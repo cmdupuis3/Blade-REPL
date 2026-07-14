@@ -1,0 +1,204 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "Blade",
+  "scopeName": "source.blade",
+  "patterns": [
+    { "include": "#comments" },
+    { "include": "#strings" },
+    { "include": "#chars" },
+    { "include": "#declarations" },
+    { "include": "#booleans" },
+    { "include": "#index-types" },
+    { "include": "#primitive-types" },
+    { "include": "#keywords" },
+    { "include": "#builtins" },
+    { "include": "#numbers" },
+    { "include": "#named-infix" },
+    { "include": "#operators" },
+    { "include": "#user-types" },
+    { "include": "#identifiers" }
+  ],
+  "repository": {
+    "comments": {
+      "patterns": [
+        {
+          "comment": "Corpus test directives: // TEST: / // EXPECT: / // MODULE:",
+          "match": "(//)\\s*((?:TEST|EXPECT|MODULE|EXPECT_OUTPUT|EXPECT_ERROR)\\b:?)(.*)$",
+          "captures": {
+            "1": { "name": "punctuation.definition.comment.blade" },
+            "2": { "name": "keyword.other.directive.blade" },
+            "3": { "name": "comment.line.double-slash.blade" }
+          },
+          "name": "comment.line.double-slash.blade"
+        },
+        {
+          "match": "//.*$",
+          "name": "comment.line.double-slash.blade"
+        },
+        { "include": "#block-comment" }
+      ]
+    },
+    "block-comment": {
+      "comment": "Blade block comments nest (Lexer.fs skipBlockComment is depth-counted)",
+      "begin": "/\\*",
+      "end": "\\*/",
+      "name": "comment.block.blade",
+      "patterns": [
+        { "include": "#block-comment" }
+      ]
+    },
+    "strings": {
+      "begin": "\"",
+      "end": "\"",
+      "name": "string.quoted.double.blade",
+      "patterns": [
+        {
+          "match": "\\\\[ntr\\\\\"]",
+          "name": "constant.character.escape.blade"
+        }
+      ]
+    },
+    "chars": {
+      "match": "'(\\\\[ntr\\\\']|[^'\\\\])'",
+      "name": "string.quoted.single.blade",
+      "captures": {
+        "1": { "name": "constant.character.blade" }
+      }
+    },
+    "declarations": {
+      "patterns": [
+        {
+          "match": "\\b(function)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+          "captures": {
+            "1": { "name": "storage.type.function.blade" },
+            "2": { "name": "entity.name.function.blade" }
+          }
+        },
+        {
+          "match": "\\b(type|struct|interface|impl|module)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+          "captures": {
+            "1": { "name": "storage.type.blade" },
+            "2": { "name": "entity.name.type.blade" }
+          }
+        }
+      ]
+    },
+    "booleans": {
+      "match": "\\b(true|false|True|False)\\b",
+      "name": "constant.language.boolean.blade"
+    },
+    "index-types": {
+      "comment": "The index-type family plus Array/like — the signature syntax Array<Elem like Idx1, Idx2>",
+      "patterns": [
+        {
+          "match": "\\b(Idx|SymIdx|AntisymIdx|HermitianIdx|CompoundIdx|EnumIdx|DepIdx|RaggedIdx)\\b",
+          "name": "support.type.index.blade"
+        },
+        {
+          "match": "\\b(Array|Poly|Void|Unit)\\b",
+          "name": "support.type.blade"
+        },
+        {
+          "match": "\\b(like)\\b",
+          "name": "keyword.operator.word.like.blade"
+        }
+      ]
+    },
+    "primitive-types": {
+      "match": "\\b(Int|Int32|Int64|Float|Float32|Float64|Double|Complex64|Complex128|Bool|String|Nat|Char)\\b",
+      "name": "support.type.primitive.blade"
+    },
+    "keywords": {
+      "patterns": [
+        {
+          "match": "\\b(if|then|else|match|with|where|for|in|guard)\\b",
+          "name": "keyword.control.blade"
+        },
+        {
+          "match": "\\b(import|from|as)\\b",
+          "name": "keyword.control.import.blade"
+        },
+        {
+          "match": "\\b(let|const|function|lambda|type|struct|interface|impl|module)\\b",
+          "name": "storage.type.blade"
+        },
+        {
+          "match": "\\b(mut|static|pure)\\b",
+          "name": "storage.modifier.blade"
+        },
+        {
+          "match": "\\b(comm|omp|cuda|reynolds)\\b",
+          "name": "keyword.other.backend.blade"
+        }
+      ]
+    },
+    "builtins": {
+      "match": "\\b(method_for|object_for|range|reverse|transpose|hermitian|gram|decompact|compute|read|sequence|replicate|zip|stack|arity|nth|zero|rank|mask|compound|intersect|union|unique|contains|group_by|group_keys|sort|reduce|conj|extents)\\b",
+      "name": "support.function.builtin.blade"
+    },
+    "numbers": {
+      "patterns": [
+        {
+          "match": "\\b\\d+\\.\\d+(?:[eE][+-]?\\d+)?\\b",
+          "name": "constant.numeric.float.blade"
+        },
+        {
+          "match": "\\b\\d+[eE][+-]?\\d+\\b",
+          "name": "constant.numeric.float.blade"
+        },
+        {
+          "match": "\\b\\d+\\b",
+          "name": "constant.numeric.integer.blade"
+        }
+      ]
+    },
+    "named-infix": {
+      "comment": ":name: named infix operators (Lexer.fs TokNamedInfix)",
+      "match": ":[A-Za-z_][A-Za-z0-9_]*:",
+      "name": "keyword.operator.named-infix.blade"
+    },
+    "operators": {
+      "patterns": [
+        {
+          "comment": "Bracketed outer-product operators, scanned inside [...] by the lexer",
+          "match": "\\[(?:==|!=|<=|>=|&&|\\|\\||[-+*/%^<>])\\]",
+          "name": "keyword.operator.outer-product.blade"
+        },
+        {
+          "comment": "Combinator operators, longest first",
+          "match": "<\\|:>|<&!>|<@>|<&>|<\\*>|<\\$>|<\\|>|>>=|>>@|@>>|\\|@>",
+          "name": "keyword.operator.combinator.blade"
+        },
+        {
+          "match": "->|=>|\\|>|<-|::|\\.\\.",
+          "name": "keyword.operator.arrow.blade"
+        },
+        {
+          "match": "==|!=|<=|>=|&&|\\|\\||>>",
+          "name": "keyword.operator.comparison.blade"
+        },
+        {
+          "match": "[-+*/]=",
+          "name": "keyword.operator.assignment.compound.blade"
+        },
+        {
+          "match": "[-+*/%^]",
+          "name": "keyword.operator.arithmetic.blade"
+        },
+        {
+          "match": "[=<>!]",
+          "name": "keyword.operator.blade"
+        }
+      ]
+    },
+    "user-types": {
+      "comment": "Capitalized identifiers are conventionally nominal types (index aliases like Lat, Lon, StationIdx)",
+      "match": "\\b[A-Z][A-Za-z0-9_]*\\b",
+      "name": "entity.name.type.blade"
+    },
+    "identifiers": {
+      "match": "\\b[a-z_][A-Za-z0-9_]*\\b",
+      "name": "variable.other.blade"
+    }
+  }
+}

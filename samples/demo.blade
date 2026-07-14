@@ -1,0 +1,63 @@
+// TEST: Grammar Demo
+// Exercises every token class the highlighter knows about.
+/* block comment
+   /* nested block comment — the lexer depth-counts these */
+   still a comment */
+
+type Lat = Idx<2>
+type Lon = Idx<2>
+type Tri = Idx<3>
+
+// A 2x2 grid over named index types — this comment shows up on hover.
+let dense: Array<Float64 like Lat, Lon> = [[10.0, 20.0], [30.0, 40.0]]
+let msk: Array<Bool like Lat, Lon> = [[true, false], [true, true]]
+let B = compound(dense, msk)
+let picked = B((0, 0))
+
+static function tri_extent(i: Tri) -> Tri = i
+
+function ragged_sum(A: Array<Float64 like DepIdx<Tri, tri_extent>>) -> Float64 = {
+    0.0
+}
+
+// Doubles each weight and accumulates the sum.
+// w: the weights to accumulate
+function total(w: Array<Float64 like Idx<3>>) -> Float64 = {
+    let mut s = 0.0
+    for k in 0..3 {
+        s += w(k) * 2.0
+    }
+    s
+}
+
+// Rank-2 outer product with a commutativity assertion.
+// A: left samples
+// B: right samples
+function covariance(A: Array<Float64 like Idx<3>>, B: Array<Float64 like Idx<3>>)
+  where comm(A, B) -> Array<Float64 like Idx<3>, Idx<3>> =
+  method_for(A, B) <@> lambda(x, y) -> x * y |> compute
+
+let xs = [1.0, 2.0, 3.0]
+let ys = [4.0, 5.0, 6.0]
+let added = xs [+] ys
+
+// Combinators: method_for / lambda / <@> / <&!> / |> compute
+let L = method_for(xs, ys)
+let f = lambda(a, b) -> a * b
+let g = lambda(a, b) -> a + b
+let (prods, sums) = (L <@> f) <&!> (L <@> g) |> compute
+
+let category = match 5 with
+  | 0 -> 0
+  | 1 -> 1
+  | n -> n * 2
+
+let greeting = "hello \"blade\"\n"
+let scale = 2.5e-3
+let flag = True
+let static two = 2
+
+// Parallelization strategies live in lambda where-clauses:
+//   lambda(a, b) where comm(a, b), omp(a: 1) -> a * b
+//   lambda(a, b) where cuda(block: 64) -> a * b
+// Named infix desugars a :dot: b -> dot(a, b)

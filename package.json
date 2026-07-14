@@ -1,0 +1,129 @@
+{
+  "name": "blade-language",
+  "displayName": "Blade Language",
+  "description": "Syntax highlighting, diagnostics, type hovers, and REPL-style evaluation for the Blade DSL (.blade / .edgi)",
+  "version": "0.1.0",
+  "publisher": "blade-local",
+  "license": "UNLICENSED",
+  "engines": {
+    "vscode": "^1.75.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "main": "./src/extension.js",
+  "activationEvents": [],
+  "contributes": {
+    "languages": [
+      {
+        "id": "blade",
+        "aliases": [
+          "Blade",
+          "blade"
+        ],
+        "extensions": [
+          ".blade",
+          ".edgi"
+        ],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "blade",
+        "scopeName": "source.blade",
+        "path": "./syntaxes/blade.tmLanguage.json"
+      }
+    ],
+    "configuration": {
+      "title": "Blade",
+      "properties": {
+        "blade.compilerPath": {
+          "type": "string",
+          "default": "",
+          "description": "Path to Blade.exe. Leave empty to try common build locations and then 'Blade' on PATH. Used by diagnostics, hovers, and all run/eval commands."
+        },
+        "blade.checkOnSave": {
+          "type": "boolean",
+          "default": true,
+          "description": "Run 'Blade check' on save and report diagnostics."
+        },
+        "blade.checkOnOpen": {
+          "type": "boolean",
+          "default": true,
+          "description": "Run 'Blade check' when a Blade file is opened."
+        },
+        "blade.runTimeoutSeconds": {
+          "type": "number",
+          "default": 180,
+          "description": "Timeout for 'Blade run' invocations (compile + execute; first runs invoke g++)."
+        }
+      }
+    },
+    "commands": [
+      {
+        "command": "blade.check",
+        "title": "Blade: Check Current File"
+      },
+      {
+        "command": "blade.runFile",
+        "title": "Blade: Run File",
+        "icon": "$(play)"
+      },
+      {
+        "command": "blade.runSelection",
+        "title": "Blade: Send Selection/Line to REPL"
+      },
+      {
+        "command": "blade.sendFileToRepl",
+        "title": "Blade: Send File to REPL"
+      },
+      {
+        "command": "blade.startRepl",
+        "title": "Blade: Start REPL"
+      },
+      {
+        "command": "blade.emitFile",
+        "title": "Blade: Show Generated C++"
+      }
+    ],
+    "keybindings": [
+      {
+        "command": "blade.runSelection",
+        "key": "alt+enter",
+        "when": "editorTextFocus && editorLangId == blade"
+      },
+      {
+        "command": "blade.sendFileToRepl",
+        "key": "alt+shift+enter",
+        "when": "editorTextFocus && editorLangId == blade"
+      },
+      {
+        "command": "blade.check",
+        "key": "ctrl+alt+enter",
+        "when": "editorTextFocus && editorLangId == blade"
+      }
+    ],
+    "menus": {
+      "editor/title/run": [
+        {
+          "command": "blade.runFile",
+          "when": "resourceLangId == blade",
+          "group": "navigation"
+        }
+      ],
+      "editor/context": [
+        {
+          "command": "blade.runSelection",
+          "when": "resourceLangId == blade",
+          "group": "blade@1"
+        },
+        {
+          "command": "blade.runFile",
+          "when": "resourceLangId == blade",
+          "group": "blade@2"
+        }
+      ]
+    }
+  }
+}
