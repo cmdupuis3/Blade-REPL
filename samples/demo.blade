@@ -4,8 +4,14 @@
    /* nested block comment — the lexer depth-counts these */
    still a comment */
 
+// Autodiff is import-gated: ad.grad(f) below.
+import ad as ad
+
+// Latitude grid axis.
 type Lat = Idx<2>
+// Longitude grid axis.
 type Lon = Idx<2>
+// Triangle-vertex index.
 type Tri = Idx<3>
 
 // A 2x2 grid over named index types — this comment shows up on hover.
@@ -57,7 +63,34 @@ let scale = 2.5e-3
 let flag = True
 let static two = 2
 
+// Scalar math intrinsics: plain calls, result Float64 (abs is type-preserving).
+let e1 = exp(1.0)
+let root = sqrt(2.0)
+let steps = floor(2.9)
+let mag = abs(-3)
+
+// Static-evaluator builtins resolve in `let static` contexts only.
+let static kmin = min(two, 3)
+
+// Virtual arrays: index-defined, no storage. range<I> yields I's positions;
+// lo..hi is the anonymous form (0..N desugars to range<Idx<N>>).
+let squares = method_for(range<Tri>) <@> lambda(i) -> i * i |> compute
+let doubles = method_for(0..3) <@> lambda(i) -> i * 2 |> compute
+
+// Reverse-mode autodiff: the primal value returns; array gradients
+// accumulate into a caller-allocated (and zeroed) mut out-buffer.
+let mut dtot = [0.0, 0.0, 0.0]
+let tv = ad.grad(total)(xs, dtot)
+
+// Units of measure flow through arithmetic; dimensional errors fail typecheck.
+Unit meters
+Unit seconds
+// Meters per second — this comment shows up on hover.
+Unit velocity = meters / seconds
+let vx0: Float<velocity> = 15.0
+
 // Parallelization strategies live in lambda where-clauses:
 //   lambda(a, b) where comm(a, b), omp(a: 1) -> a * b
 //   lambda(a, b) where cuda(block: 64) -> a * b
+//   lambda(a, b) where mpi -> a * b        (omp/cuda/mpi are mutually exclusive)
 // Named infix desugars a :dot: b -> dot(a, b)

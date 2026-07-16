@@ -91,11 +91,11 @@
       "comment": "The index-type family plus Array/like — the signature syntax Array<Elem like Idx1, Idx2>",
       "patterns": [
         {
-          "match": "\\b(Idx|SymIdx|AntisymIdx|HermitianIdx|CompoundIdx|EnumIdx|DepIdx|RaggedIdx)\\b",
+          "match": "\\b(Idx|SymIdx|AntisymIdx|HermitianIdx|CompoundIdx|EnumIdx|DepIdx|RaggedIdx|IrrepsIdx)\\b",
           "name": "support.type.index.blade"
         },
         {
-          "match": "\\b(Array|Poly|Void|Unit)\\b",
+          "match": "\\b(Array|Poly|Void|Unit|Dist)\\b",
           "name": "support.type.blade"
         },
         {
@@ -111,7 +111,7 @@
     "keywords": {
       "patterns": [
         {
-          "match": "\\b(if|then|else|match|with|where|for|in|guard)\\b",
+          "match": "\\b(if|then|else|match|with|where|for|in|guard|and)\\b",
           "name": "keyword.control.blade"
         },
         {
@@ -127,14 +127,36 @@
           "name": "storage.modifier.blade"
         },
         {
-          "match": "\\b(comm|omp|cuda|reynolds)\\b",
+          "match": "\\b(comm|omp|cuda|mpi|reynolds)\\b",
           "name": "keyword.other.backend.blade"
         }
       ]
     },
     "builtins": {
-      "match": "\\b(method_for|object_for|range|reverse|transpose|hermitian|gram|decompact|compute|read|sequence|replicate|zip|stack|arity|nth|zero|rank|mask|compound|intersect|union|unique|contains|group_by|group_keys|sort|reduce|conj|extents)\\b",
-      "name": "support.function.builtin.blade"
+      "comment": "One pattern per hover category (src/builtins.js); scripts/check-consistency.js keeps these word lists and the hover tables in sync",
+      "patterns": [
+        {
+          "match": "\\b(method_for|object_for|transpose|hermitian|gram|decompact|compute|read|sequence|replicate|zip|stack|arity|nth|zero|rank|mask|compound|intersect|union|unique|contains|group_by|group_keys|sort|reduce|conj|extents|prodsum|fill_random|grad|min|max|length)\\b",
+          "name": "support.function.builtin.blade"
+        },
+        {
+          "comment": "Virtual-array constructors (generic-bracket forms: range<I>, reverse<I>)",
+          "match": "\\b(range|reverse)\\b",
+          "name": "support.function.virtual.blade"
+        },
+        {
+          "match": "\\b(exp|log|sqrt|sin|cos|tan|sinh|cosh|tanh|asin|acos|atan|floor|ceil|abs)\\b",
+          "name": "support.function.math.blade"
+        },
+        {
+          "match": "\\b(moments|comoments|cumulants|free_cumulants|mixed_cumulants|comoments_merge|independent|dist|dist_add|dist_scale|dist_affine|dist_jet|dist_jet_closed|dist_map|dist_map_closed|mstate|mstate_merge|mstate_cumulants|cumulant)\\b",
+          "name": "support.function.ppl.blade"
+        },
+        {
+          "match": "\\b(y_to|tensor_product|linear|linear_rows|gated|gated_rows|sh_spec|total_dim|tp_weight_dim|linear_weight_dim|irreps_len|irreps_l|irreps_parity|irreps_mult|irreps_dim|irreps_offset)\\b",
+          "name": "support.function.ml.blade"
+        }
+      ]
     },
     "numbers": {
       "patterns": [

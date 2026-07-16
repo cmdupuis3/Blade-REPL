@@ -13,6 +13,9 @@
   ],
   "main": "./src/extension.js",
   "activationEvents": [],
+  "scripts": {
+    "test": "node --check src/extension.js && node --check src/builtins.js && node --check src/types.js && node --check src/keywords.js && node scripts/check-consistency.js"
+  },
   "contributes": {
     "languages": [
       {
@@ -41,7 +44,7 @@
         "blade.compilerPath": {
           "type": "string",
           "default": "",
-          "description": "Path to Blade.exe. Leave empty to try common build locations and then 'Blade' on PATH. Used by diagnostics, hovers, and all run/eval commands."
+          "description": "Path to Blade.exe. Leave empty to pick the most recently built of the common build locations (Release/Debug), then 'Blade' on PATH. Used by diagnostics, hovers, and all run/eval commands."
         },
         "blade.checkOnSave": {
           "type": "boolean",

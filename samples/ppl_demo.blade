@@ -1,0 +1,36 @@
+// TEST: PPL Hover Demo
+// The probabilistic surface: moment/cumulant formers over sample arrays and
+// the Dist cumulant tower. Formers are import-gated and called qualified
+// (ppl.moments(...)); each must be the entire right-hand side of a
+// top-level let. Hover the former names, `Dist`, and `ppl` itself.
+import ppl as ppl
+
+// Two variables (rows) observed over three samples — the LAST declared
+// index is the sample (fiber) axis.
+type TimeIdx = Idx<3>
+let B: Array<Float64 like Idx<2>, TimeIdx> = [[1.0, 2.0, 4.0], [3.0, 5.0, 4.0]]
+
+// Raw moments and cumulants of orders 1..2.
+let m1 = ppl.moments(B, 1)
+let k2 = ppl.cumulants(B, 2)
+
+// Central pair comoments (covariance) of the same array.
+let cov = ppl.comoments(B, 2)
+
+// A dist binding carries the cumulant tower as a typed value:
+// d : Dist<3, Float64 like Idx<2>>. cumulant(d, k) projects a component.
+let d = ppl.dist(B, 3)
+let mean = ppl.cumulant(d, 1)
+
+// A second dataset, declared independent of the first — their cross
+// comoments are a zero block, and dist addition is licensed.
+let C: Array<Float64 like Idx<2>, TimeIdx> = [[0.5, 1.5, 2.5], [1.0, 0.0, 1.0]]
+let _ = ppl.independent(B, C)
+let dC = ppl.dist(C, 3)
+let dSum = ppl.dist_add(d, dC)
+
+// Streaming sufficient statistics: build per chunk, merge, freeze.
+let sB = ppl.mstate(B, 2)
+let sC = ppl.mstate(C, 2)
+let sAll = ppl.mstate_merge(sB, sC)
+let (c1, c2) = ppl.mstate_cumulants(sAll)

@@ -10,6 +10,8 @@ const cp = require("child_process");
 const fs = require("fs");
 const path = require("path");
 const builtins = require("./builtins");
+const types = require("./types");
+const keywords = require("./keywords");
 
 /** @type {vscode.DiagnosticCollection} */
 let diagnostics;
@@ -32,11 +34,20 @@ const CANDIDATE_COMPILERS = [
 function findCompiler() {
   const configured = vscode.workspace.getConfiguration("blade").get("compilerPath", "");
   if (configured) return configured;
+  // Prefer the most recently built binary — a stale Release build next to a
+  // fresh Debug build would otherwise report errors the compiler no longer
+  // produces (e.g. ML statics before their elaboration pass landed).
+  let best;
   for (const c of CANDIDATE_COMPILERS) {
     if (c === "Blade") continue; // tried last, via spawn failure
-    if (fs.existsSync(c)) return c;
+    try {
+      const mtime = fs.statSync(c).mtimeMs;
+      if (!best || mtime > best.mtime) best = { path: c, mtime };
+    } catch {
+      // candidate doesn't exist
+    }
   }
-  return "Blade";
+  return best ? best.path : "Blade";
 }
 
 function run(exe, args, timeoutMs) {
@@ -331,6 +342,255 @@ async function commandEmitFile() {
   await vscode.window.showTextDocument(cppDoc, { viewColumn: vscode.ViewColumn.Beside, preview: true });
 }
 
+// --- Types (primitives, index types, nominal aliases, arrays) ---------------
+//
+// Built-in primitives and index types come from the static `types` table.
+// Nominal index types (user `type X = Idx<...>`) and `Array<...>` types are
+// resolved from the source here, since the compiler emits no bindings for
+// them. All four kinds render as a hover tooltip.
+
+const INDEX_KEYWORD_RE =
+  /^(Idx|SymIdx|AntisymIdx|HermitianIdx|CompoundIdx|EnumIdx|DepIdx|RaggedIdx)\b/;
+
+// uri.toString() -> { version, decls } cache of scanned `type` declarations.
+const typeDeclCache = new Map();
+
+/**
+ * The contiguous `//` doc-comment block directly above line `lineIndex`
+ * (0-based), Ionide-style: a blank or non-comment line ends the block, and
+ * corpus directives (// TEST:/EXPECT:/MODULE:) and `====` banners are dropped.
+ */
+function docCommentAbove(doc, lineIndex) {
+  const out = [];
+  for (let l = lineIndex - 1; l >= 0; l--) {
+    const t = doc.lineAt(l).text.trim();
+    if (!t.startsWith("//")) break; // blank or code line ends the block
+    const body = t.replace(/^\/\/\s?/, "");
+    if (/^(TEST|EXPECT|MODULE|EXPECT_OUTPUT|EXPECT_ERROR)\b/.test(body)) continue;
+    if (/^=+$/.test(body)) continue;
+    out.unshift(body);
+  }
+  const text = out.join("\n").trim();
+  return text || undefined;
+}
+
+/**
+ * Scan the document for `type Name = Rhs` aliases and `Unit name [= expr]`
+ * unit-of-measure declarations. Returns { decls, units }: decls maps
+ * name -> { name, parent, indexLike, doc }; units maps name -> { name, rhs,
+ * doc } (rhs undefined for base units). Cached per document version.
+ */
+function scanDecls(doc) {
+  const key = doc.uri.toString();
+  const cached = typeDeclCache.get(key);
+  if (cached && cached.version === doc.version) return cached;
+
+  const decls = new Map();
+  const units = new Map();
+  for (let l = 0; l < doc.lineCount; l++) {
+    const text = doc.lineAt(l).text;
+    const m = /^\s*type\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.+?)\s*$/.exec(text);
+    if (m) {
+      const parent = m[2].replace(/\s*\/\/.*$/, "").trim(); // drop trailing line comment
+      decls.set(m[1], {
+        name: m[1],
+        parent,
+        indexLike: INDEX_KEYWORD_RE.test(parent),
+        doc: docCommentAbove(doc, l),
+      });
+      continue;
+    }
+    const u = /^\s*Unit\s+([A-Za-z_][A-Za-z0-9_]*)(?:\s*=\s*(.+?))?\s*$/.exec(text);
+    if (u) {
+      const rhs = u[2] && u[2].replace(/\s*\/\/.*$/, "").trim();
+      units.set(u[1], { name: u[1], rhs: rhs || undefined, doc: docCommentAbove(doc, l) });
+    }
+  }
+  const entry = { version: doc.version, decls, units };
+  typeDeclCache.set(key, entry);
+  return entry;
+}
+
+/** The `type Name = Rhs` aliases of `doc` (see scanDecls). */
+function scanTypeDecls(doc) {
+  return scanDecls(doc).decls;
+}
+
+/** Split `s` on top-level occurrences of `sep`, ignoring `<> () []` nesting. */
+function splitTopLevel(s, sep) {
+  const parts = [];
+  let depth = 0;
+  let start = 0;
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (c === "<" || c === "(" || c === "[") depth++;
+    else if (c === ">" || c === ")" || c === "]") depth--;
+    else if (c === sep && depth === 0) {
+      parts.push(s.slice(start, i));
+      start = i + 1;
+    }
+  }
+  parts.push(s.slice(start));
+  return parts.map((p) => p.trim()).filter((p) => p.length);
+}
+
+/** Split an Array's inner text on the top-level `like` keyword (or null). */
+function splitOnLike(inner) {
+  let depth = 0;
+  for (let i = 0; i < inner.length; i++) {
+    const c = inner[i];
+    if (c === "<" || c === "(" || c === "[") depth++;
+    else if (c === ">" || c === ")" || c === "]") depth--;
+    else if (depth === 0 && /\s/.test(c) && /^like(?=\s|$)/.test(inner.slice(i + 1))) {
+      return [inner.slice(0, i), inner.slice(i + 1 + 4)];
+    }
+  }
+  return null;
+}
+
+/**
+ * From `Array` at (startLine, startChar), collect the full `Array<...>` text
+ * by tracking angle-bracket depth across up to 20 lines. Returns "" if no
+ * balanced `<...>` follows.
+ */
+function collectAngleType(doc, startLine, startChar) {
+  let result = "";
+  let depth = 0;
+  let opened = false;
+  const maxLine = Math.min(doc.lineCount, startLine + 20);
+  for (let l = startLine; l < maxLine; l++) {
+    const text = l === startLine ? doc.lineAt(l).text.slice(startChar) : "\n" + doc.lineAt(l).text;
+    for (const ch of text) {
+      result += ch;
+      if (ch === "<") {
+        depth++;
+        opened = true;
+      } else if (ch === ">") {
+        depth--;
+        if (opened && depth === 0) return result;
+      }
+    }
+  }
+  return "";
+}
+
+/**
+ * Parse the `Array<Elem like Idx1, Idx2>` type whose `Array` keyword sits at
+ * `wordRange`, resolving each index arg's doc from its nominal declaration.
+ * Returns { elem, indices: [{ text, doc }] } or null.
+ */
+function parseArrayTypeAt(doc, wordRange) {
+  const full = collectAngleType(doc, wordRange.start.line, wordRange.start.character);
+  const m = /^Array\s*<([\s\S]*)>\s*$/.exec(full);
+  if (!m) return null;
+  const inner = m[1];
+
+  let elem;
+  let idxText;
+  const parts = splitOnLike(inner);
+  if (parts) {
+    elem = parts[0].trim();
+    idxText = parts[1];
+  } else {
+    // Pretty-printer form `Array<Elem, Idx...>`: first arg is the element.
+    const commaParts = splitTopLevel(inner, ",");
+    elem = commaParts[0] || "";
+    idxText = commaParts.slice(1).join(", ");
+  }
+
+  const decls = scanTypeDecls(doc);
+  const indices = splitTopLevel(idxText, ",").map((text) => {
+    const idm = /^([A-Za-z_][A-Za-z0-9_]*)/.exec(text);
+    const nom = idm && decls.get(idm[1]);
+    return { text, doc: nom ? nom.doc : undefined };
+  });
+  return { elem, indices };
+}
+
+/**
+ * `name` + `kind` in a code block, with an optional description below a rule.
+ * `descIsPlain` renders user-authored text verbatim (no markdown); otherwise
+ * `desc` is treated as markdown (used for our built-in `sig` + prose).
+ */
+function typeMarkdown(codeLines, desc, descIsPlain) {
+  const md = new vscode.MarkdownString();
+  md.appendCodeblock(codeLines.join("\n"), "blade");
+  if (desc) {
+    md.appendMarkdown("\n---\n\n");
+    if (descIsPlain) md.appendText(desc);
+    else md.appendMarkdown(desc);
+  }
+  return md;
+}
+
+/** Multi-line Array tooltip: `Array: T like` then one index per line. */
+function arrayMarkdown(arr) {
+  const lines = [`Array: ${arr.elem} like`];
+  const bodies = arr.indices.map(
+    (ix, i) => `    ${ix.text}${i < arr.indices.length - 1 ? "," : ""}`
+  );
+  const width = bodies.length ? Math.max(...bodies.map((b) => b.length)) : 0;
+  arr.indices.forEach((ix, i) => {
+    // Keep each arg on one line: collapse any multi-line doc to a single line.
+    const doc = ix.doc && ix.doc.replace(/\s*\n\s*/g, " ");
+    lines.push(doc ? `${bodies[i].padEnd(width)}  // ${doc}` : bodies[i]);
+  });
+  const md = new vscode.MarkdownString();
+  md.appendCodeblock(lines.join("\n"), "blade");
+  return md;
+}
+
+/** Hover for a type name under the cursor, or undefined if it isn't a type. */
+function typeHoverFor(doc, word, wordRange) {
+  // Array<...>: parse the element and index args at this location.
+  if (word === "Array") {
+    const arr = parseArrayTypeAt(doc, wordRange);
+    if (arr) return new vscode.Hover(arrayMarkdown(arr), wordRange);
+  }
+  // Primitive: name + "Primitive Type", one-liner (alias facts) below.
+  const prim = types.primitives[word];
+  if (prim !== undefined) {
+    return new vscode.Hover(typeMarkdown([word, "Primitive Type"], prim), wordRange);
+  }
+  // Index type: name + "Index Type", then a short description with its args.
+  const it = types.indexTypes[word];
+  if (it) {
+    return new vscode.Hover(
+      typeMarkdown([word, "Index Type"], "`" + it.sig + "` — " + it.desc),
+      wordRange
+    );
+  }
+  // Other built-in constructor (Poly, ...).
+  const ctor = types.constructors[word];
+  if (ctor) {
+    return new vscode.Hover(
+      typeMarkdown([word, ctor.kind], "`" + ctor.sig + "` — " + ctor.desc),
+      wordRange
+    );
+  }
+  // Nominal index type / alias from a source `type X = ...` declaration.
+  const decl = scanTypeDecls(doc).get(word);
+  if (decl) {
+    const kindLine = decl.indexLike
+      ? `Nominal Index Type: ${decl.parent}`
+      : `Type Alias: ${decl.parent}`;
+    return new vscode.Hover(
+      typeMarkdown([`type ${decl.name} = ${decl.parent}`, kindLine], decl.doc, true),
+      wordRange
+    );
+  }
+  // Unit of measure from a source `Unit name [= expr]` declaration.
+  const unit = scanDecls(doc).units.get(word);
+  if (unit) {
+    const declLine = unit.rhs ? `Unit ${unit.name} = ${unit.rhs}` : `Unit ${unit.name}`;
+    return new vscode.Hover(
+      typeMarkdown([declLine, "Unit of Measure"], unit.doc, true),
+      wordRange
+    );
+  }
+  return undefined;
+}
+
 // --- Hover ------------------------------------------------------------------
 
 /** Find the best binding for `word` visible from `line` (0-based). */
@@ -350,11 +610,40 @@ function lookupBinding(doc, word, line) {
   return best;
 }
 
+/**
+ * Build a normalizer for type strings the compiler reports. It rewrites the
+ * IR's function-type spelling (`Arrow`) to `function`, and renders templated
+ * type variables as abstract types — OCaml/F#-style `'a`, `'b`, ... shown as
+ * bare `T`, `U`, ... `Z` (OCaml-like, without the apostrophe). The returned
+ * closure keeps a per-signature map so the same variable maps to the same
+ * letter across a function's params and return type. Apply it only to type
+ * strings — never to doc prose, whose apostrophes (`kernel's`) are not types.
+ */
+const TYPE_VAR_LETTERS = ["T", "U", "V", "W", "X", "Y", "Z"];
+function typeNormalizer() {
+  const seen = new Map();
+  return (s) => {
+    if (!s) return s;
+    let out = s.replace(/\bArrow\b/g, "function");
+    out = out.replace(/'([A-Za-z]\w*)/g, (_, name) => {
+      if (!seen.has(name)) {
+        const i = seen.size;
+        seen.set(name, TYPE_VAR_LETTERS[i] || `T${i - TYPE_VAR_LETTERS.length + 2}`);
+      }
+      return seen.get(name);
+    });
+    return out;
+  };
+}
+
 /** Signature header: multi-line function types go below the name. */
 function signatureText(kind, name, type) {
-  return type.includes("\n")
-    ? `${kind} ${name} :\n${type}`
-    : `${kind} ${name} : ${type}`;
+  const norm = typeNormalizer();
+  const k = norm(kind);
+  const t = norm(type);
+  return t.includes("\n")
+    ? `${k} ${name} :\n${t}`
+    : `${k} ${name} : ${t}`;
 }
 
 /**
@@ -370,20 +659,22 @@ function signatureText(kind, name, type) {
  *       comm(A, B)
  */
 function renderCallable(prefix, name, params, ret, where) {
-  const head = prefix ? `${prefix} ${name}` : name;
+  const norm = typeNormalizer();
+  const nret = norm(ret);
+  const head = prefix ? `${norm(prefix)} ${name}` : name;
   const lines = [];
   if (!params || params.length === 0) {
-    lines.push(`${head}()${ret ? " -> " + ret : ""}`);
+    lines.push(`${head}()${nret ? " -> " + nret : ""}`);
   } else {
     lines.push(`${head}(`);
     const bodies = params.map(
-      (p, i) => `    ${p.name}: ${p.type}${i < params.length - 1 ? "," : ""}`
+      (p, i) => `    ${p.name}: ${norm(p.type)}${i < params.length - 1 ? "," : ""}`
     );
     const width = Math.max(...bodies.map((b) => b.length));
     params.forEach((p, i) => {
       lines.push(p.doc ? `${bodies[i].padEnd(width)}  // ${p.doc}` : bodies[i]);
     });
-    lines.push(`)${ret ? " -> " + ret : ""}`);
+    lines.push(`)${nret ? " -> " + nret : ""}`);
   }
   if (Array.isArray(where) && where.length > 0) {
     lines.push("where");
@@ -392,9 +683,10 @@ function renderCallable(prefix, name, params, ret, where) {
   return lines.join("\n");
 }
 
-function hoverMarkdown(sig, doc) {
+function hoverMarkdown(sig, doc, badge) {
   const md = new vscode.MarkdownString();
   md.appendCodeblock(sig, "blade");
+  if (badge) md.appendMarkdown(`\n*${badge}*\n`);
   if (doc) {
     md.appendMarkdown("\n---\n\n");
     md.appendText(doc);
@@ -439,9 +731,20 @@ const hoverProvider = {
         const sig = builtin.params
           ? renderCallable("", word, builtin.params, builtin.ret, null)
           : builtin.sig;
-        return new vscode.Hover(hoverMarkdown(sig, builtin.doc), wordRange);
+        return new vscode.Hover(
+          hoverMarkdown(sig, builtin.doc, builtins.categories[builtin.category]),
+          wordRange
+        );
       }
-      return undefined;
+      // Domain-specific keywords (comm/omp/mpi/like/where/...). After
+      // builtins so callable keyword forms (pure, guard, reynolds) keep
+      // their signature hovers; before types (case-disjoint, no shadowing).
+      const kw = keywords.keywords[word];
+      if (kw) {
+        return new vscode.Hover(typeMarkdown([kw.usage, "Keyword"], kw.doc, true), wordRange);
+      }
+      // Types: primitives, index types, nominal aliases, units, Array<...>.
+      return typeHoverFor(doc, word, wordRange);
     }
     // No identifier under the cursor — try combinator/operator hover.
     const lineText = doc.lineAt(position.line).text;
@@ -523,6 +826,12 @@ const signatureHelpProvider = {
       docText = builtin.doc;
     }
 
+    // Normalize types once (Arrow -> function, 'a -> T) so the label and the
+    // per-parameter offsets computed from them stay in sync.
+    const norm = typeNormalizer();
+    params = params.map((p) => ({ name: p.name, type: norm(p.type), doc: p.doc }));
+    ret = norm(ret);
+
     const label =
       `${call.name}(` +
       params.map((p) => `${p.name}: ${p.type}`).join(", ") +
@@ -533,6 +842,80 @@ const signatureHelpProvider = {
     help.activeSignature = 0;
     help.activeParameter = Math.min(call.activeParameter, Math.max(0, params.length - 1));
     return help;
+  },
+};
+
+// --- Completion ---------------------------------------------------------------
+
+/**
+ * Word completions from the same sources the hover uses, in shadowing order:
+ * compiler bindings, builtins, domain keywords, built-in types, and
+ * source-scanned type/unit declarations. Plain word inserts — no snippets,
+ * no trigger characters (`(` already triggers signature help). Operators are
+ * deliberately excluded (not word-completable).
+ */
+const completionProvider = {
+  provideCompletionItems(doc) {
+    const items = [];
+    const seen = new Set();
+    const push = (label, kind, detail, docMd) => {
+      if (seen.has(label)) return;
+      seen.add(label);
+      const item = new vscode.CompletionItem(label, kind);
+      if (detail) item.detail = detail;
+      if (docMd) item.documentation = docMd;
+      items.push(item);
+    };
+
+    // 1. Compiler bindings for this document (shadow the static tables).
+    for (const b of bindingsByDoc.get(doc.uri.toString()) || []) {
+      if (!b.name) continue;
+      const callable = Array.isArray(b.params) && b.ret !== undefined;
+      push(
+        b.name,
+        callable ? vscode.CompletionItemKind.Function : vscode.CompletionItemKind.Variable,
+        b.type,
+        b.doc ? new vscode.MarkdownString().appendText(b.doc) : undefined
+      );
+    }
+
+    // 2. Builtins (callable and sig-form), with the category badge as detail.
+    for (const [name, e] of Object.entries(builtins.identifiers)) {
+      const sig = e.params ? renderCallable("", name, e.params, e.ret, null) : e.sig;
+      push(
+        name,
+        vscode.CompletionItemKind.Function,
+        builtins.categories[e.category],
+        hoverMarkdown(sig, e.doc, builtins.categories[e.category])
+      );
+    }
+
+    // 3. Domain keywords.
+    for (const [name, k] of Object.entries(keywords.keywords)) {
+      push(name, vscode.CompletionItemKind.Keyword, "keyword", typeMarkdown([k.usage, "Keyword"], k.doc, true));
+    }
+
+    // 4. Built-in types: primitives, index types, constructors.
+    for (const [name, d] of Object.entries(types.primitives)) {
+      push(name, vscode.CompletionItemKind.Struct, "Primitive Type", typeMarkdown([name, "Primitive Type"], d));
+    }
+    for (const [name, t] of Object.entries(types.indexTypes)) {
+      push(name, vscode.CompletionItemKind.Class, t.sig, typeMarkdown([name, "Index Type"], "`" + t.sig + "` — " + t.desc));
+    }
+    for (const [name, c] of Object.entries(types.constructors)) {
+      push(name, vscode.CompletionItemKind.Class, c.sig, typeMarkdown([name, c.kind], "`" + c.sig + "` — " + c.desc));
+    }
+
+    // 5. Source-scanned `type` aliases and `Unit` declarations.
+    const scanned = scanDecls(doc);
+    for (const [name, d] of scanned.decls) {
+      push(name, vscode.CompletionItemKind.Class, `type ${name} = ${d.parent}`, d.doc ? new vscode.MarkdownString().appendText(d.doc) : undefined);
+    }
+    for (const [name, u] of scanned.units) {
+      push(name, vscode.CompletionItemKind.Unit, u.rhs ? `Unit ${name} = ${u.rhs}` : `Unit ${name}`, u.doc ? new vscode.MarkdownString().appendText(u.doc) : undefined);
+    }
+
+    return items;
   },
 };
 
@@ -554,6 +937,8 @@ function activate(context) {
       "(",
       ","
     ),
+
+    vscode.languages.registerCompletionItemProvider({ language: "blade" }, completionProvider),
 
     vscode.commands.registerCommand("blade.check", () => {
       const doc = vscode.window.activeTextEditor?.document;
@@ -581,6 +966,7 @@ function activate(context) {
     vscode.workspace.onDidCloseTextDocument((doc) => {
       diagnostics.delete(doc.uri);
       bindingsByDoc.delete(doc.uri.toString());
+      typeDeclCache.delete(doc.uri.toString());
     }),
 
     vscode.workspace.onDidChangeConfiguration((e) => {

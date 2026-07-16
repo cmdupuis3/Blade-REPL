@@ -1,0 +1,36 @@
+// TEST: ML Hover Demo
+// The equivariant-ML surface: irreps specs, sizing/navigation statics, and
+// the op formers. Everything is import-gated and called qualified
+// (ml.total_dim(...)). Hover the op names, the statics, `IrrepsIdx`, and
+// `ml` itself. Value shapes mirror tests/corpus/ml-ops.
+import ml as ml
+
+// A spec is a `let static` array of (l, parity, mult) blocks:
+// b0 = 2x(l=0) cells 0..1, b1 = 2x(l=1) cells 2..7, b2 = 1x(l=2) cells 8..12.
+let static spec_h = [(0, 0, 2), (1, 1, 2), (2, 0, 1)]
+
+// Sizing and block navigation fold at compile time.
+let static dh = ml.total_dim(spec_h)
+let static nb = ml.irreps_len(spec_h)
+let static off1 = ml.irreps_offset(spec_h, 1)
+let static len1 = ml.irreps_mult(spec_h, 1) * ml.irreps_dim(spec_h, 1)
+
+// IrrepsIdx<spec> annotates an array with the spec's block structure.
+let x: Array<Float like IrrepsIdx<spec_h>> = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0]
+
+// Spherical-harmonic embedding of a direction, degrees 0..2.
+let sh = ml.y_to(2, 1.0, 2.0, 3.0)
+
+// Tensor product with per-path weights (weight count = tp_weight_dim).
+let static tiny = [(0, 0, 1)]
+let static tinycfg = (tiny, tiny, tiny)
+let tout = ml.tensor_product(tinycfg, [2.0], [3.0], [0.5])
+
+// Equivariant linear layer and gated nonlinearity.
+let static s2 = [(0, 0, 2)]
+let lout = ml.linear(s2, s2, [1.0, 0.0, 0.0, 1.0], [5.0, 7.0])
+let gout = ml.gated(s2, [0.0, 2.0])
+
+// Batched row forms.
+let static three = 3
+let grows = ml.gated_rows(s2, three, [0.0, 2.0, 0.0, 2.0, 0.0, 2.0])
