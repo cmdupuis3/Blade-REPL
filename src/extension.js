@@ -1,6 +1,7 @@
 // Blade language support: diagnostics via `Blade check`, type hovers and
 // signature help via `Blade ide check --json` (auto-detected; falls back to
-// text diagnostics against compilers without the JSON subcommand).
+// text diagnostics against compilers without the JSON subcommand), and an
+// interpreter-backed REPL with inline results (src/repl.js).
 //
 // Plain CommonJS on purpose — no build step, no dependencies. VS Code's own
 // Node runtime executes this directly.
@@ -12,6 +13,7 @@ const path = require("path");
 const builtins = require("./builtins");
 const types = require("./types");
 const keywords = require("./keywords");
+const repl = require("./repl");
 
 /** @type {vscode.DiagnosticCollection} */
 let diagnostics;
@@ -71,25 +73,56 @@ function run(exe, args, timeoutMs) {
 
 // --- Diagnostics ------------------------------------------------------------
 
-// Text formats produced today (TypeEnv.formatCompileError / Cli.fs):
-//   line:col: message
-//   file:line:col: message          (File rarely populated in spans)
-//   Parse error at line:col: message
+// Text formats produced today:
+//   error[BL0000]: message          (rustc-style header, Diagnostics.Render)
+//     --> file:line:col             (location line following a header)
+//   line:col: message               (legacy renderShort / formatCompileError)
+//   file:line:col: message
+//   Parse error at line:col: message  (pre-diagnostics-arc builds)
 const DIAG_RE = /^(?:Parse error at )?(?:(.+?):)?(\d+):(\d+):\s*(.+)$/;
+const HEADER_RE = /^(error|warning|note)\[(BL\d{4})\]:\s*(.+)$/;
+const ARROW_RE = /^-->\s*(?:(.+?):)?(\d+):(\d+)\s*$/;
 
 /** @param {vscode.TextDocument} doc */
 function textToDiagnostics(doc, text) {
   const result = [];
-  for (const raw of text.split(/\r?\n/)) {
-    const line = raw.trim();
+  const lines = text.split(/\r?\n/);
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i].trim();
     if (!line) continue;
+    const h = HEADER_RE.exec(line);
+    if (h) {
+      // rustc-style block: the location follows on a "--> file:line:col"
+      // line; snippet/gutter/note lines after it are display-only.
+      let lineNo = 0;
+      let colNo = 0;
+      const a = ARROW_RE.exec((lines[i + 1] || "").trim());
+      if (a) {
+        lineNo = Math.max(0, parseInt(a[2], 10) - 1);
+        colNo = Math.max(0, parseInt(a[3], 10) - 1);
+        i++;
+      }
+      const start = new vscode.Position(lineNo, colNo);
+      const end = doc.lineCount > lineNo ? doc.lineAt(lineNo).range.end : start;
+      const severity =
+        h[1] === "warning"
+          ? vscode.DiagnosticSeverity.Warning
+          : h[1] === "note"
+            ? vscode.DiagnosticSeverity.Information
+            : vscode.DiagnosticSeverity.Error;
+      const d = new vscode.Diagnostic(new vscode.Range(start, end), h[3], severity);
+      d.source = "blade";
+      d.code = h[2];
+      result.push(d);
+      continue;
+    }
     const m = DIAG_RE.exec(line);
     if (!m) continue;
     const lineNo = Math.max(0, parseInt(m[2], 10) - 1);
     const colNo = Math.max(0, parseInt(m[3], 10) - 1);
     const start = new vscode.Position(lineNo, colNo);
-    // Statement-level spans only today: highlight from the reported column to
-    // the end of that line so the squiggle is visible.
+    // Statement-level spans only in this legacy format: highlight from the
+    // reported column to the end of that line so the squiggle is visible.
     const end = doc.lineCount > lineNo ? doc.lineAt(lineNo).range.end : start;
     const severity = /^warning/i.test(m[4])
       ? vscode.DiagnosticSeverity.Warning
@@ -123,6 +156,8 @@ function jsonToDiagnostics(doc, payload) {
       severity
     );
     diag.source = "blade";
+    // BLxxxx diagnostic code (additive field, compilers >= diagnostics arc).
+    if (d.code) diag.code = d.code;
     result.push(diag);
   }
   return result;
@@ -189,13 +224,11 @@ function reportNoCompiler(exe) {
   );
 }
 
-// --- REPL-style evaluation (blade run) ---------------------------------------
+// --- Batch run (blade run) ---------------------------------------------------
 //
-// Blade has no interactive session, but `blade run` auto-prints every
-// top-level binding ("x = 7"), so compiling and running a snippet behaves
-// like REPL evaluation. Alt+Enter sends the selection (or current line);
-// Alt+Shift+Enter runs the whole file. Output lands in the "Blade REPL"
-// channel.
+// The ▶ Run path stays a full g++ compile+run of the saved file (`blade run`
+// auto-prints every top-level binding) — no session, full codegen fidelity.
+// Interactive evaluation goes through the interpreter-backed REPL below.
 
 /** @type {vscode.OutputChannel} */
 let replChannel;
@@ -237,56 +270,24 @@ async function commandRunFile() {
   await runBlade(editor.document.fileName, `> run ${path.basename(editor.document.fileName)}`);
 }
 
-// --- Interactive REPL terminal (`blade repl`) --------------------------------
+// --- Interactive REPL (`blade repl`, interpreter-backed) ---------------------
 //
-// The compiler's `blade repl` subcommand is an accumulating session: each
-// submitted snippet recompiles and re-runs the whole session, printing only
-// new/changed values, with in-place rebinding. The extension hosts it in a
-// real terminal (like Ionide's FSI / the Python REPL) and Alt+Enter sends
-// code into its stdin via sendText.
+// The compiler's `blade repl` subcommand is an accumulating session, now
+// evaluated by the tree-walking interpreter (<100 ms per input; per-input
+// g++ fallback for what it can't cover yet). src/repl.js owns the process
+// behind a pseudoterminal, which is what lets Alt+Enter results render
+// INLINE next to the evaluated line as well as in the terminal transcript.
+// The anchor ({ uri, line, version }) names the line the result decorates;
+// version-stamping lets a late result detect that the document moved on.
 
-/** @type {vscode.Terminal | undefined} */
-let replTerminal;
-
-function getReplTerminal(cwd) {
-  if (replTerminal && replTerminal.exitStatus === undefined) return replTerminal;
-  const exe = findCompiler();
-  replTerminal = vscode.window.createTerminal({
-    name: "Blade REPL",
-    shellPath: exe,
-    shellArgs: ["repl"],
-    cwd,
-  });
-  return replTerminal;
-}
-
-function replCwdFor(doc) {
-  // The REPL process's cwd is where the compiled session runs, so relative
-  // data paths (NetCDF.load("sample.nc")) resolve next to the source file.
-  if (doc && doc.uri.scheme === "file") return path.dirname(doc.fileName);
-  const ws = vscode.workspace.workspaceFolders;
-  return ws && ws.length > 0 ? ws[0].uri.fsPath : undefined;
-}
-
-function sendToRepl(doc, code) {
-  const term = getReplTerminal(replCwdFor(doc));
-  term.show(true);
-  const lines = code.split(/\r?\n/);
-  if (lines.length > 1) {
-    // Batch multi-line input so the whole block evaluates as ONE snippet
-    // (one recompile) instead of line-by-line.
-    term.sendText(":paste");
-    term.sendText(code);
-    term.sendText(":end");
-  } else {
-    term.sendText(code);
-  }
+function anchorAt(doc, line) {
+  return { uri: doc.uri.toString(), line, version: doc.version };
 }
 
 function commandStartRepl() {
   const editor = vscode.window.activeTextEditor;
   const doc = editor && editor.document.languageId === "blade" ? editor.document : undefined;
-  getReplTerminal(replCwdFor(doc)).show(false);
+  repl.startRepl(doc);
 }
 
 function commandSendSelectionToRepl() {
@@ -296,7 +297,15 @@ function commandSendSelectionToRepl() {
   const sel = editor.selection;
   const code = sel.isEmpty ? doc.lineAt(sel.active.line).text : doc.getText(sel);
   if (!code.trim()) return;
-  sendToRepl(doc, code);
+  // The result decorates the submission's last line — where its value
+  // "returns" (a full-line selection's end often sits at col 0 of the NEXT
+  // line; step back so the anchor stays on the code).
+  const anchorLine = sel.isEmpty
+    ? sel.active.line
+    : sel.end.character === 0 && sel.end.line > sel.start.line
+      ? sel.end.line - 1
+      : sel.end.line;
+  repl.sendToRepl(doc, code, anchorAt(doc, anchorLine));
   // Python-style: with no selection, step the cursor to the next non-empty
   // line so repeated Alt+Enter walks the file.
   if (sel.isEmpty) {
@@ -313,9 +322,12 @@ function commandSendSelectionToRepl() {
 function commandSendFileToRepl() {
   const editor = vscode.window.activeTextEditor;
   if (!editor || editor.document.languageId !== "blade") return;
-  const code = editor.document.getText();
+  const doc = editor.document;
+  const code = doc.getText();
   if (!code.trim()) return;
-  sendToRepl(editor.document, code);
+  let last = doc.lineCount - 1;
+  while (last > 0 && doc.lineAt(last).text.trim() === "") last--;
+  repl.sendToRepl(doc, code, anchorAt(doc, last));
 }
 
 async function commandEmitFile() {
@@ -925,6 +937,7 @@ function activate(context) {
   diagnostics = vscode.languages.createDiagnosticCollection("blade");
   output = vscode.window.createOutputChannel("Blade");
   context.subscriptions.push(diagnostics, output);
+  repl.init(context, { findCompiler, reportNoCompiler });
 
   const cfg = () => vscode.workspace.getConfiguration("blade");
 
@@ -950,10 +963,7 @@ function activate(context) {
     vscode.commands.registerCommand("blade.startRepl", commandStartRepl),
     vscode.commands.registerCommand("blade.runSelection", commandSendSelectionToRepl),
     vscode.commands.registerCommand("blade.sendFileToRepl", commandSendFileToRepl),
-
-    vscode.window.onDidCloseTerminal((t) => {
-      if (t === replTerminal) replTerminal = undefined;
-    }),
+    vscode.commands.registerCommand("blade.replReset", () => repl.resetRepl()),
 
     vscode.workspace.onDidSaveTextDocument((doc) => {
       if (cfg().get("checkOnSave", true)) checkDocument(doc);

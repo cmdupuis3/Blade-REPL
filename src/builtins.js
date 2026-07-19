@@ -256,6 +256,15 @@ const identifiers = {
     ],
     ret: "(Int64, ...)",
   },
+  complex: {
+    category: "core",
+    doc: "Complex literal constructor — the one way to build a complex value. Components must be float-typed (no implicit int promotion). Yields Complex128; checked against a Complex64 annotation it adopts the narrow width.",
+    params: [
+      { name: "re", type: "Float64", doc: "real part" },
+      { name: "im", type: "Float64", doc: "imaginary part" },
+    ],
+    ret: "Complex128",
+  },
   conj: {
     category: "core",
     doc: "Complex conjugate (elementwise on arrays).",

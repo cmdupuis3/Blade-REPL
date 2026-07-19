@@ -14,7 +14,8 @@
   "main": "./src/extension.js",
   "activationEvents": [],
   "scripts": {
-    "test": "node --check src/extension.js && node --check src/builtins.js && node --check src/types.js && node --check src/keywords.js && node scripts/check-consistency.js"
+    "test": "node --check src/extension.js && node --check src/repl.js && node --check src/replProto.js && node --check src/builtins.js && node --check src/types.js && node --check src/keywords.js && node scripts/check-consistency.js",
+    "test:repl": "node scripts/repl-protocol-test.js"
   },
   "contributes": {
     "languages": [
@@ -60,6 +61,11 @@
           "type": "number",
           "default": 180,
           "description": "Timeout for 'Blade run' invocations (compile + execute; first runs invoke g++)."
+        },
+        "blade.inlineReplResults": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show each REPL evaluation's result inline at the end of the evaluated line (green value / red error; full output and timing on hover). Cleared when the document changes."
         }
       }
     },
@@ -84,6 +90,10 @@
       {
         "command": "blade.startRepl",
         "title": "Blade: Start REPL"
+      },
+      {
+        "command": "blade.replReset",
+        "title": "Blade: Reset REPL Session"
       },
       {
         "command": "blade.emitFile",

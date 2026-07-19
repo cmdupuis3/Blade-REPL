@@ -136,7 +136,7 @@
       "comment": "One pattern per hover category (src/builtins.js); scripts/check-consistency.js keeps these word lists and the hover tables in sync",
       "patterns": [
         {
-          "match": "\\b(method_for|object_for|transpose|hermitian|gram|decompact|compute|read|sequence|replicate|zip|stack|arity|nth|zero|rank|mask|compound|intersect|union|unique|contains|group_by|group_keys|sort|reduce|conj|extents|prodsum|fill_random|grad|min|max|length)\\b",
+          "match": "\\b(method_for|object_for|transpose|hermitian|gram|decompact|compute|read|sequence|replicate|zip|stack|arity|nth|zero|rank|mask|compound|intersect|union|unique|contains|group_by|group_keys|sort|reduce|conj|extents|prodsum|fill_random|grad|min|max|length|complex)\\b",
           "name": "support.function.builtin.blade"
         },
         {
