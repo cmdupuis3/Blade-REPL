@@ -16,60 +16,60 @@
 // with the one-liner below the rule. Mirrors the grammar's primitive-types
 // list, plus the nullary Void/Unit.
 const primitives = {
-  Int: "32-bit signed integer (alias of Int32).",
-  Int32: "32-bit signed integer.",
-  Int64: "64-bit signed integer.",
-  Float: "64-bit float (alias of Float64).",
-  Float32: "32-bit IEEE float.",
-  Float64: "64-bit IEEE float (double precision).",
-  Double: "64-bit float (alias of Float64).",
-  Complex64: "Single-precision complex number (two Float32 parts).",
-  Complex128: "Double-precision complex number (two Float64 parts).",
-  Bool: "Boolean truth value.",
-  String: "Text string.",
+  Int: "32-bit integer.",
+  Int32: "32-bit integer.",
+  Int64: "64-bit integer.",
+  Float: "64-bit float",
+  Float32: "32-bit float.",
+  Float64: "64-bit float.",
+  Double: "64-bit float.",
+  Complex64: "64-bit complex number (pair of Float32).",
+  Complex128: "128-bit complex number (pair of Float64).",
+  Bool: "Boolean.",
+  String: "String of text.",
   Nat: "Type-level natural: a static size/extent (indices, arities).",
-  Char: "Character literal (stored as Int32).",
+  Char: "Character literal.",
   Void: "No value; the type of pure-effect positions.",
-  Unit: "The unit (empty tuple) type. As a declaration keyword, `Unit meters` / `Unit velocity = meters / seconds` introduces a unit of measure for `Float<unit>` annotations.",
+  Unit: "The unit (empty tuple) type. Not to be confused with the `Unit` declaration keyword, which introduces a unit of measure for `Float<unit>` annotations.",
 };
 
 // The index-type family. `sig` shows the argument shape; `desc` is a very
 // short description of the index type and the arguments it takes.
 const indexTypes = {
   Idx: {
-    sig: "Idx<n>",
-    desc: "Dense index of extent n (a literal size or a nominal index type).",
+    sig: "Idx<n: Nat>",
+    desc: "Simple index type.\n Index type of extent n: Nat.",
   },
   SymIdx: {
-    sig: "SymIdx<r, n>",
-    desc: "Symmetric index: rank-r symmetric group over an extent-n index (compacted upper-triangular storage).",
+    sig: "SymIdx<r: Nat, n: Nat>",
+    desc: "Symmetric index type. \n Rank-r symmetric dimensions over an extent-n index.",
   },
   AntisymIdx: {
-    sig: "AntisymIdx<r, n>",
-    desc: "Antisymmetric index: rank-r antisymmetric group over an extent-n index (strict upper-triangular storage).",
+    sig: "AntisymIdx<r: Nat, n: Nat>",
+    desc: "Antisymmetric index type. \n Rank-r antisymmetric dimensions over an extent-n index (no diagonal).",
   },
   HermitianIdx: {
-    sig: "HermitianIdx<n>",
-    desc: "Hermitian index: conjugate-symmetric pair over an extent-n index (complex arrays).",
+    sig: "HermitianIdx<n: Nat>",
+    desc: "Hermitian index type. \n Rank-2 conjugate-symmetric dimensions over an extent-n index (real- and complex-valued only).",
   },
   CompoundIdx: {
-    sig: "CompoundIdx<Idx...>",
-    desc: "Compound index: a masked / sparse view over one or more base index types.",
+    sig: "CompoundIdx<Tuple<I_j: Idx<n_j: Nat>>, mask: bool^r>",
+    desc: "Compound index type.\n Contiguous storage of a masked or sparse view over one or more base index types.",
   },
   EnumIdx: {
     sig: "EnumIdx<Enum>",
-    desc: "Enumerated index: one position per case of an enum / tag set.",
+    desc: "Enumerated index type. \n Only one position per case of an enum / tag set.",
   },
   DepIdx: {
-    sig: "DepIdx<Parent, f>",
-    desc: "Dependent index: per-parent extent given by a function f (ragged / jagged shapes).",
+    sig: "DepIdx<Parent, f: static Nat -> Idx<Nat>>",
+    desc: "Dependent index type. \n Per-parent extent given by a function f (ragged / jagged shapes).",
   },
   RaggedIdx: {
-    sig: "RaggedIdx<Parent, extents>",
-    desc: "Ragged index: variable inner extent per outer position.",
+    sig: "RaggedIdx<I: Idx<Nat>, n: Nat>",
+    desc: "Ragged index type. \n Variable inner extent of length n per outer position.",
   },
   IrrepsIdx: {
-    sig: "IrrepsIdx<spec>",
+    sig: "IrrepsIdx<l: Nat, parity: bool, mult: Nat>",
     desc: "Irreps-structured index: block layout from a static `(l, parity, mult)` spec (equivariant-ML arrays). Navigate blocks with the static builtins `ml.irreps_offset` / `ml.irreps_dim` / `ml.irreps_len` / ...",
   },
 };
@@ -80,12 +80,12 @@ const constructors = {
   Poly: {
     sig: "Poly<T, args>",
     kind: "Type Constructor",
-    desc: "Polyvariadic parameter pack (query with arity / nth).",
+    desc: "Polyvariadic parameter pack.\n Query with arity() and nth().",
   },
   Dist: {
     sig: "Dist<order, Elem like axes>",
     kind: "Type Constructor",
-    desc: "Typed cumulant tower of a random vector: carries the cumulants k1..k_order over the variable axes. Built with `ppl.dist(A, r)`; project a component with `ppl.cumulant(d, k)`; `+` and scalar `*` push forward when independence is declared.",
+    desc: "Typed cumulant tower of a random vector. \n Carries the cumulants k1..k_order over the variable axes. Built with `ppl.dist(A, r)`; project a component with `ppl.cumulant(d, k)`; `+` and scalar `*` push forward when independence is declared.",
   },
 };
 
