@@ -19,7 +19,7 @@ const grammar = JSON.parse(
   fs.readFileSync(path.join(root, "syntaxes", "blade.tmLanguage.json"), "utf8")
 );
 
-// The compiler's reserved words — source: _blade-compiler/Lexer.fs:139-218
+// The compiler's reserved words — source: GitHub/Blade/src/Lexer.fs:139-218
 // (76 distinct; True/False are lexer aliases of true/false and appear in the
 // grammar's booleans pattern only).
 const LEXER_KEYWORDS = [

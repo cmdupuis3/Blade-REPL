@@ -24,13 +24,20 @@ let output;
 let ideMode = "unknown";
 // uri.toString() -> bindings array from the last successful JSON check.
 const bindingsByDoc = new Map();
+// uri.toString() -> type-provider store structure (providers[] from the JSON
+// check), each entry tagged with `_loadText` (the source text of its `.load`
+// line). Cached so tooltips survive an edit that breaks the check elsewhere,
+// and a store is only re-validated when its own `.load` expression changes.
+const providersByDoc = new Map();
 // Warn about a missing compiler only once per session.
 let warnedNoCompiler = false;
 
 const CANDIDATE_COMPILERS = [
   "Blade", // PATH
-  "C:\\Users\\cdupu\\Documents\\_blade-compiler\\bin\\Release\\net7.0\\Blade.exe",
-  "C:\\Users\\cdupu\\Documents\\_blade-compiler\\bin\\Debug\\net7.0\\Blade.exe",
+  // Canonical compiler repo (standard .NET layout). findCompiler() picks the
+  // most-recently-built of these, so Release/Debug both work.
+  "C:\\Users\\cdupu\\Documents\\GitHub\\Blade\\bin\\Release\\net7.0\\Blade.exe",
+  "C:\\Users\\cdupu\\Documents\\GitHub\\Blade\\bin\\Debug\\net7.0\\Blade.exe",
 ];
 
 function findCompiler() {
@@ -52,12 +59,12 @@ function findCompiler() {
   return best ? best.path : "Blade";
 }
 
-function run(exe, args, timeoutMs) {
+function run(exe, args, timeoutMs, cwd) {
   return new Promise((resolve) => {
     cp.execFile(
       exe,
       args,
-      { timeout: timeoutMs || 30000, maxBuffer: 16 * 1024 * 1024 },
+      { timeout: timeoutMs || 30000, maxBuffer: 16 * 1024 * 1024, cwd: cwd || undefined },
       (err, stdout, stderr) => {
         resolve({
           // err.code is the exit code (number) or a spawn error string like "ENOENT"
@@ -167,10 +174,16 @@ function jsonToDiagnostics(doc, payload) {
 async function checkDocument(doc) {
   if (doc.languageId !== "blade" || doc.uri.scheme !== "file") return;
   const exe = findCompiler();
+  // Run from the file's own directory so a provider's relative data path
+  // (`z.load("data/…")`) resolves the same way it does when the compiler is
+  // invoked from that folder. Without this the load fails, which both drops
+  // provider tooltips and — for unannotated reads — makes the file fail to
+  // type-check, emptying `bindings` (so even ordinary/param hovers disappear).
+  const cwd = path.dirname(doc.fileName);
 
   // Prefer the JSON IDE mode; probe once per session.
   if (ideMode !== "text") {
-    const res = await run(exe, ["ide", "check", "--json", doc.fileName]);
+    const res = await run(exe, ["ide", "check", "--json", doc.fileName], undefined, cwd);
     if (res.failedToSpawn) {
       reportNoCompiler(exe);
       return;
@@ -184,7 +197,27 @@ async function checkDocument(doc) {
     if (payload && typeof payload === "object" && (payload.diagnostics || payload.bindings)) {
       ideMode = "json";
       bindingsByDoc.set(doc.uri.toString(), payload.bindings || []);
+      cacheProviders(doc, payload.providers || []);
       diagnostics.set(doc.uri, jsonToDiagnostics(doc, payload));
+      // Concise telemetry so a "no tooltips" report can be pinpointed: empty
+      // bindings ⇒ the file didn't type-check; providers=0 on a provider file
+      // ⇒ its data path didn't resolve from the run directory.
+      output.appendLine(
+        `[blade] ${path.basename(doc.fileName)}: bindings=${(payload.bindings || []).length}` +
+          ` providers=${(payload.providers || []).length} diagnostics=${(payload.diagnostics || []).length}`
+      );
+      return;
+    }
+    // Non-JSON output. If JSON mode was never established this is an old
+    // compiler → latch to text mode. But once JSON has worked, a later
+    // non-JSON result is a transient failure (e.g. the compiler crashed on
+    // this file); keep JSON mode and the last-good hovers rather than killing
+    // tooltips for the rest of the session.
+    if (ideMode === "json") {
+      output.appendLine(
+        `[blade] ide check produced no JSON for ${path.basename(doc.fileName)} (kept last-good hovers)`
+      );
+      if (res.stderr) output.appendLine(res.stderr.split(/\r?\n/).slice(0, 20).join("\n"));
       return;
     }
     ideMode = "text";
@@ -193,7 +226,7 @@ async function checkDocument(doc) {
     );
   }
 
-  const res = await run(exe, ["check", doc.fileName]);
+  const res = await run(exe, ["check", doc.fileName], undefined, cwd);
   if (res.failedToSpawn) {
     reportNoCompiler(exe);
     return;
@@ -622,6 +655,107 @@ function lookupBinding(doc, word, line) {
   return best;
 }
 
+// --- Type-provider structure (providers[]) ----------------------------------
+
+/** Trimmed source text of a 1-based line, or "" if out of range. */
+function loadLineText(doc, line) {
+  const idx = (line || 1) - 1;
+  return idx >= 0 && idx < doc.lineCount ? doc.lineAt(idx).text.trim() : "";
+}
+
+/**
+ * Merge a fresh providers[] payload into the per-document cache. Fresh entries
+ * win; a previously-cached store is kept only when its `.load` line text is
+ * unchanged in the current document — so tooltips persist across an edit that
+ * breaks the check elsewhere, and refresh exactly when a `.load` changes.
+ */
+function cacheProviders(doc, incoming) {
+  const key = doc.uri.toString();
+  const prev = providersByDoc.get(key) || [];
+  const byStore = new Map();
+  for (const p of prev) {
+    if (p._loadText && p._loadText === loadLineText(doc, p.line)) byStore.set(p.store, p);
+  }
+  for (const p of incoming) {
+    p._loadText = loadLineText(doc, p.line);
+    byStore.set(p.store, p);
+  }
+  providersByDoc.set(key, Array.from(byStore.values()));
+}
+
+/** The cached provider store named `name` in this document, or undefined. */
+function lookupProviderStore(doc, name) {
+  return (providersByDoc.get(doc.uri.toString()) || []).find((p) => p.store === name);
+}
+
+/** Hover for a provided member (`store.vars.x` / `store.dims.x`). */
+function providerMemberMarkdown(prov, section, mem) {
+  return typeMarkdown(
+    [`${mem.name}: ${mem.type}`],
+    `${prov.provider} \`${section}\` member of \`${prov.store}\` — \`${prov.path}\``,
+    false
+  );
+}
+
+/** Hover for a store handle (`let store = z.load(...)`): the dims/vars it exposes. */
+function providerStoreMarkdown(prov) {
+  const md = new vscode.MarkdownString();
+  md.appendCodeblock(`${prov.store} : ${prov.provider} store`, "blade");
+  md.appendMarkdown(`\n*data provider (${prov.provider}) — \`${prov.path}\`*\n`);
+  const fmt = (arr) => arr.map((m) => `${m.name}: ${m.type}`).join("\n");
+  if (prov.dims && prov.dims.length) {
+    md.appendMarkdown("\n---\n`dims`\n");
+    md.appendCodeblock(fmt(prov.dims), "blade");
+  }
+  if (prov.vars && prov.vars.length) {
+    md.appendMarkdown("\n`vars`\n");
+    md.appendCodeblock(fmt(prov.vars), "blade");
+  }
+  return md;
+}
+
+/** Hover for a provider alias (`z`): the provider it names and stores it loads. */
+function providerAliasMarkdown(alias, provs) {
+  const provider = provs[0].provider;
+  const md = new vscode.MarkdownString();
+  md.appendCodeblock(`import ${provider} as ${alias}`, "blade");
+  md.appendMarkdown(`\n*data provider (${provider})*\n`);
+  if (provs.length) {
+    md.appendMarkdown("\n---\nstores\n");
+    md.appendCodeblock(
+      provs.map((p) => `${p.store} = ${alias}.load("${p.path}")`).join("\n"),
+      "blade"
+    );
+  }
+  return md;
+}
+
+/**
+ * Provider hover for the identifier at `position`: a provided member, a store
+ * handle, or a provider alias. Returns undefined when none applies (so the
+ * caller falls through to ordinary bindings/builtins/types).
+ */
+function providerHover(doc, position, word, wordRange) {
+  // Provided member: the word follows `<store>.vars.` / `<store>.dims.`.
+  const linePrefix = doc.lineAt(position.line).text.slice(0, wordRange.start.character);
+  const m = /([A-Za-z_]\w*)\s*\.\s*(vars|dims)\s*\.\s*$/.exec(linePrefix);
+  if (m) {
+    const prov = lookupProviderStore(doc, m[1]);
+    if (prov) {
+      const members = (m[2] === "dims" ? prov.dims : prov.vars) || [];
+      const mem = members.find((x) => x.name === word);
+      if (mem) return new vscode.Hover(providerMemberMarkdown(prov, m[2], mem), wordRange);
+    }
+  }
+  // Store handle: the word is a loaded store's binding name.
+  const store = lookupProviderStore(doc, word);
+  if (store) return new vscode.Hover(providerStoreMarkdown(store), wordRange);
+  // Provider alias: the word is an `import <p> as <word>` alias.
+  const aliased = (providersByDoc.get(doc.uri.toString()) || []).filter((p) => p.alias === word);
+  if (aliased.length) return new vscode.Hover(providerAliasMarkdown(word, aliased), wordRange);
+  return undefined;
+}
+
 /**
  * Build a normalizer for type strings the compiler reports. It rewrites the
  * IR's function-type spelling (`Arrow`) to `function`, and renders templated
@@ -727,6 +861,17 @@ const hoverProvider = {
     const wordRange = doc.getWordRangeAtPosition(position, /[A-Za-z_][A-Za-z0-9_]*/);
     if (wordRange) {
       const word = doc.getText(wordRange);
+      // Type-provider structure wins over ordinary bindings so a store name
+      // shows its dims/vars (and members/aliases, which aren't bindings) rather
+      // than the opaque `let store : store`. Guarded so a malformed payload
+      // can never break ordinary hovers.
+      let prov;
+      try {
+        prov = providerHover(doc, position, word, wordRange);
+      } catch (_) {
+        prov = undefined;
+      }
+      if (prov) return prov;
       // Source bindings win over the builtin table (shadowing).
       const b = lookupBinding(doc, word, position.line);
       if (b) {
@@ -736,7 +881,11 @@ const hoverProvider = {
           Array.isArray(b.params) && b.ret !== undefined
             ? renderCallable(b.kind || "function", b.name, b.params, b.ret, b.where)
             : signatureText(b.kind || "", b.name, b.type);
-        return new vscode.Hover(hoverMarkdown(sig, b.doc), wordRange);
+        // A top-level provider read carries its source member as a badge.
+        const badge = b.providerRead
+          ? `from ${b.providerRead.store}.${b.providerRead.member}`
+          : undefined;
+        return new vscode.Hover(hoverMarkdown(sig, b.doc, badge), wordRange);
       }
       const builtin = builtins.identifiers[word];
       if (builtin) {
@@ -976,6 +1125,7 @@ function activate(context) {
     vscode.workspace.onDidCloseTextDocument((doc) => {
       diagnostics.delete(doc.uri);
       bindingsByDoc.delete(doc.uri.toString());
+      providersByDoc.delete(doc.uri.toString());
       typeDeclCache.delete(doc.uri.toString());
     }),
 

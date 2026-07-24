@@ -16,8 +16,8 @@ function findExe() {
   if (process.env.BLADE_EXE) return process.env.BLADE_EXE;
   // Same candidates (and freshness rule) as findCompiler in src/extension.js.
   const candidates = [
-    "C:\\Users\\cdupu\\Documents\\_blade-compiler\\bin\\Release\\net7.0\\Blade.exe",
-    "C:\\Users\\cdupu\\Documents\\_blade-compiler\\bin\\Debug\\net7.0\\Blade.exe",
+    "C:\\Users\\cdupu\\Documents\\GitHub\\Blade\\bin\\Release\\net7.0\\Blade.exe",
+    "C:\\Users\\cdupu\\Documents\\GitHub\\Blade\\bin\\Debug\\net7.0\\Blade.exe",
   ];
   let best;
   for (const c of candidates) {
