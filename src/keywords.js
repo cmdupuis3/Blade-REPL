@@ -17,31 +17,31 @@
 const keywords = {
   comm: {
     usage: "where comm(A, B)",
-    doc: "Commutativity constraint: declares the listed parameters interchangeable (the kernel is invariant under their exchange). Licenses symmetric packing (SymIdx) and triangular iteration. A where clause may name several comma-separated groups.",
+    doc: "Kernel commutativity group. All args in a single comm(...) conjunct are mutually commutative. If these args recieve copies of the same array, the output dimensions are transposed and made symmetric.",
   },
   omp: {
     usage: "where omp(x: 1)",
-    doc: "OpenMP parallelization strategy for the enclosing function or lambda's loop nest. Mutually exclusive with cuda and mpi.",
+    doc: "OpenMP parallelization strategy. The first n dimensions of x are parallelized with OpenMP.",
   },
   cuda: {
     usage: "where cuda(block: 64)",
-    doc: "CUDA execution strategy for the enclosing function or lambda. Mutually exclusive with omp and mpi.",
+    doc: "CUDA parallelization strategy. S-dimensions are collapsed and pooled, then distributed to CUDA blocks of the given size.",
   },
   mpi: {
     usage: "where mpi",
-    doc: "MPI distribution strategy (bare conjunct) for the enclosing function or lambda. Mutually exclusive with omp and cuda. Run distributed with `blade run <file> --mpi N`.",
+    doc: "MPI parallelization strategy. Only applies to the first S-dimension.",
   },
   indep: {
-    usage: "where p.indep(a, b)   (with import ppl as p)",
+    usage: "where ppl.indep(a, b)",
     doc: "PPL conjunct: declares two Dist-typed parameters independent within this function, licensing `+` on them. Call sites discharge it from declared or derived independence. Must be written qualified with the ppl import's alias — bare `where indep(a, b)` no longer resolves. Module-level form: `let _ = ppl.independent(X, Y)`.",
   },
   like: {
     usage: "Array<Float64 like Lat, Lon>",
-    doc: "Separates an array's element type from its index-type list inside Array<...> (and Dist<...>) annotations.",
+    doc: "Separates an array's element type from its index-type list inside Array<...> and Dist<...> annotations.",
   },
   where: {
     usage: "function f(A, B) where comm(A, B), omp(x: 1) -> T",
-    doc: "Constraint clause on functions and lambdas: commutativity groups (comm), at most one parallel strategy (omp / cuda / mpi), and module-qualified conjuncts such as p.indep(a, b) (with `import ppl as p`) — comma-separated. Also opens the constraint block of grouped type aliases (`type P1 = T1 and P2 = T2 where ...`).",
+    doc: "Constraint clause on functions and lambdas: commutativity groups (comm), at most one parallel strategy (omp / cuda / mpi), and module-qualified conjuncts such as pppl.indep(a, b), comma-separated. Also opens the constraint block of grouped type aliases (`type P1 = T1 and P2 = T2 where ...`).",
   },
   static: {
     usage: "let static n = 2",

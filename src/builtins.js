@@ -45,14 +45,14 @@
 // Category -> hover badge text. Rendered as an italic line under the
 // signature block; also drives completion detail and the consistency check.
 const categories = {
-  core: "builtin",
-  virtual: "virtual array — index-defined, no storage",
-  autodiff: "autodiff — requires `import ad`, call qualified (ad.…)",
-  math: "math intrinsic — scalar, result Float64",
-  static: "static builtin — `let static` contexts only",
-  ppl: "PPL — requires `import ppl`, call qualified (ppl.…)",
-  ml: "ML — requires `import ml`, call qualified (ml.…)",
-  module: "import-gated module — members resolve only qualified through the import's alias",
+  core: "Builtin",
+  virtual: "Virtual array",
+  autodiff: "Autodifferentiation — requires `import ad`",
+  math: "Math intrinsic — requires `import math`",
+  static: "Static builtin — Statically evaluable native functions, mainly for `static` contexts",
+  ppl: "PPL — requires `import ppl`",
+  ml: "ML — requires `import ml`",
+  module: "Module — requires `import <module>`",
 };
 
 // --- Core: loop builders, combinators, array/SQL algebra ---------------------
@@ -60,41 +60,41 @@ const categories = {
 const identifiers = {
   method_for: {
     category: "core",
-    doc: "Builds a method loop over the given arrays' shared iteration space. Apply a kernel with <@>, then force with |> compute.",
+    doc: "Builds a method loop over the given arrays' outer iteration space. Apply to a kernel with <@>.",
     params: [
-      { name: "a1..an", type: "Array<T, Idx...> | lo..hi", doc: "arrays (or an anonymous range) defining the iteration space" },
+      { name: "a, ...", type: "(Idx... -> T)... -> U", doc: "Tuple of arrays" },
     ],
     ret: "MethodLoop<n>",
   },
   object_for: {
     category: "core",
-    doc: "Builds an object loop from a kernel. Compose with >>@ / @>>, apply with <@>.",
+    doc: "Builds an object loop from a kernel function. Apply to an array tuple with <@>.",
     params: [
-      { name: "kernel", type: "lambda(T...) -> U", doc: "kernel defining the object's per-site value" },
+      { name: "kernel", type: "T -> U", doc: "Kernel function" },
     ],
     ret: "ObjectLoop<n>",
   },
   compute: {
     category: "core",
-    doc: "Forces a deferred loop pipeline, materializing its result (single fused loop nest where possible). Used as a pipe terminal: `... |> compute`.",
+    doc: "Evaluates a computation. Used as a pipe terminal: `comp |> compute`.",
     params: [
-      { name: "pipeline", type: "deferred", doc: "unforced loop pipeline (piped in with |>)" },
+      { name: "comp", type: "Computation", doc: "Unevaluated computation resulting from loop application" },
     ],
-    ret: "Array | scalar | tuple",
+    ret: "T",
   },
   pure: {
     category: "core",
-    doc: "Wraps a value as a pure (effect-free) computation. Also a reserved keyword (cannot be rebound).",
+    doc: "Wraps a value as a pure computation.",
     params: [
-      { name: "expr", type: "T", doc: "value to lift" },
+      { name: "Value", type: "T", doc: "Value to lift" },
     ],
     ret: "Computation<T>",
   },
   read: {
     category: "core",
-    doc: "Read terminal for a deferred pipeline: `... |> read`.",
+    doc: "Read terminal for a file-provided value: `value |> read`.",
     params: [
-      { name: "pipeline", type: "deferred", doc: "unforced loop pipeline (piped in with |>)" },
+      { name: "value", type: "T", doc: "File-provided value to read" },
     ],
     ret: "T",
   },
@@ -102,9 +102,9 @@ const identifiers = {
     category: "core",
     doc: "Reduction over an array or unforced deferred pipeline (fused into one loop nest with scalar accumulators when deferred).",
     params: [
-      { name: "array", type: "Array<T, Idx...> | deferred", doc: "values to reduce" },
-      { name: "kernel", type: "lambda(U, T) -> U", doc: "combining function" },
-      { name: "init", type: "U  (optional)", doc: "initial accumulator; defaults to the kernel's zero" },
+      { name: "array", type: "Idx... -> T", doc: "Array to reduce" },
+      { name: "kernel", type: "U -> T -> U", doc: "combining function" },
+      { name: "init", type: "U", doc: " Optional initial accumulator; defaults to the kernel's zero" },
     ],
     ret: "U",
   },
@@ -112,17 +112,17 @@ const identifiers = {
     category: "core",
     doc: "Filters an array by a boolean predicate array, yielding a compound (masked) view. Rearrangement combinator; forces deferred inputs.",
     params: [
-      { name: "array", type: "Array<T, Idx...>", doc: "source array" },
-      { name: "predicate", type: "Array<Bool, Idx...>", doc: "boolean mask over the same index space" },
+      { name: "array", type: "Idx... -> T", doc: "source array" },
+      { name: "predicate", type: "Idx... -> Bool", doc: "boolean mask over the same index space" },
     ],
-    ret: "compound view of Array<T, Idx...>",
+    ret: "Idx... -> T",
   },
   compound: {
     category: "core",
     doc: "Constructs a compound (sparse-view) array from a dense array and a boolean mask sharing its named index types.",
     params: [
-      { name: "dense", type: "Array<T, Idx...>", doc: "dense source values" },
-      { name: "mask", type: "Array<Bool, Idx...>", doc: "present/absent mask; must share the dense array's index types" },
+      { name: "dense", type: "Idx... -> T", doc: "dense source values" },
+      { name: "mask", type: "Idx... -> Bool", doc: "present/absent mask; must share the dense array's index types" },
     ],
     ret: "compound view of Array<T, Idx...>",
   },
@@ -130,58 +130,58 @@ const identifiers = {
     category: "core",
     doc: "Co-iterates arrays over a shared index space.",
     params: [
-      { name: "a1..an", type: "Array<T, Idx>", doc: "arrays sharing an index space" },
+      { name: "a1..an", type: "(Idx... -> Tn)...", doc: "arrays sharing an index space" },
     ],
-    ret: "co-iterated view",
+    ret: "Idx... -> (T1, ..., Tn)",
   },
   stack: {
     category: "core",
     doc: "Stacks arrays along a new leading dimension.",
     params: [
-      { name: "a1..an", type: "Array<T, Idx...>", doc: "same-shaped arrays to stack" },
+      { name: "a1..an", type: "(Idx... -> T)...", doc: "same-shaped arrays to stack" },
     ],
-    ret: "Array<T, Idx<n>, Idx...>",
+    ret: "Idx<n> -> Idx... -> T",
   },
   sort: {
     category: "core",
     doc: "Sorts an array. Rearrangement combinator; forces deferred inputs.",
     params: [
-      { name: "array", type: "Array<T, Idx>", doc: "values to sort" },
-      { name: "key", type: "lambda(T) -> U  (optional)", doc: "sort key; defaults to the element itself" },
+      { name: "array", type: "Idx... -> T", doc: "values to sort" },
+      { name: "key", type: "U -> T -> U  (optional)", doc: "sort key; defaults to the element itself" },
     ],
-    ret: "Array<T, Idx>",
+    ret: "Idx... -> T",
   },
   unique: {
     category: "core",
     doc: "Distinct elements. Rearrangement combinator; forces deferred inputs.",
     params: [
-      { name: "array", type: "Array<T, Idx>", doc: "source values" },
+      { name: "array", type: "Idx... -> T", doc: "source values" },
     ],
-    ret: "Array<T, Idx>",
+    ret: "Idx... -> T",
   },
   intersect: {
     category: "core",
     doc: "Set intersection of two arrays. Forces deferred inputs.",
     params: [
-      { name: "a", type: "Array<T, Idx>", doc: "left operand" },
-      { name: "b", type: "Array<T, Idx>", doc: "right operand" },
+      { name: "a", type: "Idx... -> T", doc: "left operand" },
+      { name: "b", type: "Idx... -> T", doc: "right operand" },
     ],
-    ret: "Array<T, Idx>",
+    ret: "Idx... -> T",
   },
   union: {
     category: "core",
     doc: "Set union of two arrays. Forces deferred inputs.",
     params: [
-      { name: "a", type: "Array<T, Idx>", doc: "left operand" },
-      { name: "b", type: "Array<T, Idx>", doc: "right operand" },
+      { name: "a", type: "Idx... -> T", doc: "left operand" },
+      { name: "b", type: "Idx... -> T", doc: "right operand" },
     ],
-    ret: "Array<T, Idx>",
+    ret: "Idx... -> T",
   },
   contains: {
     category: "core",
     doc: "Membership test.",
     params: [
-      { name: "array", type: "Array<T, Idx>", doc: "values to search" },
+      { name: "array", type: "Idx... -> T", doc: "values to search" },
       { name: "value", type: "T", doc: "element to look for" },
     ],
     ret: "Bool",
@@ -190,28 +190,28 @@ const identifiers = {
     category: "core",
     doc: "Groups values by a grouping array. Shared rearrangement helper; forces deferred inputs.",
     params: [
-      { name: "values", type: "Array<T, Idx>", doc: "values to group" },
-      { name: "grouping", type: "Array<U, Idx>", doc: "group key for each value (same index space)" },
+      { name: "values", type: "Idx1 -> Idx... -> T", doc: "values to group" },
+      { name: "grouping", type: "GroupKeys<Idx1, Idx2>", doc: "group key for each value (same index space)" },
     ],
-    ret: "grouped Array (ragged by group)",
+    ret: "Idx2 -> Idx... -> T", // TODO: need a type check
   },
   group_keys: {
     category: "core",
     doc: "Key set of a grouping, indexable alongside group_by results.",
     params: [
-      { name: "grouping", type: "Array<T, Idx>", doc: "the grouping array" },
+      { name: "grouping", type: "Idx1 -> Idx2", doc: "the grouping array" },
     ],
-    ret: "GroupKeys<Idx, Idx>",
+    ret: "GroupKeys<Idx1, Idx2>", // TODO: need a type check
   },
   transpose: {
     category: "core",
-    doc: "Swaps two dimensions (default: the first two). Rearrangement combinator; forces deferred inputs.",
+    doc: "Hard-transposes two dimensions.",
     params: [
-      { name: "array", type: "Array<T, Idx1, Idx2, ...>", doc: "source array (rank >= 2)" },
-      { name: "d1", type: "Int  (optional)", doc: "first dimension to swap (default 0)" },
-      { name: "d2", type: "Int  (optional)", doc: "second dimension to swap (default 1)" },
+      { name: "array", type: "Idx1 -> Idx2 -> ... -> T", doc: "source array (r >= 2)" },
+      { name: "d1", type: "Int", doc: "first dimension to transpose" },
+      { name: "d2", type: "Int", doc: "second dimension to transpose" },
     ],
-    ret: "Array<T, Idx2, Idx1, ...>",
+    ret: "Id2 -> Idx1 -> ...-> T",
   },
   decompact: {
     category: "core",
@@ -444,6 +444,18 @@ identifiers.length = {
   category: "static",
   doc: "Length of a static array or tuple. Static evaluator only (`let static` contexts) — at runtime use extents.",
   params: [{ name: "xs", type: "static array | tuple", doc: "compile-time value to measure" }],
+  ret: "Int (static)",
+};
+identifiers.rank = {
+  category: "static",
+  doc: "Rank of an array-valued expression. Static evaluator only (`let static` contexts).",
+  params: [{ name: "x", type: "static array expr", doc: "" }],
+  ret: "Int (static)",
+};
+identifiers.arity = {
+  category: "static",
+  doc: "Arity of an arity-polymorphic array tuple expression. Static evaluator only (`let static` contexts).",
+  params: [{ name: "xs", type: "static array tuple expr", doc: "" }],
   ret: "Int (static)",
 };
 
@@ -807,20 +819,20 @@ identifiers.ml = {
 
 const operators = {
   "<@>": {
-    sig: "loop <@> kernel -> deferred",
-    doc: "Apply: attaches a kernel to a method/object loop, producing a deferred computation (force with |> compute).",
+    sig: "ObjectLoop <@> (Array...) -> Computation \n| MethodLoop <@> kernel -> Computation",
+    doc: "Apply combinator: apply an object loop to an array tuple, or a method loop to a kernel to yield a computation.",
   },
   "<$>": {
-    sig: "f <$> computation",
+    sig: "f <$> Computation",
     doc: "Functor map over a computation.",
   },
   "<&>": {
-    sig: "deferred <&> deferred -> (a, b)",
-    doc: "Parallel composition: run two deferred pipelines side by side; results as a tuple.",
+    sig: "Computation <&> Computation -> Computation",
+    doc: "Loop Join: Merge loop nests of two computations if possible. Yields results as a tuple.",
   },
   "<&!>": {
-    sig: "deferred <&!> deferred -> (a, b)",
-    doc: "Fusion: fuse two deferred pipelines into one loop nest; results as a tuple.",
+    sig: "Computation <&!> Computation -> Computation",
+    doc: "Force Join: fuse two computations completely, error if incompatible. Yields results as a tuple.",
   },
   "<|>": {
     sig: "a <|> b",
@@ -831,16 +843,16 @@ const operators = {
     doc: "Choice with fallback.",
   },
   ">>=": {
-    sig: "computation >>= f",
+    sig: "Computation >>= f",
     doc: "Bind: sequence a computation into a continuation.",
   },
   ">>@": {
     sig: "object_for(f) >>@ object_for(g)",
-    doc: "Compose object loops (g after f).",
+    doc: "Compose-apply: Compose functions inside object loops; object_for(f >> g).",
   },
   "@>>": {
-    sig: "method_loop @>> method_loop",
-    doc: "Compose method loops.",
+    sig: "(method_loop(arrays) <@> f) @>> (method_loop(arrays) <@> g)",
+    doc: "Apply-compose: Compose functions inside method loop computations; method_loop(arrays) <@> (f >> g).",
   },
   "<*>": {
     sig: "a <*> b",
@@ -851,12 +863,12 @@ const operators = {
     doc: "Pipe: feeds the left value to the right function/terminal (compute, read, ...).",
   },
   "|@>": {
-    sig: "a |@> f   (= f <@> a)",
-    doc: "Pipe-apply: desugars to the <@> apply with operands flipped.",
+    sig: "a |@> f",
+    doc: "Pipe-apply: desugars to the <@> apply with operands flipped: f <@> a",
   },
   ">>": {
     sig: "f >> g",
-    doc: "Function composition: applies f, then g.",
+    doc: "Compose: applies f, then g.",
   },
   "..": {
     sig: "lo..hi",
