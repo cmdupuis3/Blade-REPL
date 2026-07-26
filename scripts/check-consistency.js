@@ -20,10 +20,10 @@ const grammar = JSON.parse(
 );
 
 // The compiler's reserved words — source: GitHub/Blade/src/Lexer.fs:139-218
-// (76 distinct; True/False are lexer aliases of true/false and appear in the
+// (77 distinct; True/False are lexer aliases of true/false and appear in the
 // grammar's booleans pattern only).
 const LEXER_KEYWORDS = [
-  "let", "const", "mut", "static", "function", "lambda", "type",
+  "let", "rec", "const", "mut", "static", "function", "lambda", "type",
   "struct", "interface", "impl", "module", "for", "if", "then",
   "else", "match", "with", "where", "and", "comm", "omp", "cuda",
   "mpi", "reynolds", "true", "false", "in", "import", "from", "as",

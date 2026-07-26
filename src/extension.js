@@ -551,8 +551,11 @@ function parseArrayTypeAt(doc, wordRange) {
   const decls = scanTypeDecls(doc);
   const indices = splitTopLevel(idxText, ",").map((text) => {
     const idm = /^([A-Za-z_][A-Za-z0-9_]*)/.exec(text);
-    const nom = idm && decls.get(idm[1]);
-    return { text, doc: nom ? nom.doc : undefined };
+    const name = idm && idm[1];
+    const nom = name && decls.get(name);
+    if (nom) return { text, doc: nom.doc };
+    const it = name && types.indexTypes[name];
+    return { text, doc: it ? it.desc : undefined };
   });
   return { elem, indices };
 }
@@ -757,6 +760,21 @@ function providerMemberMarkdown(prov, section, mem) {
   );
 }
 
+/**
+ * Hover for a provided axis (`store.index.y`): the index type the provider
+ * derived from the file, with its extent when statically known. Annotating
+ * against this instead of a hand-written `Idx<64>` keeps the program tied to
+ * the store rather than to a copied number.
+ */
+function providerAxisMarkdown(prov, ix) {
+  const sig = ix.extent === undefined ? `Idx<${ix.name}>` : `Idx<${ix.extent}>`;
+  return typeMarkdown(
+    [`${prov.store}.index.${ix.name}`, sig, "Provided Index Type"],
+    `${prov.provider} dimension \`${ix.name}\` of \`${prov.store}\` — \`${prov.path}\``,
+    false
+  );
+}
+
 /** Hover for a store handle (`let store = z.load(...)`): the dims/vars it exposes. */
 function providerStoreMarkdown(prov) {
   const md = new vscode.MarkdownString();
@@ -770,6 +788,19 @@ function providerStoreMarkdown(prov) {
   if (prov.vars && prov.vars.length) {
     md.appendMarkdown("\n`vars`\n");
     md.appendCodeblock(fmt(prov.vars), "blade");
+  }
+  // The axis types, spelled as they are written in an annotation.
+  if (prov.indexTypes && prov.indexTypes.length) {
+    md.appendMarkdown("\n`index`\n");
+    md.appendCodeblock(
+      prov.indexTypes
+        .map((ix) =>
+          `${prov.store}.index.${ix.name}` +
+          (ix.extent === undefined ? "" : `  // Idx<${ix.extent}>`)
+        )
+        .join("\n"),
+      "blade"
+    );
   }
   return md;
 }
@@ -806,6 +837,14 @@ function providerHover(doc, position, word, wordRange) {
       const mem = members.find((x) => x.name === word);
       if (mem) return new vscode.Hover(providerMemberMarkdown(prov, m[2], mem), wordRange);
     }
+  }
+  // Provided axis type: the word follows `<store>.index.` — the file-derived
+  // index type, usable in annotations (`Array<Float64 like store.index.y>`).
+  const ax = /([A-Za-z_]\w*)\s*\.\s*index\s*\.\s*$/.exec(linePrefix);
+  if (ax) {
+    const prov = lookupProviderStore(doc, ax[1]);
+    const ix = prov && (prov.indexTypes || []).find((x) => x.name === word);
+    if (ix) return new vscode.Hover(providerAxisMarkdown(prov, ix), wordRange);
   }
   // Store handle: the word is a loaded store's binding name.
   const store = lookupProviderStore(doc, word);
