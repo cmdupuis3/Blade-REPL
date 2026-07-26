@@ -29,6 +29,10 @@ const bindingsByDoc = new Map();
 // line). Cached so tooltips survive an edit that breaks the check elsewhere,
 // and a store is only re-validated when its own `.load` expression changes.
 const providersByDoc = new Map();
+// uri.toString() -> calls array from the last successful JSON check: one
+// entry per builtin call site with the compiler's monomorphized (concrete)
+// argument/result types. Rendered under the abstract signature in hovers.
+const callsByDoc = new Map();
 // Warn about a missing compiler only once per session.
 let warnedNoCompiler = false;
 
@@ -198,6 +202,7 @@ async function checkDocument(doc) {
       ideMode = "json";
       bindingsByDoc.set(doc.uri.toString(), payload.bindings || []);
       cacheProviders(doc, payload.providers || []);
+      callsByDoc.set(doc.uri.toString(), payload.calls || []);
       diagnostics.set(doc.uri, jsonToDiagnostics(doc, payload));
       // Concise telemetry so a "no tooltips" report can be pinpointed: empty
       // bindings ⇒ the file didn't type-check; providers=0 on a provider file
@@ -655,6 +660,61 @@ function lookupBinding(doc, word, line) {
   return best;
 }
 
+// --- Concrete call-site instantiations (calls[]) -----------------------------
+
+/**
+ * The innermost recorded builtin call named `word` whose span contains
+ * `position`. Entries come from the compiler's calls[] payload (1-based
+ * spans, concrete monomorphized types); nested same-name calls resolve to
+ * the tightest enclosing span.
+ */
+function lookupCall(doc, word, position) {
+  const calls = callsByDoc.get(doc.uri.toString());
+  if (!calls) return undefined;
+  const line = position.line + 1;
+  const ch = position.character + 1;
+  const before = (l, c) => l < line || (l === line && c <= ch);
+  const after = (l, c) => l > line || (l === line && c >= ch);
+  let best;
+  for (const c of calls) {
+    if (c.name !== word) continue;
+    if (!before(c.line, c.col) || !after(c.endLine, c.endCol)) continue;
+    if (!best) {
+      best = c;
+      continue;
+    }
+    const startsLater = c.line > best.line || (c.line === best.line && c.col >= best.col);
+    const endsEarlier = c.endLine < best.endLine || (c.endLine === best.endLine && c.endCol <= best.endCol);
+    if (startsLater && endsEarlier) best = c;
+  }
+  return best;
+}
+
+/**
+ * The concrete instantiation block for a recorded call: the abstract
+ * signature's shape with the compiler's monomorphized types substituted
+ * (concrete notation — `Array<Elem like Idx...>`, curried arrows). Param
+ * names are borrowed from the abstract entry when the arity lines up
+ * (variadic/optional entries fall back to positional a1..aN).
+ */
+function renderConcreteCall(name, call, abstractParams) {
+  const args = call.args || [];
+  // Borrow abstract names when they cover the args (trailing params are
+  // optional — reduce's init, sort's key); variadic entries ("a, ..." packs
+  // more args than named params) fall back to positional labels.
+  const names =
+    abstractParams && abstractParams.length >= args.length
+      ? abstractParams.map((p) => p.name)
+      : args.map((_, i) => `a${i + 1}`);
+  if (args.length === 0) return `${name}()${call.ret ? " -> " + call.ret : ""}`;
+  const lines = [`${name}(`];
+  args.forEach((t, i) => {
+    lines.push(`    ${names[i]}: ${t}${i < args.length - 1 ? "," : ""}`);
+  });
+  lines.push(`)${call.ret ? " -> " + call.ret : ""}`);
+  return lines.join("\n");
+}
+
 // --- Type-provider structure (providers[]) ----------------------------------
 
 /** Trimmed source text of a 1-based line, or "" if out of range. */
@@ -892,10 +952,23 @@ const hoverProvider = {
         const sig = builtin.params
           ? renderCallable("", word, builtin.params, builtin.ret, null)
           : builtin.sig;
-        return new vscode.Hover(
-          hoverMarkdown(sig, builtin.doc, builtins.categories[builtin.category]),
-          wordRange
-        );
+        // Abstract signature first, then — when the compiler reported this
+        // call site in calls[] — the concrete monomorphized instantiation,
+        // so the two line up argument-for-argument.
+        const md = new vscode.MarkdownString();
+        md.appendCodeblock(sig, "blade");
+        const call = builtin.params ? lookupCall(doc, word, position) : undefined;
+        if (call) {
+          md.appendMarkdown("\n*this call:*\n");
+          md.appendCodeblock(renderConcreteCall(word, call, builtin.params), "blade");
+        }
+        const badge = builtins.categories[builtin.category];
+        if (badge) md.appendMarkdown(`\n*${badge}*\n`);
+        if (builtin.doc) {
+          md.appendMarkdown("\n---\n\n");
+          md.appendText(builtin.doc);
+        }
+        return new vscode.Hover(md, wordRange);
       }
       // Domain-specific keywords (comm/omp/mpi/like/where/...). After
       // builtins so callable keyword forms (pure, guard, reynolds) keep
@@ -1126,6 +1199,7 @@ function activate(context) {
       diagnostics.delete(doc.uri);
       bindingsByDoc.delete(doc.uri.toString());
       providersByDoc.delete(doc.uri.toString());
+      callsByDoc.delete(doc.uri.toString());
       typeDeclCache.delete(doc.uri.toString());
     }),
 

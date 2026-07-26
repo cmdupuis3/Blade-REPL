@@ -22,9 +22,12 @@
 // `ObjectLoop<n>` for loops, `deferred` for an unforced pipeline. Templated
 // (polymorphic) element/result types are written as abstract type variables
 // — OCaml-style but without the apostrophe, drawn in order from T, U, V, W,
-// X, Y, Z — so a reduction kernel reads `lambda(U, T) -> U` (accumulator U,
-// element T). A function type is an "arrow" (domain -> codomain); arrays are
-// the other kind of arrow, written `Array<T like ...>`. (Types the compiler
+// X, Y, Z — so a reduction kernel reads `U -> T -> U` (accumulator U,
+// element T). A function type is an "arrow" (domain -> codomain), written as
+// a plain ML-style curried arrow — `T -> U`, never `lambda(T) -> U` (the
+// wrapper is redundant; `lambda(x) -> expr` appears only where an argument
+// must syntactically BE a lambda literal, e.g. dist_map). Arrays are the
+// other kind of arrow, written `Array<T like ...>`. (Types the compiler
 // reports are normalized the same way at display time — see typeNormalizer
 // in extension.js.)
 //
@@ -37,8 +40,12 @@
 // TypeCheck.fs; autodiff surface Grad.fs (import-gated `import ad`,
 // qualified ad.grad); PPL formers ppl/compiler/PplElaborate.fs (arity error
 // messages quote the expected shapes); ML ops ml/compiler/MLElaborate.fs;
-// ML sizing statics ml/compiler/MLStatics.fs; static-only builtins
-// StaticEval.fs evalBuiltin.
+// ML sizing statics ml/compiler/MLStatics.fs; Cartesian<->irreps bridge
+// specs ml/compiler/CartesianBridge.fs; rand surface
+// rand/compiler/RandElaborate.fs; spectra surface
+// spectra/compiler/SpectraElaborate.fs; sgs surface
+// sgs/compiler/SgsElaborate.fs; static-only builtins StaticEval.fs
+// evalBuiltin.
 
 "use strict";
 
@@ -49,7 +56,7 @@ const categories = {
   virtual: "Virtual array",
   autodiff: "Autodifferentiation — requires `import ad`",
   math: "Math intrinsic — requires `import math`",
-  static: "Static builtin — Statically evaluable native functions, mainly for `static` contexts",
+  static: "Static builtin — statically evaluable native functions for `let static` contexts",
   ppl: "PPL — requires `import ppl`",
   ml: "ML — requires `import ml`",
   module: "Module — requires `import <module>`",
@@ -62,7 +69,7 @@ const identifiers = {
     category: "core",
     doc: "Builds a method loop over the given arrays' outer iteration space. Apply to a kernel with <@>.",
     params: [
-      { name: "a, ...", type: "(Idx... -> T)... -> U", doc: "Tuple of arrays" },
+      { name: "a, ...", type: "(Idx... -> T)...", doc: "Tuple of arrays (or a single zip(...))" },
     ],
     ret: "MethodLoop<n>",
   },
@@ -70,7 +77,7 @@ const identifiers = {
     category: "core",
     doc: "Builds an object loop from a kernel function. Apply to an array tuple with <@>.",
     params: [
-      { name: "kernel", type: "T -> U", doc: "Kernel function" },
+      { name: "kernel", type: "T... -> U", doc: "Kernel function" },
     ],
     ret: "ObjectLoop<n>",
   },
@@ -78,7 +85,7 @@ const identifiers = {
     category: "core",
     doc: "Evaluates a computation. Used as a pipe terminal: `comp |> compute`.",
     params: [
-      { name: "comp", type: "Computation", doc: "Unevaluated computation resulting from loop application" },
+      { name: "comp", type: "Computation<T>", doc: "Unevaluated computation resulting from loop application" },
     ],
     ret: "T",
   },
@@ -86,7 +93,7 @@ const identifiers = {
     category: "core",
     doc: "Wraps a value as a pure computation.",
     params: [
-      { name: "Value", type: "T", doc: "Value to lift" },
+      { name: "value", type: "T", doc: "Value to lift" },
     ],
     ret: "Computation<T>",
   },
@@ -102,35 +109,35 @@ const identifiers = {
     category: "core",
     doc: "Reduction over an array or unforced deferred pipeline (fused into one loop nest with scalar accumulators when deferred).",
     params: [
-      { name: "array", type: "Idx... -> T", doc: "Array to reduce" },
-      { name: "kernel", type: "U -> T -> U", doc: "combining function" },
-      { name: "init", type: "U", doc: " Optional initial accumulator; defaults to the kernel's zero" },
+      { name: "array", type: "(Idx... -> T) | deferred", doc: "Array (or unforced pipeline) to reduce" },
+      { name: "kernel", type: "U -> T -> U", doc: "Combining function (accumulator first)" },
+      { name: "init", type: "U  (optional)", doc: "Initial accumulator; defaults to the (+)/(*) section identity — required for other kernels over rank >= 2 or deferred inputs" },
     ],
     ret: "U",
   },
   mask: {
     category: "core",
-    doc: "Filters an array by a boolean predicate array, yielding a compound (masked) view. Rearrangement combinator; forces deferred inputs.",
+    doc: "Builds the Bool selection mask of a predicate over an array: evaluates the predicate elementwise, keeping the source's exact index records. Positions, not values — compose masks with elementwise Bool algebra, compact with compound(A, m), iterate the filtered space with range<CompoundIdx<m>>.",
     params: [
       { name: "array", type: "Idx... -> T", doc: "source array" },
-      { name: "predicate", type: "Idx... -> Bool", doc: "boolean mask over the same index space" },
+      { name: "predicate", type: "T -> Bool", doc: "per-element selection predicate" },
     ],
-    ret: "Idx... -> T",
+    ret: "Idx... -> Bool  (same index space as the source)",
   },
   compound: {
     category: "core",
-    doc: "Constructs a compound (sparse-view) array from a dense array and a boolean mask sharing its named index types.",
+    doc: "Compacts a dense array through a boolean mask over its leading dimensions into a compound (sparse) view — the in-language analog of a provider's load_compound.",
     params: [
       { name: "dense", type: "Idx... -> T", doc: "dense source values" },
-      { name: "mask", type: "Idx... -> Bool", doc: "present/absent mask; must share the dense array's index types" },
+      { name: "mask", type: "Idx... -> Bool", doc: "present/absent mask over a leading prefix of the dense array's dims; must live over its exact index space (build with mask())" },
     ],
-    ret: "compound view of Array<T, Idx...>",
+    ret: "Array<T, CompoundIdx<mask>, Idx...>  (compact view)",
   },
   zip: {
     category: "core",
     doc: "Co-iterates arrays over a shared index space.",
     params: [
-      { name: "a1..an", type: "(Idx... -> Tn)...", doc: "arrays sharing an index space" },
+      { name: "a, ...", type: "(Idx... -> Tn)...", doc: "arrays sharing an index space" },
     ],
     ret: "Idx... -> (T1, ..., Tn)",
   },
@@ -138,26 +145,26 @@ const identifiers = {
     category: "core",
     doc: "Stacks arrays along a new leading dimension.",
     params: [
-      { name: "a1..an", type: "(Idx... -> T)...", doc: "same-shaped arrays to stack" },
+      { name: "a, ...", type: "(Idx... -> T)...", doc: "same-shaped arrays to stack" },
     ],
     ret: "Idx<n> -> Idx... -> T",
   },
   sort: {
     category: "core",
-    doc: "Sorts an array. Rearrangement combinator; forces deferred inputs.",
+    doc: "Sorts a rank-1 array (stable, ascending by key). Rearrangement combinator; forces deferred inputs.",
     params: [
-      { name: "array", type: "Idx... -> T", doc: "values to sort" },
-      { name: "key", type: "U -> T -> U  (optional)", doc: "sort key; defaults to the element itself" },
+      { name: "array", type: "Idx<n> -> T", doc: "Rank-1 array of values to sort" },
+      { name: "key", type: "T -> U  (optional)", doc: "Sort key; defaults to the element itself" },
     ],
-    ret: "Idx... -> T",
+    ret: "Idx<n> -> T",
   },
   unique: {
     category: "core",
-    doc: "Distinct elements. Rearrangement combinator; forces deferred inputs.",
+    doc: "Distinct elements, preserving first-occurrence order. Rearrangement combinator; forces deferred inputs.",
     params: [
       { name: "array", type: "Idx... -> T", doc: "source values" },
     ],
-    ret: "Idx... -> T",
+    ret: "Idx<u> -> T  (fresh dynamic-extent axis)",
   },
   intersect: {
     category: "core",
@@ -166,7 +173,7 @@ const identifiers = {
       { name: "a", type: "Idx... -> T", doc: "left operand" },
       { name: "b", type: "Idx... -> T", doc: "right operand" },
     ],
-    ret: "Idx... -> T",
+    ret: "Idx<u> -> T  (fresh dynamic-extent axis)",
   },
   union: {
     category: "core",
@@ -175,7 +182,7 @@ const identifiers = {
       { name: "a", type: "Idx... -> T", doc: "left operand" },
       { name: "b", type: "Idx... -> T", doc: "right operand" },
     ],
-    ret: "Idx... -> T",
+    ret: "Idx<u> -> T  (fresh dynamic-extent axis)",
   },
   contains: {
     category: "core",
@@ -188,30 +195,30 @@ const identifiers = {
   },
   group_by: {
     category: "core",
-    doc: "Groups values by a grouping array. Shared rearrangement helper; forces deferred inputs.",
+    doc: "Groups a rank-1 values array through a grouping structure into a rank-2 groups × members array. Shared rearrangement helper; forces deferred inputs.",
     params: [
-      { name: "values", type: "Idx1 -> Idx... -> T", doc: "values to group" },
-      { name: "grouping", type: "GroupKeys<Idx1, Idx2>", doc: "group key for each value (same index space)" },
+      { name: "values", type: "Idx1 -> T", doc: "values to group (over the source axis)" },
+      { name: "grouping", type: "GroupKeys<Idx2, Idx1>", doc: "grouping structure over the same source axis" },
     ],
-    ret: "Idx2 -> Idx... -> T", // TODO: need a type check
+    ret: "Idx2 -> IdxM -> T  (IdxM: ragged member axis)",
   },
   group_keys: {
     category: "core",
-    doc: "Key set of a grouping, indexable alongside group_by results.",
+    doc: "Builds the grouping structure (key set + membership) from rank-1 key arrays over one shared source axis; 2+ keys form a compound grouping (one bucket per distinct tuple). Indexable alongside group_by results.",
     params: [
-      { name: "grouping", type: "Idx1 -> Idx2", doc: "the grouping array" },
+      { name: "k, ...", type: "(Idx1 -> T)...", doc: "key arrays over the shared source axis" },
     ],
-    ret: "GroupKeys<Idx1, Idx2>", // TODO: need a type check
+    ret: "GroupKeys<Idx2, Idx1>  (group axis Idx2, source axis Idx1)",
   },
   transpose: {
     category: "core",
-    doc: "Hard-transposes two dimensions.",
+    doc: "Hard-transposes two dimensions (a physical data move between plain axes). Within one symmetry group it resolves storage-preservingly instead: symmetric — identity, antisymmetric — negation, hermitian — conjugation.",
     params: [
-      { name: "array", type: "Idx1 -> Idx2 -> ... -> T", doc: "source array (r >= 2)" },
-      { name: "d1", type: "Int", doc: "first dimension to transpose" },
-      { name: "d2", type: "Int", doc: "second dimension to transpose" },
+      { name: "array", type: "Idx1 -> Idx2 -> ... -> T", doc: "source array (rank >= 2)" },
+      { name: "d1", type: "Int (static)", doc: "first dimension to transpose" },
+      { name: "d2", type: "Int (static)", doc: "second dimension to transpose" },
     ],
-    ret: "Id2 -> Idx1 -> ...-> T",
+    ret: "Idx... -> T  (dims d1 and d2 swapped)",
   },
   decompact: {
     category: "core",
@@ -224,37 +231,37 @@ const identifiers = {
   },
   gram: {
     category: "core",
-    doc: "Gram-style product: pairwise products of an array with itself (or with a second array).",
+    doc: "Gram product gram(A, B) = A * B^H: result[i, j] = sum_k A[i, k] * conj(B[j, k]) over the shared trailing axis (complex element iff either operand is complex). gram(A) — or B syntactically the same array — yields the square symmetric (real) / Hermitian (complex) form, packed triangular.",
     params: [
-      { name: "a", type: "Array<T, Idx<n>>", doc: "left factor" },
-      { name: "b", type: "Array<T, Idx<n>>  (optional)", doc: "right factor; defaults to `a` (symmetric result)" },
+      { name: "a", type: "Array<T, Idx<m>, Idx<n>>", doc: "left factor (rank 2)" },
+      { name: "b", type: "Array<T, Idx<p>, Idx<n>>  (optional)", doc: "right factor sharing the trailing axis; defaults to `a`" },
     ],
-    ret: "Array<T, Idx<n>, Idx<n>>",
+    ret: "Array<T, Idx<m>, Idx<p>>  (same-array: SymIdx<2, m> / HermitianIdx<m> packed)",
   },
   replicate: {
     category: "core",
     doc: "Repeats a computation `count` times into an array.",
     params: [
-      { name: "count", type: "Int64", doc: "number of repetitions (static or provider-backed)" },
-      { name: "body", type: "T expr", doc: "expression evaluated per repetition" },
+      { name: "count", type: "Int64 (static)", doc: "number of repetitions (a literal, `let static`, or static-function call)" },
+      { name: "body", type: "T", doc: "expression evaluated per repetition" },
     ],
     ret: "Array<T, Idx<count>>",
   },
   sequence: {
     category: "core",
-    doc: "Evaluates expressions in order; the result is the last one.",
+    doc: "Assembles same-typed expressions into an array along a fresh leading Idx<n> axis (n = the expression count; element types unify, array elements nest under the new axis).",
     params: [
-      { name: "e1..en", type: "expr", doc: "expressions, evaluated left to right" },
+      { name: "e, ...", type: "T", doc: "expressions, evaluated left to right" },
     ],
-    ret: "type of the last expression",
+    ret: "Array<T, Idx<n>>",
   },
   extents: {
     category: "core",
-    doc: "The array's per-dimension extents.",
+    doc: "The array's extents, answered from the type when statically known: rank 1 — the extent itself; higher rank — a tuple with one Int64 per dimension. Ragged, grouped, and compound dims reject (no scalar extent exists).",
     params: [
       { name: "array", type: "Array<T, Idx...>", doc: "array to measure" },
     ],
-    ret: "(Int64, ...)",
+    ret: "Int64 | (Int64, ..., Int64)",
   },
   complex: {
     category: "core",
@@ -269,35 +276,35 @@ const identifiers = {
     category: "core",
     doc: "Complex conjugate (elementwise on arrays).",
     params: [
-      { name: "x", type: "Complex128 | Array<Complex128, Idx...>", doc: "value or array to conjugate" },
+      { name: "x", type: "T  (Complex128 | Array<Complex128, Idx...>)", doc: "value or array to conjugate" },
     ],
-    ret: "same as input",
+    ret: "T",
   },
   hermitian: {
     category: "core",
-    doc: "Hermitian view/marker for complex arrays (conjugate-transpose symmetry).",
+    doc: "Conjugate transpose (adjoint) A^H — sugar for conj(transpose(A, 0, 1)). The name is the operation, not the property: the result is a plain dense array, NOT a Hermitian-typed matrix (that producer is gram on a complex array).",
     params: [
-      { name: "array", type: "Array<Complex128, Idx<n>, Idx<n>>", doc: "complex square array" },
+      { name: "array", type: "Array<Complex128, Idx<m>, Idx<n>>", doc: "complex matrix (rank 2)" },
     ],
-    ret: "hermitian view",
+    ret: "Array<Complex128, Idx<n>, Idx<m>>",
   },
   guard: {
     category: "core",
     doc: "Evaluates the body only where the condition holds. Also a reserved keyword (cannot be rebound).",
     params: [
       { name: "cond", type: "Bool", doc: "guard condition" },
-      { name: "body", type: "T expr", doc: "expression evaluated when the condition holds" },
+      { name: "body", type: "T", doc: "expression evaluated when the condition holds" },
     ],
-    ret: "guarded T",
+    ret: "T",
   },
   reynolds: {
     category: "core",
     doc: "Reynolds operator: group-averages a kernel over its argument permutations — reynolds(f) yields the symmetrized kernel (f(x, y) + f(y, x)); reynolds(f, Antisymmetric) the sign-weighted average. Feeds <@> like any kernel; results pack into SymIdx / AntisymIdx storage.",
     params: [
-      { name: "kernel", type: "lambda(T...) -> U", doc: "kernel to symmetrize" },
+      { name: "kernel", type: "T... -> U", doc: "kernel to symmetrize" },
       { name: "symmetry", type: "Antisymmetric  (optional)", doc: "sign-weighted (antisymmetric) averaging; default symmetric" },
     ],
-    ret: "symmetrized kernel",
+    ret: "T... -> U  (same type as the kernel)",
   },
   zero: {
     category: "core",
@@ -307,7 +314,7 @@ const identifiers = {
   },
   rank: {
     category: "core",
-    doc: "Number of dimensions of an array.",
+    doc: "Number of dimensions of an array. Typed Int64 in any context; folds statically when the operand's rank is known.",
     params: [
       { name: "array", type: "Array<T, Idx...>", doc: "array to inspect" },
     ],
@@ -344,7 +351,7 @@ const identifiers = {
     params: [
       { name: "mod", type: "Int64", doc: "modulus expression bounding the generated values" },
     ],
-    ret: "Array (shape from the binding's annotation)",
+    ret: "Array<T, Idx...>  (shape from the binding's annotation)",
   },
 
   // --- Virtual arrays: index-defined, storage-free (their own object kind;
@@ -375,7 +382,7 @@ const identifiers = {
     params: [
       { name: "f", type: "function", doc: "named top-level differentiable function" },
     ],
-    ret: "gradient function (primal args + mut out-buffers) -> primal value",
+    ret: "primal args... -> mut out-buffers... -> T  (the primal value)",
   },
 };
 
@@ -414,48 +421,38 @@ for (const [name, doc] of Object.entries(MATH)) {
 identifiers.abs = {
   category: "math",
   doc: "Absolute value. Unlike the other math intrinsics, abs preserves the operand's numeric type (Int stays Int, Float stays Float). Scalar-only; a user binding named abs shadows it.",
-  params: [{ name: "x", type: "Int | Float", doc: "numeric scalar" }],
-  ret: "same numeric type as x",
+  params: [{ name: "x", type: "T  (Int | Float)", doc: "numeric scalar" }],
+  ret: "T",
 };
 
 // --- Static-evaluator-only builtins (StaticEval.fs evalBuiltin) --------------
 // Resolve only in `let static` contexts. At runtime min/max are written as
-// reduce fold kernels, not intrinsics.
+// reduce fold kernels, not intrinsics. (rank and arity are NOT static-only:
+// they are keywords typed Int64 in any context that merely fold statically —
+// see their core entries above.)
 
 identifiers.min = {
   category: "static",
   doc: "Smaller of two static numbers. Static evaluator only (`let static` contexts) — at runtime, write a reduce fold kernel instead.",
   params: [
-    { name: "a", type: "Int | Float (static)", doc: "first value" },
-    { name: "b", type: "Int | Float (static)", doc: "second value" },
+    { name: "a", type: "T  (static Int | Float)", doc: "first value" },
+    { name: "b", type: "T", doc: "second value (same numeric type; no int/float mixing)" },
   ],
-  ret: "same type (static)",
+  ret: "T (static)",
 };
 identifiers.max = {
   category: "static",
   doc: "Larger of two static numbers. Static evaluator only (`let static` contexts) — at runtime, write a reduce fold kernel instead.",
   params: [
-    { name: "a", type: "Int | Float (static)", doc: "first value" },
-    { name: "b", type: "Int | Float (static)", doc: "second value" },
+    { name: "a", type: "T  (static Int | Float)", doc: "first value" },
+    { name: "b", type: "T", doc: "second value (same numeric type; no int/float mixing)" },
   ],
-  ret: "same type (static)",
+  ret: "T (static)",
 };
 identifiers.length = {
   category: "static",
   doc: "Length of a static array or tuple. Static evaluator only (`let static` contexts) — at runtime use extents.",
-  params: [{ name: "xs", type: "static array | tuple", doc: "compile-time value to measure" }],
-  ret: "Int (static)",
-};
-identifiers.rank = {
-  category: "static",
-  doc: "Rank of an array-valued expression. Static evaluator only (`let static` contexts).",
-  params: [{ name: "x", type: "static array expr", doc: "" }],
-  ret: "Int (static)",
-};
-identifiers.arity = {
-  category: "static",
-  doc: "Arity of an arity-polymorphic array tuple expression. Static evaluator only (`let static` contexts).",
-  params: [{ name: "xs", type: "static array tuple expr", doc: "" }],
+  params: [{ name: "xs", type: "array | tuple  (static)", doc: "compile-time value to measure" }],
   ret: "Int (static)",
 };
 
@@ -474,7 +471,7 @@ const PPL_FORMERS = {
       { name: "A", type: "Array<Float, ..., SampleIdx> | dist", doc: "annotated module-level sample array, or a dist binding" },
       { name: "k", type: "Int (static)", doc: "highest order, >= 1 (1..8 on a dist)" },
     ],
-    ret: "moment tensors mu_1..mu_k (SymIdx-packed over the leading axes)",
+    ret: "(mu_1, ..., mu_k)  (SymIdx-packed moment tensors over the leading axes)",
   },
   comoments: {
     doc: "Central comoments: comoments(A, 2) is the same-array covariance block; comoments(X, Y) the cross-covariance block between two arrays (rectangular, zero if declared independent).",
@@ -482,7 +479,7 @@ const PPL_FORMERS = {
       { name: "X", type: "Array<Float, ..., SampleIdx>", doc: "annotated module-level sample array" },
       { name: "k_or_Y", type: "2 | Array<Float, ..., SampleIdx>", doc: "the static order 2 (same-array), or a second array (cross block)" },
     ],
-    ret: "central comoment block",
+    ret: "Array<Float, SymIdx<2, d>> | Array<Float, Idx<d1>, Idx<d2>>  (same-array / cross block)",
   },
   cumulants: {
     doc: "Cumulant tower kappa_1..kappa_r of a sample array (Möbius inversion over set partitions).",
@@ -490,7 +487,7 @@ const PPL_FORMERS = {
       { name: "A", type: "Array<Float, ..., SampleIdx>", doc: "annotated module-level sample array" },
       { name: "r", type: "Int (static)", doc: "highest order, 1..6" },
     ],
-    ret: "cumulant tensors kappa_1..kappa_r (SymIdx-packed)",
+    ret: "(kappa_1, ..., kappa_r)  (SymIdx-packed cumulant tensors)",
   },
   free_cumulants: {
     doc: "Free-probability cumulants of a sample array (order 1..6).",
@@ -498,7 +495,7 @@ const PPL_FORMERS = {
       { name: "A", type: "Array<Float, ..., SampleIdx>", doc: "annotated module-level sample array" },
       { name: "r", type: "Int (static)", doc: "highest order, 1..6" },
     ],
-    ret: "free-cumulant tensors",
+    ret: "(kappa_1, ..., kappa_r)  (free-cumulant tensors)",
   },
   mixed_cumulants: {
     doc: "Mixed cumulants across two sample arrays, order p in the first and q in the second.",
@@ -513,14 +510,14 @@ const PPL_FORMERS = {
   comoments_merge: {
     doc: "Merges two data chunks' pair comoments into the whole-data covariance: takes each chunk's comoments, means, and static size.",
     params: [
-      { name: "cA", type: "comoments of chunk A", doc: "pair comoments of the first chunk" },
-      { name: "mA", type: "means of chunk A", doc: "per-variable means of the first chunk" },
-      { name: "nA", type: "Int (static)", doc: "first chunk's sample count" },
-      { name: "cB", type: "comoments of chunk B", doc: "pair comoments of the second chunk" },
-      { name: "mB", type: "means of chunk B", doc: "per-variable means of the second chunk" },
-      { name: "nB", type: "Int (static)", doc: "second chunk's sample count" },
+      { name: "cA", type: "Array<Float, SymIdx<2, d>>", doc: "pair comoments of the first chunk (a module-level comoments binding, by name)" },
+      { name: "mA", type: "Array<Float, Idx<d>>", doc: "per-variable means of the first chunk (by name)" },
+      { name: "nA", type: "Int (static)", doc: "first chunk's sample count, >= 1" },
+      { name: "cB", type: "Array<Float, SymIdx<2, d>>", doc: "pair comoments of the second chunk (by name)" },
+      { name: "mB", type: "Array<Float, Idx<d>>", doc: "per-variable means of the second chunk (by name)" },
+      { name: "nB", type: "Int (static)", doc: "second chunk's sample count, >= 1" },
     ],
-    ret: "merged pair comoments",
+    ret: "Array<Float, SymIdx<2, d>>  (merged pair comoments)",
   },
   dist: {
     doc: "Constructs a Dist cumulant tower from a sample array: carries kappa_1..kappa_r over the variable axes. Project with ppl.cumulant(d, k); combine with +, scalar *, dist_add, dist_scale under declared independence.",
@@ -615,7 +612,49 @@ const PPL_FORMERS = {
     params: [
       { name: "s", type: "mstate", doc: "previously declared mstate binding" },
     ],
-    ret: "(kappa_1, ..., kappa_r) cumulant tensors",
+    ret: "(kappa_1, ..., kappa_r)  (cumulant tensors)",
+  },
+  dist_expect: {
+    doc: "Expectation of a polynomial under a univariate dist: E[c0 + c1 X + ... + cq X^q], read from the dist's raw-moment reconstruction (degree q <= 8).",
+    params: [
+      { name: "d", type: "Dist  (univariate)", doc: "previously declared dist binding" },
+      { name: "c0..cq", type: "Float", doc: "polynomial coefficients, constant first" },
+    ],
+    ret: "Float64  (scalar expectation)",
+  },
+  dist_reweight: {
+    doc: "Polynomial reweighting (tower Bayes) of a univariate dist: multiplies the quasi-density by w(x) = c0 + ... + cq x^q and renormalizes. A degree-q weight consumes q orders of the tower, so the result carries order r - q (must be >= 1).",
+    params: [
+      { name: "d", type: "Dist<r>  (univariate)", doc: "previously declared dist binding" },
+      { name: "c0..cq", type: "Float", doc: "weight-polynomial coefficients, constant first" },
+    ],
+    ret: "Dist<r - q>",
+  },
+  dist_mix: {
+    doc: "Two-component mixture of univariate dists with scalar weights, normalized by w1 + w2; the result carries order min(r1, r2).",
+    params: [
+      { name: "w1", type: "Float", doc: "first mixture weight (any pure scalar expression)" },
+      { name: "d1", type: "Dist<r1>  (univariate)", doc: "previously declared dist binding" },
+      { name: "w2", type: "Float", doc: "second mixture weight" },
+      { name: "d2", type: "Dist<r2>  (univariate)", doc: "previously declared dist binding" },
+    ],
+    ret: "Dist<min(r1, r2)>",
+  },
+  dist_atoms: {
+    doc: "Order-r tower of the atomic quasi-measure w1*delta(x1) + ... + wk*delta(xk), normalized by the weight sum. Deliberately sign-agnostic: weights may be negative, so non-classical towers (negative variance included) are carryable values.",
+    params: [
+      { name: "r", type: "Int (static)", doc: "carried order, 1..6" },
+      { name: "x1, w1, ...", type: "Float", doc: "atom positions and weights, alternating (k >= 1 atoms)" },
+    ],
+    ret: "Dist<r>",
+  },
+  dist_negativity: {
+    doc: "L1 negativity of a dist read as a quasi-distribution on the claimed support {x1..xs}: cell weights via Lagrange indicators (exact when s - 1 <= the carried order; demanded), N = sum of max(0, -cell). Zero iff the tower is a genuine probability on that support.",
+    params: [
+      { name: "d", type: "Dist<r>  (univariate)", doc: "previously declared dist binding" },
+      { name: "x1..xs", type: "Float", doc: "claimed support points; s - 1 <= r" },
+    ],
+    ret: "Float64  (0 iff classical on that support)",
   },
 };
 for (const [name, entry] of Object.entries(PPL_FORMERS)) {
@@ -659,7 +698,7 @@ identifiers.y_to = {
     { name: "y", type: "Float", doc: "direction y component" },
     { name: "z", type: "Float", doc: "direction z component" },
   ],
-  ret: "irreps vector Array<Float, Idx<total_dim(sh_spec(LMAX))>>",
+  ret: "Array<Float, Idx<total_dim(sh_spec(LMAX))>>",
 };
 identifiers.tensor_product = {
   category: "ml",
@@ -714,6 +753,71 @@ identifiers.gated_rows = {
   ],
   ret: "Array<Float, Idx<NROWS * dim>>",
 };
+identifiers.scalars = {
+  category: "ml",
+  doc: "Invariant-exit op: copies the l=0 blocks' entries of an irreps vector into a plain array (block order, multiplicity order). Emits ALL l=0 entries regardless of parity — the equiv judgment governs which callers may treat them as invariants (O3 rejects (0, odd) specs). The spec must have at least one l=0 block.",
+  params: [
+    { name: "SPEC", type: "spec (static)", doc: "irreps spec of x" },
+    { name: "x", type: "Array<Float, Idx<dim>>", doc: "irreps vector" },
+  ],
+  ret: "Array<Float, Idx<n0>>  (n0 = total l=0 entries)",
+};
+identifiers.norms = {
+  category: "ml",
+  doc: "Per-(block, multiplicity) 2-norms of an irreps vector, in (block, mu) order. O(3)-invariant for every parity — an invariant-exit op like scalars.",
+  params: [
+    { name: "SPEC", type: "spec (static)", doc: "irreps spec of x" },
+    { name: "x", type: "Array<Float, Idx<dim>>", doc: "irreps vector" },
+  ],
+  ret: "Array<Float, Idx<nslots>>  (nslots = sum of block multiplicities)",
+};
+identifiers.derive_linear = {
+  category: "ml",
+  doc: "Derived equivariant linear layer: the COMPLETE Schur basis of Hom_G(V_in, V_out) — every (l, parity)-matched (input, output) block pair mixes multiplicities (duplicate matches accumulate, unlike linear's first-match rule), and output blocks with no matching input stay exactly zero. Rejects spec pairs sharing no (l, parity) — every equivariant map is zero (BL4007). The two-argument form binds the layer as a function value: `let layer = ml.derive_linear(SIN, SOUT)`, then `layer(w, x)`.",
+  params: [
+    { name: "SPEC_IN", type: "spec (static)", doc: "input irreps spec" },
+    { name: "SPEC_OUT", type: "spec (static)", doc: "output irreps spec" },
+    { name: "w", type: "Array<Float, Idx<wdim>>  (optional)", doc: "weights, pair-major mult_out x mult_in; wdim = ml.hom_dim(SPEC_IN, SPEC_OUT)" },
+    { name: "x", type: "Array<Float, Idx<dimIn>>  (optional)", doc: "input irreps vector (omit both w and x for the binding form)" },
+  ],
+  ret: "Array<Float, Idx<dimOut>>  (two-argument form: the layer as lambda(w, x))",
+};
+identifiers.derive_tp = {
+  category: "ml",
+  doc: "Derived tensor product: tensor_product with the output spec DERIVED as the full Clebsch-Gordan decomposition ml.tp_spec(SPEC1, SPEC2), so every output block is reachable by construction. The two-argument form binds the op as a function value: `let tp = ml.derive_tp(S1, S2)`, then `tp(x, y, w)`.",
+  params: [
+    { name: "SPEC1", type: "spec (static)", doc: "left input irreps spec" },
+    { name: "SPEC2", type: "spec (static)", doc: "right input irreps spec" },
+    { name: "x", type: "Array<Float, Idx<dim1>>  (optional)", doc: "left irreps vector" },
+    { name: "y", type: "Array<Float, Idx<dim2>>  (optional)", doc: "right irreps vector" },
+    { name: "w", type: "Array<Float, Idx<wdim>>  (optional)", doc: "path weights; wdim = ml.tp_full_weight_dim(SPEC1, SPEC2) (omit x, y, w for the binding form)" },
+  ],
+  ret: "Array<Float, Idx<total_dim(tp_spec(SPEC1, SPEC2))>>  (two-argument form: the op as lambda(x, y, w))",
+};
+identifiers.tensor_to_irreps = {
+  category: "ml",
+  doc: "Cartesian->irreps bridge (rank-2, 3-D): decomposes a flat row-major 3x3 tensor (g[3i + j] = G_ij) into trace, axial pseudovector in Y1 component order (y, z, x), and symmetric-traceless part in Y2 order. Rows orthonormal in the Frobenius inner product. A rank-2 Cartesian tensor is parity-EVEN throughout — the l=1 block does not flip under improper elements.",
+  params: [
+    { name: "g", type: "Array<Float, Idx<9>>", doc: "flat row-major 3x3 Cartesian tensor" },
+  ],
+  ret: "Array<Float, IrrepsIdx<[(0,0,1), (1,0,1), (2,0,1)]>>  (dim 9)",
+};
+identifiers.sym_to_irreps = {
+  category: "ml",
+  doc: "Cartesian->irreps bridge for symmetric tensors: decomposes the packed symmetric tensor [s00, s01, s02, s11, s12, s22] (upper triangle, row-major) into its trace and symmetric-traceless irreps. Orthonormal (off-diagonals weighted sqrt(2)); irreps_to_sym is the exact inverse.",
+  params: [
+    { name: "s", type: "Array<Float, Idx<6>>", doc: "packed symmetric tensor, upper triangle row-major" },
+  ],
+  ret: "Array<Float, IrrepsIdx<[(0,0,1), (2,0,1)]>>  (dim 6)",
+};
+identifiers.irreps_to_sym = {
+  category: "ml",
+  doc: "Irreps->Cartesian bridge: the exact inverse of sym_to_irreps — rebuilds the packed symmetric tensor [s00, s01, s02, s11, s12, s22] (upper triangle, row-major) from its irreps decomposition.",
+  params: [
+    { name: "t", type: "Array<Float, IrrepsIdx<[(0,0,1), (2,0,1)]>>", doc: "irreps vector (trace + symmetric-traceless blocks)" },
+  ],
+  ret: "Array<Float, Idx<6>>  (packed upper triangle, row-major)",
+};
 
 // ML sizing/navigation statics: fully static (fold at compile time), used in
 // `let static` positions; block accessors take a 0-based block index into
@@ -739,6 +843,30 @@ const ML_STATICS = {
     params: [
       { name: "specIn", type: "spec (static)", doc: "input irreps spec" },
       { name: "specOut", type: "spec (static)", doc: "output irreps spec" },
+    ],
+    ret: "Int (static)",
+  },
+  tp_spec: {
+    doc: "Full Clebsch-Gordan decomposition spec of spec1 (x) spec2, merged-canonical: contributions aggregated by (l, parity) and ordered ascending — the output spec derive_tp uses, stable to write in annotations. Completeness: total_dim(tp_spec(s1, s2)) = total_dim(s1) * total_dim(s2).",
+    params: [
+      { name: "spec1", type: "spec (static)", doc: "left input irreps spec" },
+      { name: "spec2", type: "spec (static)", doc: "right input irreps spec" },
+    ],
+    ret: "spec (static)",
+  },
+  hom_dim: {
+    doc: "Dimension of Hom_G(V_in, V_out) by Schur's lemma: sum of multIn * multOut over shared (l, parity), multiplicities aggregated across duplicate blocks. Zero iff every equivariant linear map is zero; the derive_linear weight count.",
+    params: [
+      { name: "specIn", type: "spec (static)", doc: "input irreps spec" },
+      { name: "specOut", type: "spec (static)", doc: "output irreps spec" },
+    ],
+    ret: "Int (static)",
+  },
+  tp_full_weight_dim: {
+    doc: "Number of derive_tp path weights for a spec pair — tp_weight_dim of the full config (spec1, spec2, tp_spec(spec1, spec2)).",
+    params: [
+      { name: "spec1", type: "spec (static)", doc: "left input irreps spec" },
+      { name: "spec2", type: "spec (static)", doc: "right input irreps spec" },
     ],
     ret: "Int (static)",
   },
@@ -807,79 +935,94 @@ identifiers.ad = {
 identifiers.ppl = {
   category: "module",
   sig: "import ppl as p",
-  doc: "Probabilistic programming module. Surface (qualified through the import's alias): the formers moments, comoments, cumulants, free_cumulants, mixed_cumulants, comoments_merge, dist, dist_add, dist_scale, dist_affine, dist_jet(_closed), dist_map(_closed), mstate, mstate_merge, mstate_cumulants; plus cumulant(d, k) projection, the independent(X, Y) declaration, and the where-clause license `where p.indep(a, b)`.",
+  doc: "Probabilistic programming module. Surface (qualified through the import's alias): the formers moments, comoments, cumulants, free_cumulants, mixed_cumulants, comoments_merge, dist, dist_add, dist_scale, dist_affine, dist_jet(_closed), dist_map(_closed), mstate, mstate_merge, mstate_cumulants, dist_expect, dist_reweight, dist_mix, dist_atoms, dist_negativity; plus cumulant(d, k) projection, the independent(X, Y) declaration, and the where-clause license `where p.indep(a, b)`.",
 };
 identifiers.ml = {
   category: "module",
   sig: "import ml as ml",
-  doc: "Equivariant ML module. Surface (qualified through the import's alias): ops y_to, tensor_product, linear, linear_rows, gated, gated_rows; sizing/navigation statics sh_spec, total_dim, tp_weight_dim, linear_weight_dim, irreps_len, irreps_l, irreps_parity, irreps_mult, irreps_dim, irreps_offset.",
+  doc: "Equivariant ML module. Surface (qualified through the import's alias): ops y_to, tensor_product, linear, linear_rows, gated, gated_rows, scalars, norms, derive_linear, derive_tp, tensor_to_irreps, sym_to_irreps, irreps_to_sym; sizing/navigation statics sh_spec, total_dim, tp_weight_dim, linear_weight_dim, tp_spec, hom_dim, tp_full_weight_dim, irreps_len, irreps_l, irreps_parity, irreps_mult, irreps_dim, irreps_offset.",
+};
+identifiers.rand = {
+  category: "module",
+  sig: "import rand as rand",
+  doc: "Random-array module. Surface (qualified through the import's alias): uniform(key, shape) — dense Float64 draws ~ U[0, 1); normal(key, shape) — N(0, 1) via Box-Muller. `key` is an Int64 stream key (same key => same draws); `shape` is a static int (rank 1) or list of static ints (row-major). The RNG lives in the C++ runtime (opaque builtins, not synthesized Blade source), and rand output is not differentiable. Only `import rand [as <alias>]` is allowed.",
+};
+identifiers.spectra = {
+  category: "module",
+  sig: "import spectra as sp",
+  doc: "Spectral-analysis module. Surface (qualified through the import's alias): fft(x) — unnormalized forward DFT of a real signal, Array<Complex128 like Idx<n>>; ifft(X) — real inverse synthesis of a complex spectrum (carries the 1/n); fft2(x) / ifft2(X) — the rank-2 field forms; power(x) — |FFT(x)|^2 per bin (real); polyspec(x1, ..., xk) — order-k cross-polyspectrum, k = the call-site arity, 2..4 (2 cross-power, 3 bispectrum, 4 trispectrum). Ops read the DECLARED shape (the pass runs before type inference), so an array argument must carry an annotation: an annotated let or parameter, a call of a function with an annotated array return type, or an ascription `(expr : Array<...>)`.",
+};
+identifiers.sgs = {
+  category: "module",
+  sig: "import sgs as sgs",
+  doc: "Subgrid-scale closure module: field formers over (3, n, n, n) velocity fields. Surface (qualified through the import's alias; W a `let static` name or literal): grad(U, DX) — velocity-gradient field (3, 3, n, n, n) with G(c, d, i, j, k) = d_d u_c, 2nd-order central differences, periodic; box_filter(U, W) — tile means (3, m, m, m), m = n/W; stress(U, W) — exact subgrid stress tau_ij = mean(u_i u_j | tile) - mean_i mean_j, packed (6, m, m, m) in upper-triangle row-major order. Ops read the DECLARED shape, so the field argument must carry an annotation (annotated let/parameter, annotated-return function call, or ascription).",
 };
 
 // --- Operators ----------------------------------------------------------------
 
 const operators = {
   "<@>": {
-    sig: "ObjectLoop <@> (Array...) -> Computation \n| MethodLoop <@> kernel -> Computation",
+    sig: "| ObjectLoop<n> -> (Idx... -> T)... -> Computation \n| MethodLoop<n> -> (T... -> U) -> Computation",
     doc: "Apply combinator: apply an object loop to an array tuple, or a method loop to a kernel to yield a computation.",
   },
   "<$>": {
-    sig: "f <$> Computation",
+    sig: "(T -> U) -> Computation<T> -> Computation<U>",
     doc: "Functor map over a computation.",
   },
   "<&>": {
-    sig: "Computation <&> Computation -> Computation",
+    sig: "Computation<T> -> Computation<U> -> Computation<(T, U)>",
     doc: "Loop Join: Merge loop nests of two computations if possible. Yields results as a tuple.",
   },
   "<&!>": {
-    sig: "Computation <&!> Computation -> Computation",
+    sig: "Computation<T> -> Computation<U> -> Computation<(T, U)>",
     doc: "Force Join: fuse two computations completely, error if incompatible. Yields results as a tuple.",
   },
   "<|>": {
-    sig: "a <|> b",
-    doc: "Choice combinator.",
+    sig: "T -> T -> T",
+    doc: "Value-keyed choice: the left value where it is nonzero, else the right (an allocated zero falls through — contrast <|:>).",
   },
   "<|:>": {
-    sig: "a <|:> fallback",
-    doc: "Choice with fallback.",
+    sig: "Array<T, Idx...> -> Array<T, Idx...> -> Array<T, Idx...>",
+    doc: "Storage-keyed fallback on arrays: the left where its storage holds the cell, else the right — an allocated zero survives (unlike <|>).",
   },
   ">>=": {
-    sig: "Computation >>= f",
+    sig: "Computation<T> -> (T -> Computation<U>) -> Computation<U>",
     doc: "Bind: sequence a computation into a continuation.",
   },
   ">>@": {
-    sig: "object_for(f) >>@ object_for(g)",
+    sig: "ObjectLoop(T -> U) -> ObjectLoop(U -> V) -> ObjectLoop(T -> V)",
     doc: "Compose-apply: Compose functions inside object loops; object_for(f >> g).",
   },
   "@>>": {
-    sig: "(method_loop(arrays) <@> f) @>> (method_loop(arrays) <@> g)",
-    doc: "Apply-compose: Compose functions inside method loop computations; method_loop(arrays) <@> (f >> g).",
+    sig: "Computation<T> -> Computation<U> -> Computation<U>",
+    doc: "Apply-compose: Compose functions inside method loop computations; method_for(arrays) <@> (f >> g).",
   },
   "<*>": {
-    sig: "a <*> b",
-    doc: "Array product combinator.",
+    sig: "MethodLoop<m> -> MethodLoop<n> -> MethodLoop<m + n>",
+    doc: "Loop product: concatenates two method loops' array tuples into one loop (the applied kernel then takes m + n arguments).",
   },
   "|>": {
-    sig: "value |> f",
+    sig: "T -> (T -> U) -> U",
     doc: "Pipe: feeds the left value to the right function/terminal (compute, read, ...).",
   },
   "|@>": {
-    sig: "a |@> f",
+    sig: "(Idx... -> T) -> (T -> U) -> Computation",
     doc: "Pipe-apply: desugars to the <@> apply with operands flipped: f <@> a",
   },
   ">>": {
-    sig: "f >> g",
+    sig: "(T -> U) -> (U -> V) -> (T -> V)",
     doc: "Compose: applies f, then g.",
   },
   "..": {
     sig: "lo..hi",
-    doc: "Anonymous virtual range over Int64 positions lo (inclusive) to hi (exclusive) — the same storage-free virtual-array kind as range<I>. Drives for-in loops and anonymous method_for spaces.",
+    doc: "Anonymous range, lo (inclusive) to hi (exclusive), sugar for range<I>.",
   },
   "::": {
     sig: "head :: tail",
     doc: "Cons: prepends an element (also the list pattern form in match arms: `| h :: t -> ...`).",
   },
   "->": {
-    sig: "lambda(x) -> expr    (T1, T2) -> R    | pat -> expr",
+    sig: "lambda(x) -> expr",
     doc: "Arrow: introduces a lambda/function result, a function type's codomain, and a match arm's body.",
   },
   "=>": {
@@ -891,19 +1034,19 @@ const operators = {
     doc: "Reserved operator token: lexed, but no parse rule uses it today (assignment is `=` / `+=` on mut bindings).",
   },
   "+=": {
-    sig: "x += e   (x mut)",
+    sig: "x += e",
     doc: "Accumulating assignment on a mut binding: x = x + e. The accumulation form ad.grad() differentiates through.",
   },
   "-=": {
-    sig: "x -= e   (x mut)",
+    sig: "x -= e",
     doc: "Subtracting assignment on a mut binding: x = x - e.",
   },
   "*=": {
-    sig: "x *= e   (x mut)",
+    sig: "x *= e",
     doc: "Multiplying assignment on a mut binding: x = x * e.",
   },
   "/=": {
-    sig: "x /= e   (x mut)",
+    sig: "x /= e",
     doc: "Dividing assignment on a mut binding: x = x / e.",
   },
 };
@@ -911,7 +1054,7 @@ const operators = {
 // Bracketed outer-product operators [op]: one entry each, generated.
 for (const op of ["+", "-", "*", "/", "%", "^", "==", "!=", "<", "<=", ">", ">=", "&&", "||"]) {
   operators[`[${op}]`] = {
-    sig: `a [${op}] b -> outer product`,
+    sig: `(Idx1... -> T) [${op}] (Idx2... -> T) -> Idx1... -> Idx2... -> U`,
     doc: `Outer ${op}: applies ${op} across all index combinations of the operands, producing a higher-rank array.`,
   };
 }
