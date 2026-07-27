@@ -25,7 +25,7 @@ const grammar = JSON.parse(
 const LEXER_KEYWORDS = [
   "let", "rec", "const", "mut", "static", "function", "lambda", "type",
   "struct", "interface", "impl", "module", "for", "if", "then",
-  "else", "match", "with", "where", "and", "comm", "omp", "cuda",
+  "else", "match", "with", "where", "and", "comm", "anticomm", "omp", "cuda",
   "mpi", "reynolds", "true", "false", "in", "import", "from", "as",
   "Void", "Unit", "Array", "Idx", "SymIdx", "AntisymIdx",
   "HermitianIdx", "CompoundIdx", "EnumIdx", "DepIdx", "RaggedIdx",

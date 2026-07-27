@@ -16,7 +16,7 @@
 // scripts/check-consistency.js maps categories to the grammar's
 // support.function.* scopes.
 //
-// Type spellings follow the compiler's pretty-printer: `Array<T, Idx...>`
+// Type spellings follow the compiler's pretty-printer: `Array<T like  Idx...>`
 // for arrays, `virtual Array<...>` for the storage-free virtual-array kind
 // (IR arrows whose slots are all SIdxVirt), `MethodLoop<n>` /
 // `ObjectLoop<n>` for loops, `deferred` for an unforced pipeline. Templated
@@ -69,7 +69,7 @@ const identifiers = {
     category: "core",
     doc: "Builds a method loop over the given arrays' outer iteration space. Apply to a kernel with <@>.",
     params: [
-      { name: "a, ...", type: "(Idx... -> T)...", doc: "Tuple of arrays (or a single zip(...))" },
+      { name: "a, ...", type: "(Idx... -> T)...", doc: "Tuple of arrays" },
     ],
     ret: "MethodLoop<n>",
   },
@@ -117,21 +117,21 @@ const identifiers = {
   },
   mask: {
     category: "core",
-    doc: "Builds the Bool selection mask of a predicate over an array: evaluates the predicate elementwise, keeping the source's exact index records. Positions, not values — compose masks with elementwise Bool algebra, compact with compound(A, m), iterate the filtered space with range<CompoundIdx<m>>.",
+    doc: "Builds a Bool selection mask of a predicate over an array.",
     params: [
       { name: "array", type: "Idx... -> T", doc: "source array" },
       { name: "predicate", type: "T -> Bool", doc: "per-element selection predicate" },
     ],
-    ret: "Idx... -> Bool  (same index space as the source)",
+    ret: "Idx... -> Bool",
   },
   compound: {
     category: "core",
     doc: "Compacts a dense array through a boolean mask over its leading dimensions into a compound (sparse) view — the in-language analog of a provider's load_compound.",
     params: [
-      { name: "dense", type: "Idx... -> T", doc: "dense source values" },
+      { name: "dense", type: "Idx... -> IdxTail... -> T", doc: "dense source values" },
       { name: "mask", type: "Idx... -> Bool", doc: "present/absent mask over a leading prefix of the dense array's dims; must live over its exact index space (build with mask())" },
     ],
-    ret: "Array<T, CompoundIdx<mask>, Idx...>  (compact view)",
+    ret: "CompoundIdx<mask> -> IdxTail... -> T",
   },
   zip: {
     category: "core",
@@ -222,21 +222,21 @@ const identifiers = {
   },
   decompact: {
     category: "core",
-    doc: "Expands a symmetry-compacted dimension (SymIdx/AntisymIdx storage) back to dense form. Forces deferred inputs.",
+    doc: "Expands a compacted dimension (e.g., SymIdx/AntisymIdx storage) into a dense form. Forces materialization.",
     params: [
-      { name: "array", type: "Array<T, SymIdx<r, n>, ...>", doc: "symmetry-compacted array" },
+      { name: "array", type: "Array<T like CompactIdx<r, n>, ...>", doc: "Compacted array (any compact index type allowed)" },
       { name: "dim", type: "Int", doc: "which compacted dimension to expand" },
     ],
-    ret: "Array<T, Idx<n>, ..., Idx<n>>",
+    ret: "Array<T like Idx<n>, ..., Idx<n>>",
   },
   gram: {
     category: "core",
     doc: "Gram product gram(A, B) = A * B^H: result[i, j] = sum_k A[i, k] * conj(B[j, k]) over the shared trailing axis (complex element iff either operand is complex). gram(A) — or B syntactically the same array — yields the square symmetric (real) / Hermitian (complex) form, packed triangular.",
     params: [
-      { name: "a", type: "Array<T, Idx<m>, Idx<n>>", doc: "left factor (rank 2)" },
-      { name: "b", type: "Array<T, Idx<p>, Idx<n>>  (optional)", doc: "right factor sharing the trailing axis; defaults to `a`" },
+      { name: "a", type: "Array<T like Idx<m>, Idx<n>>", doc: "left factor (rank 2)" },
+      { name: "b", type: "Array<T like Idx<p>, Idx<n>>  (optional)", doc: "right factor sharing the trailing axis; defaults to `a`" },
     ],
-    ret: "Array<T, Idx<m>, Idx<p>>  (same-array: SymIdx<2, m> / HermitianIdx<m> packed)",
+    ret: "| Idx<m> -> Idx<p> -> T (A =/= B)  \n| SymIdx<2, m> -> T (A == B, real-valued) \n| HermitianIdx<m> -> T (A == B, complex-valued)",
   },
   replicate: {
     category: "core",
@@ -245,23 +245,23 @@ const identifiers = {
       { name: "count", type: "Int64 (static)", doc: "number of repetitions (a literal, `let static`, or static-function call)" },
       { name: "body", type: "T", doc: "expression evaluated per repetition" },
     ],
-    ret: "Array<T, Idx<count>>",
+    ret: "Idx<count> -> T",
   },
   sequence: {
     category: "core",
-    doc: "Assembles same-typed expressions into an array along a fresh leading Idx<n> axis (n = the expression count; element types unify, array elements nest under the new axis).",
+    doc: "Assembles same-typed expressions into an array along a fresh leading Idx<n> axis.",
     params: [
       { name: "e, ...", type: "T", doc: "expressions, evaluated left to right" },
     ],
-    ret: "Array<T, Idx<n>>",
+    ret: "Idx<n> -> T",
   },
   extents: {
     category: "core",
-    doc: "The array's extents, answered from the type when statically known: rank 1 — the extent itself; higher rank — a tuple with one Int64 per dimension. Ragged, grouped, and compound dims reject (no scalar extent exists).",
+    doc: "The array's extents, when statically known: rank 1 — the extent itself; higher rank — a tuple with one Int64 per dimension. Ragged, grouped, and compound dims reject (no scalar extent exists).",
     params: [
-      { name: "array", type: "Array<T, Idx...>", doc: "array to measure" },
+      { name: "array", type: "Array<T like  Idx...>", doc: "array to measure" },
     ],
-    ret: "Int64 | (Int64, ..., Int64)",
+    ret: "Tuple<Int64>",
   },
   complex: {
     category: "core",
@@ -316,7 +316,7 @@ const identifiers = {
     category: "core",
     doc: "Number of dimensions of an array. Typed Int64 in any context; folds statically when the operand's rank is known.",
     params: [
-      { name: "array", type: "Array<T, Idx...>", doc: "array to inspect" },
+      { name: "array", type: "Array<T like  Idx...>", doc: "array to inspect" },
     ],
     ret: "Int64",
   },
@@ -351,7 +351,7 @@ const identifiers = {
     params: [
       { name: "mod", type: "Int64", doc: "modulus expression bounding the generated values" },
     ],
-    ret: "Array<T, Idx...>  (shape from the binding's annotation)",
+    ret: "Array<T like  Idx...>  (shape from the binding's annotation)",
   },
 
   // --- Virtual arrays: index-defined, storage-free (their own object kind;
@@ -979,11 +979,11 @@ const operators = {
   },
   "<|>": {
     sig: "T -> T -> T",
-    doc: "Value-keyed choice: the left value where it is nonzero, else the right (an allocated zero falls through — contrast <|:>).",
+    doc: "Value-keyed choice: the left value where it is nonzero, else the right.",
   },
   "<|:>": {
-    sig: "Array<T, Idx...> -> Array<T, Idx...> -> Array<T, Idx...>",
-    doc: "Storage-keyed fallback on arrays: the left where its storage holds the cell, else the right — an allocated zero survives (unlike <|>).",
+    sig: "Array<T like Idx...> -> Array<T like Idx...> -> Array<T like Idx...>",
+    doc: "Storage-keyed fallback on arrays: the left where its storage holds the cell, else the right.",
   },
   ">>=": {
     sig: "Computation<T> -> (T -> Computation<U>) -> Computation<U>",

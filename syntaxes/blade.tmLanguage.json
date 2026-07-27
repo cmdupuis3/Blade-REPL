@@ -127,7 +127,7 @@
           "name": "storage.modifier.blade"
         },
         {
-          "match": "\\b(comm|omp|cuda|mpi|reynolds)\\b",
+          "match": "\\b(comm|anticomm|omp|cuda|mpi|reynolds)\\b",
           "name": "keyword.other.backend.blade"
         }
       ]

@@ -33,6 +33,11 @@ const providersByDoc = new Map();
 // entry per builtin call site with the compiler's monomorphized (concrete)
 // argument/result types. Rendered under the abstract signature in hovers.
 const callsByDoc = new Map();
+// uri.toString() -> kernels array from the last successful JSON check: one
+// entry per lambda-kernel span with the deduction snapshot (param names,
+// deduced comm/anticomm clauses, declared where conjuncts, per-param cell
+// ranks). Span-keyed — hover/completion resolve kernels by position.
+const kernelsByDoc = new Map();
 // Warn about a missing compiler only once per session.
 let warnedNoCompiler = false;
 
@@ -203,6 +208,7 @@ async function checkDocument(doc) {
       bindingsByDoc.set(doc.uri.toString(), payload.bindings || []);
       cacheProviders(doc, payload.providers || []);
       callsByDoc.set(doc.uri.toString(), payload.calls || []);
+      kernelsByDoc.set(doc.uri.toString(), payload.kernels || []);
       diagnostics.set(doc.uri, jsonToDiagnostics(doc, payload));
       // Concise telemetry so a "no tooltips" report can be pinpointed: empty
       // bindings ⇒ the file didn't type-check; providers=0 on a provider file
@@ -870,6 +876,10 @@ function typeNormalizer() {
   return (s) => {
     if (!s) return s;
     let out = s.replace(/\bArrow\b/g, "function");
+    // Compiler-synthesized extent names from rank deduction (decl-close pins
+    // mint `__<fn>_deduced_n<k>`, reduce's rank-1 demand mints `__inferred_n`)
+    // are display noise — an unnamed dimension, not a name the user wrote.
+    out = out.replace(/\b__\w+_deduced_n\d+\b|\b__inferred_n\d*\b/g, "_");
     out = out.replace(/'([A-Za-z]\w*)/g, (_, name) => {
       if (!seen.has(name)) {
         const i = seen.size;
@@ -939,6 +949,69 @@ function hoverMarkdown(sig, doc, badge) {
   return md;
 }
 
+// --- Deduced commutativity & minimum ranks ------------------------------------
+
+/** The comm/anticomm conjuncts of a where-clause list (drops omp/cuda/...). */
+function commClauses(where) {
+  return (where || []).filter((w) => /^(comm|anticomm)\(/.test(w));
+}
+
+/**
+ * Append the deduction block to a hover — two same-width labels so the values
+ * line up:
+ *
+ *   deduced comm: `comm(a, b)`
+ *   deduced rank: a: T^1, b: T^1
+ *
+ * The comm line is declared ∪ deduced ("None" when the deduction ran and
+ * proved nothing); under a "deduced" heading the already-pinned entries are
+ * the ones worth marking, so those carry the tag. `deducedComm` not being an
+ * array means an old compiler without the field — no block at all.
+ */
+function appendDeductionLines(md, declaredWhere, deducedComm, minRanks) {
+  if (!Array.isArray(deducedComm)) return;
+  const declared = commClauses(declaredWhere);
+  const parts = declared
+    .map((c) => "`" + c + "` (declared)")
+    .concat(deducedComm.filter((c) => !declared.includes(c)).map((c) => "`" + c + "`"));
+  md.appendMarkdown(parts.length ? `\n*deduced comm: ${parts.join(", ")}*\n` : "\n*deduced comm: None*\n");
+  if (minRanks && minRanks.length) {
+    const rendered = minRanks.map((r) => `${r.param}: T^${r.rank}`).join(", ");
+    md.appendMarkdown(`\n*deduced rank: ${rendered}*\n`);
+  }
+}
+
+/** minRanks list for a compiler function binding (params carrying minRank). */
+function bindingMinRanks(b) {
+  return (b.params || [])
+    .filter((p) => typeof p.minRank === "number" && p.minRank > 0)
+    .map((p) => ({ param: p.name, rank: p.minRank }));
+}
+
+/**
+ * The kernels[] entry whose span STARTS inside the hovered word — the
+ * `lambda` keyword of an inline kernel, or the variable reference of a
+ * let-bound kernel at its use site. Start-anchored so identifiers deep in a
+ * kernel body don't all light up with the kernel's deduction block.
+ */
+function kernelAt(doc, wordRange) {
+  const entries = kernelsByDoc.get(doc.uri.toString()) || [];
+  return entries.find((k) => {
+    const kl = (k.line || 1) - 1;
+    const kc = (k.col || 1) - 1;
+    return (
+      kl === wordRange.start.line &&
+      kc >= wordRange.start.character &&
+      kc <= wordRange.end.character
+    );
+  });
+}
+
+/** Kernel minRanks, dropping scalar (rank-0) cells — nothing to annotate. */
+function kernelMinRanks(k) {
+  return (k.minRanks || []).filter((r) => r.rank > 0);
+}
+
 /** Longest operator from the builtins table covering `character` in `lineText`. */
 function operatorAt(lineText, character) {
   let best;
@@ -971,20 +1044,45 @@ const hoverProvider = {
         prov = undefined;
       }
       if (prov) return prov;
+      // A lambda-kernel span starting under the cursor (the `lambda` keyword
+      // of an inline kernel, or a let-bound kernel's use-site reference)
+      // enriches whatever hover the word produces with its deduction block.
+      const kernel = kernelAt(doc, wordRange);
       // Source bindings win over the builtin table (shadowing).
       const b = lookupBinding(doc, word, position.line);
       if (b) {
         // Functions (anything with structured params/ret) render as a full
         // callable signature; plain values keep the `kind name : type` form.
-        const sig =
-          Array.isArray(b.params) && b.ret !== undefined
-            ? renderCallable(b.kind || "function", b.name, b.params, b.ret, b.where)
-            : signatureText(b.kind || "", b.name, b.type);
+        const callable = Array.isArray(b.params) && b.ret !== undefined;
+        const sig = callable
+          ? renderCallable(b.kind || "function", b.name, b.params, b.ret, b.where)
+          : signatureText(b.kind || "", b.name, b.type);
+        const md = new vscode.MarkdownString();
+        md.appendCodeblock(sig, "blade");
         // A top-level provider read carries its source member as a badge.
-        const badge = b.providerRead
-          ? `from ${b.providerRead.store}.${b.providerRead.member}`
-          : undefined;
-        return new vscode.Hover(hoverMarkdown(sig, b.doc, badge), wordRange);
+        if (b.providerRead) {
+          md.appendMarkdown(`\n*from ${b.providerRead.store}.${b.providerRead.member}*\n`);
+        }
+        if (callable) {
+          appendDeductionLines(md, b.where, b.deducedComm, bindingMinRanks(b));
+        } else if (kernel) {
+          // A let-bound lambda hovered at its kernel use site: the binding is
+          // a plain value (opaque function type) — the kernel entry carries
+          // the deduction.
+          appendDeductionLines(md, kernel.declaredWhere, kernel.deducedComm, kernelMinRanks(kernel));
+        }
+        if (b.doc) {
+          md.appendMarkdown("\n---\n\n");
+          md.appendText(b.doc);
+        }
+        return new vscode.Hover(md, wordRange);
+      }
+      // Inline lambda kernel: hover on the `lambda` keyword itself.
+      if (word === "lambda" && kernel) {
+        const md = new vscode.MarkdownString();
+        md.appendCodeblock(`lambda(${(kernel.params || []).join(", ")}) -> ...`, "blade");
+        appendDeductionLines(md, kernel.declaredWhere, kernel.deducedComm, kernelMinRanks(kernel));
+        return new vscode.Hover(md, wordRange);
       }
       const builtin = builtins.identifiers[word];
       if (builtin) {
@@ -1121,16 +1219,165 @@ const signatureHelpProvider = {
 // --- Completion ---------------------------------------------------------------
 
 /**
+ * Classify the cursor inside a `function name(...)` / `lambda(...)`
+ * declaration header (bounded backward scan, 8 lines). Returns undefined when
+ * the cursor is not in a header — including once the body has started (`=` for
+ * functions, `->` for lambdas). Otherwise:
+ *   { kind: "function"|"lambda", name?, line,        // header position
+ *     inParams, currentParam?,                        // inside the param list
+ *     afterParams, afterWhere, afterArrow }           // past the closing `)`
+ */
+function declContextAt(doc, position) {
+  const startLine = Math.max(0, position.line - 8);
+  let head = null; // nearest opener before the cursor: { line, paren, kind, name }
+  for (let l = position.line; l >= startLine && !head; l--) {
+    const text = doc.lineAt(l).text;
+    const limit = l === position.line ? position.character : text.length;
+    const re = /\b(?:function\s+([A-Za-z_]\w*)|lambda)\s*\(/g;
+    let m;
+    while ((m = re.exec(text)) !== null) {
+      const paren = m.index + m[0].length - 1;
+      if (paren >= limit) break;
+      head = { line: l, paren, kind: m[1] ? "function" : "lambda", name: m[1] };
+    }
+  }
+  if (!head) return undefined;
+  // Concatenate from the opening paren to the cursor, then bracket-count.
+  let tail = "";
+  for (let l = head.line; l <= position.line; l++) {
+    const text = doc.lineAt(l).text;
+    const from = l === head.line ? head.paren : 0;
+    const to = l === position.line ? position.character : text.length;
+    tail += text.slice(from, to) + (l < position.line ? "\n" : "");
+  }
+  let depth = 0;
+  let closeIdx = -1;
+  for (let i = 0; i < tail.length; i++) {
+    const c = tail[i];
+    if (c === "(" || c === "[" || c === "{") depth++;
+    else if (c === ")" || c === "]" || c === "}") {
+      depth--;
+      if (depth === 0) {
+        closeIdx = i;
+        break;
+      }
+    }
+  }
+  if (closeIdx === -1) {
+    // Inside the parameter list. The current param is the text after the last
+    // top-level comma; `name:` (with at most a partial type word) means the
+    // cursor sits in its annotation position.
+    let last = 1; // tail[0] is the opening paren
+    depth = 0;
+    for (let i = 0; i < tail.length; i++) {
+      const c = tail[i];
+      if (c === "(" || c === "[" || c === "{") depth++;
+      else if (c === ")" || c === "]" || c === "}") depth--;
+      else if (c === "," && depth === 1) last = i + 1;
+    }
+    const pm = /^\s*([A-Za-z_]\w*)\s*:\s*([A-Za-z_]\w*)?\s*$/.exec(tail.slice(last));
+    return {
+      kind: head.kind, name: head.name, line: head.line,
+      inParams: true, currentParam: pm ? pm[1] : undefined,
+      afterParams: false, afterWhere: false, afterArrow: false,
+    };
+  }
+  const after = tail.slice(closeIdx + 1);
+  // Body started: `=` opens a function body, `->` a lambda body.
+  if (head.kind === "function" ? after.includes("=") : after.includes("->")) return undefined;
+  return {
+    kind: head.kind, name: head.name, line: head.line,
+    inParams: false, currentParam: undefined,
+    afterParams: true,
+    afterWhere: /\bwhere\b/.test(after),
+    afterArrow: after.includes("->"),
+  };
+}
+
+/**
+ * Deduction-aware completions inside a declaration header: the deduced
+ * `where comm(...)` / `where anticomm(...)` pin after the param list, and the
+ * deduced minimum rank (`T^k`) in a parameter's annotation position. Backed by
+ * the last check's caches — same staleness contract as diagnostics (save to
+ * refresh), which matches the confirm-and-pin workflow: write the kernel
+ * unannotated, save, pin from the suggestion.
+ */
+function deductionCompletions(doc, position) {
+  const ctx = declContextAt(doc, position);
+  if (!ctx) return [];
+  let deduced = [];
+  let declared = [];
+  const rankByParam = new Map();
+  if (ctx.kind === "function") {
+    if (!ctx.name) return [];
+    const b = (bindingsByDoc.get(doc.uri.toString()) || []).find(
+      (x) => x.name === ctx.name && Array.isArray(x.params) && x.ret !== undefined
+    );
+    if (!b || !Array.isArray(b.deducedComm)) return [];
+    deduced = b.deducedComm;
+    declared = commClauses(b.where);
+    for (const r of bindingMinRanks(b)) rankByParam.set(r.param, r.rank);
+  } else {
+    // Inline lambda: the kernels[] entry whose span starts on the header line.
+    const k = (kernelsByDoc.get(doc.uri.toString()) || []).find(
+      (e) => (e.line || 1) - 1 === ctx.line
+    );
+    if (!k) return [];
+    deduced = k.deducedComm || [];
+    declared = commClauses(k.declaredWhere);
+    for (const r of kernelMinRanks(k)) rankByParam.set(r.param, r.rank);
+  }
+  const items = [];
+  if (ctx.inParams) {
+    const k = ctx.currentParam && rankByParam.get(ctx.currentParam);
+    if (k) {
+      const item = new vscode.CompletionItem(`T^${k}`, vscode.CompletionItemKind.TypeParameter);
+      item.detail = `minimum deduced rank for '${ctx.currentParam}'`;
+      item.documentation = new vscode.MarkdownString().appendText(
+        `The body forces rank ${k} on '${ctx.currentParam}' — the deduced minimum. ` +
+          "Annotating a higher rank is allowed; lower is a type error."
+      );
+      item.filterText = "T";
+      item.sortText = "0";
+      items.push(item);
+    }
+  } else if (ctx.afterParams && !(ctx.kind === "function" && ctx.afterArrow)) {
+    for (const clause of deduced.filter((c) => !declared.includes(c))) {
+      const label = ctx.afterWhere ? clause : `where ${clause}`;
+      const item = new vscode.CompletionItem(label, vscode.CompletionItemKind.Snippet);
+      item.detail = clause.startsWith("anticomm(")
+        ? "deduced anticommutativity — pin to enable strict-triangular (zero-diagonal) storage"
+        : "deduced commutativity — pin to enable compact symmetric (triangular) storage";
+      item.filterText = ctx.afterWhere ? clause.slice(0, clause.indexOf("(")) : "where";
+      item.sortText = "0";
+      items.push(item);
+    }
+  }
+  return items;
+}
+
+/**
  * Word completions from the same sources the hover uses, in shadowing order:
  * compiler bindings, builtins, domain keywords, built-in types, and
  * source-scanned type/unit declarations. Plain word inserts — no snippets,
  * no trigger characters (`(` already triggers signature help). Operators are
- * deliberately excluded (not word-completable).
+ * deliberately excluded (not word-completable). One position-aware exception:
+ * deduction completions (the `where comm(...)` pin, `T^k` minimum ranks)
+ * prepend when the cursor sits in a declaration header.
  */
 const completionProvider = {
-  provideCompletionItems(doc) {
+  provideCompletionItems(doc, position) {
     const items = [];
     const seen = new Set();
+    // 0. Deduction-aware suggestions (guarded: never break word completion).
+    try {
+      for (const item of deductionCompletions(doc, position)) {
+        seen.add(typeof item.label === "string" ? item.label : item.label.label);
+        items.push(item);
+      }
+    } catch (_) {
+      /* header parsing is best-effort */
+    }
     const push = (label, kind, detail, docMd) => {
       if (seen.has(label)) return;
       seen.add(label);
@@ -1239,6 +1486,7 @@ function activate(context) {
       bindingsByDoc.delete(doc.uri.toString());
       providersByDoc.delete(doc.uri.toString());
       callsByDoc.delete(doc.uri.toString());
+      kernelsByDoc.delete(doc.uri.toString());
       typeDeclCache.delete(doc.uri.toString());
     }),
 
@@ -1258,3 +1506,21 @@ function activate(context) {
 function deactivate() {}
 
 module.exports = { activate, deactivate };
+
+// Headless test surface (scripts/, not used by VS Code): the providers, the
+// checker, and the per-document caches they read. Everything here is the same
+// object the activation wires up — no test-only forks.
+module.exports._test = {
+  checkDocument,
+  hoverProvider,
+  completionProvider,
+  declContextAt,
+  bindingsByDoc,
+  kernelsByDoc,
+  setOutput: (o) => {
+    output = o;
+  },
+  setDiagnostics: (d) => {
+    diagnostics = d;
+  },
+};

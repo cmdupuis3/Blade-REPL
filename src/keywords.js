@@ -19,6 +19,10 @@ const keywords = {
     usage: "where comm(A, B)",
     doc: "Kernel commutativity group. All args in a single comm(...) conjunct are mutually commutative. If these args recieve copies of the same array, the output dimensions are transposed and made symmetric.",
   },
+  anticomm: {
+    usage: "where anticomm(A, B)",
+    doc: "Kernel anticommutativity group — the signed sibling of comm: f(B, A) = -f(A, B). Needs at least two names. If these args receive copies of the same array, the output compacts to strict-triangular (zero-diagonal) antisymmetric storage. A name cannot appear in both a comm and an anticomm group.",
+  },
   omp: {
     usage: "where omp(x: 1)",
     doc: "OpenMP parallelization strategy. The first n dimensions of x are parallelized with OpenMP.",
@@ -41,7 +45,7 @@ const keywords = {
   },
   where: {
     usage: "function f(A, B) where comm(A, B), omp(x: 1) -> T",
-    doc: "Constraint clause on functions and lambdas: commutativity groups (comm), at most one parallel strategy (omp / cuda / mpi), and module-qualified conjuncts such as pppl.indep(a, b), comma-separated. Also opens the constraint block of grouped type aliases (`type P1 = T1 and P2 = T2 where ...`).",
+    doc: "Constraint clause on functions and lambdas: commutativity groups (comm / anticomm), at most one parallel strategy (omp / cuda / mpi), and module-qualified conjuncts such as ppl.indep(a, b), comma-separated. Also opens the constraint block of grouped type aliases (`type P1 = T1 and P2 = T2 where ...`).",
   },
   static: {
     usage: "let static n = 2",
