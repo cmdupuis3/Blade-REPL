@@ -405,10 +405,18 @@ async function commandEmitFile() {
 // resolved from the source here, since the compiler emits no bindings for
 // them. All four kinds render as a hover tooltip.
 
-const INDEX_KEYWORD_RE =
-  /^(Idx|SymIdx|AntisymIdx|HermitianIdx|CompoundIdx|EnumIdx|DepIdx|RaggedIdx)\b/;
+// Does a `type X = Rhs` right-hand side name an index type? Derived from the
+// hover table rather than spelled out, so a family member added there cannot
+// end up hovering as an index type while its aliases read as plain aliases.
+// Longest-first so the alternation never depends on the table's key order.
+const INDEX_KEYWORD_RE = new RegExp(
+  `^(${Object.keys(types.indexTypes)
+    .sort((a, b) => b.length - a.length)
+    .join("|")})\\b`
+);
 
-// uri.toString() -> { version, decls } cache of scanned `type` declarations.
+// uri.toString() -> { version, decls, units, statics } cache of the scanned
+// declarations (see scanDecls).
 const typeDeclCache = new Map();
 
 /**
@@ -431,10 +439,12 @@ function docCommentAbove(doc, lineIndex) {
 }
 
 /**
- * Scan the document for `type Name = Rhs` aliases and `Unit name [= expr]`
- * unit-of-measure declarations. Returns { decls, units }: decls maps
+ * Scan the document for `type Name = Rhs` aliases, `Unit name [= expr]`
+ * unit-of-measure declarations, and single-line `let static Name = Rhs`
+ * bindings. Returns { decls, units, statics }: decls maps
  * name -> { name, parent, indexLike, doc }; units maps name -> { name, rhs,
- * doc } (rhs undefined for base units). Cached per document version.
+ * doc } (rhs undefined for base units); statics maps name -> rhs (the key
+ * lists a `SparseIdx<K>` names). Cached per document version.
  */
 function scanDecls(doc) {
   const key = doc.uri.toString();
@@ -443,8 +453,11 @@ function scanDecls(doc) {
 
   const decls = new Map();
   const units = new Map();
+  const statics = new Map();
   for (let l = 0; l < doc.lineCount; l++) {
     const text = doc.lineAt(l).text;
+    const s = /^\s*let\s+static\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.+?)\s*$/.exec(text);
+    if (s) statics.set(s[1], s[2].replace(/\s*\/\/.*$/, "").trim());
     const m = /^\s*type\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.+?)\s*$/.exec(text);
     if (m) {
       const parent = m[2].replace(/\s*\/\/.*$/, "").trim(); // drop trailing line comment
@@ -462,7 +475,7 @@ function scanDecls(doc) {
       units.set(u[1], { name: u[1], rhs: rhs || undefined, doc: docCommentAbove(doc, l) });
     }
   }
-  const entry = { version: doc.version, decls, units };
+  const entry = { version: doc.version, decls, units, statics };
   typeDeclCache.set(key, entry);
   return entry;
 }
@@ -566,6 +579,138 @@ function parseArrayTypeAt(doc, wordRange) {
   return { elem, indices };
 }
 
+// --- The concrete OrbIdx / SparseIdx class at a hover site --------------------
+//
+// Both types keep their whole identity in their arguments, so the static table
+// can only describe the family. An OrbIdx's level list IS the class, and the
+// written spelling need not be the class it lowers to (a rank-1 level is the
+// trivial group and drops; what survives decides the record). A SparseIdx's
+// rank is never written — it is the arity of its keys' tuples. Both are
+// resolved from the source at hover time, exactly as `Array<...>` is.
+
+/** `[(2,-), (2,+)]` -> [{rank, plus}, ...]; `[]` -> []; null if malformed. */
+function parseOrbLevels(text) {
+  const m = /^\[\s*([\s\S]*?)\s*\]$/.exec(text.trim());
+  if (!m) return null;
+  if (!m[1]) return [];
+  const levels = [];
+  for (const part of splitTopLevel(m[1], ",")) {
+    const lm = /^\(\s*(\d+)\s*,\s*([+-])\s*\)$/.exec(part);
+    if (!lm) return null;
+    levels.push({ rank: Number(lm[1]), plus: lm[2] === "+" });
+  }
+  return levels;
+}
+
+/** Exact C(m, r) as a BigInt (0 when r > m). Each step is an exact division. */
+function binom(m, r) {
+  if (BigInt(r) > m) return 0n;
+  let acc = 1n;
+  for (let i = 1n; i <= BigInt(r); i++) acc = (acc * (m - BigInt(r) + i)) / i;
+  return acc;
+}
+
+const INT64_MAX = 9223372036854775807n;
+
+/** Render a level list the way the compiler prints it. */
+function showOrbLevels(levels) {
+  return "[" + levels.map((l) => `(${l.rank},${l.plus ? "+" : "-"})`).join(", ") + "]";
+}
+
+/**
+ * The `this class:` block for a written `OrbIdx<[...], n>`: the record it
+ * normalizes to when the spelling isn't already normal, the wreath group and
+ * its raw-axis count, and the cardinality fold
+ * (M0 = n; M = C(M+r-1, r) at `+`, C(M, r) at `-`) when the extent is a
+ * literal. Returns undefined if `text` isn't a well-formed OrbIdx.
+ */
+function orbIdxDetail(text) {
+  const m = /^OrbIdx\s*<([\s\S]*)>\s*$/.exec(text.trim());
+  if (!m) return undefined;
+  const parts = splitTopLevel(m[1], ",");
+  if (parts.length !== 2) return undefined;
+  const levels = parseOrbLevels(parts[0]);
+  if (!levels || levels.some((l) => l.rank < 1)) return undefined;
+  const extent = parts[1];
+
+  // A rank-1 level is the trivial group and drops at either sign; the empty
+  // class is `Idx<n>` and a single survivor is the exact Sym/Antisym record.
+  const kept = levels.filter((l) => l.rank !== 1);
+  const lines = [];
+  if (kept.length === 0) lines.push(`normalizes to  Idx<${extent}>`);
+  else if (kept.length === 1)
+    lines.push(
+      `normalizes to  ${kept[0].plus ? "SymIdx" : "AntisymIdx"}<${kept[0].rank}, ${extent}>`
+    );
+  else {
+    if (kept.length !== levels.length)
+      lines.push(`normalizes to  OrbIdx<${showOrbLevels(kept)}, ${extent}>`);
+    lines.push(
+      `group          ${kept.map((l) => `S_${l.rank}`).join(" wr ")}` +
+        `  (characters ${kept.map((l) => (l.plus ? "+" : "-")).join(", ")})`
+    );
+  }
+  lines.push(`raw axes       ${kept.reduce((a, l) => a * l.rank, 1)}`);
+
+  if (/^\d+$/.test(extent)) {
+    let cells = BigInt(extent);
+    const steps = [];
+    let overflowed = false;
+    for (const l of kept) {
+      const top = l.plus ? cells + BigInt(l.rank) - 1n : cells;
+      cells = binom(top, l.rank);
+      steps.push(`C(${top},${l.rank}) = ${cells}`);
+      // The compiler's fold is exactly-checked int64 and stops at the first
+      // step that wraps; carrying on would print a number it never computes.
+      if (cells > INT64_MAX) {
+        overflowed = true;
+        break;
+      }
+    }
+    lines.push(`cells          ${[extent, ...steps].join(" -> ")}`);
+    // The fold runs at allocation, not at the declaration — the class can be
+    // named, but nothing can be stored in it.
+    if (overflowed) lines.push(`               int64 overflow — refused at allocation`);
+  }
+  return lines.join("\n");
+}
+
+/**
+ * The `this class:` block for a written `SparseIdx<keys>`: the entry count and
+ * the rank the tuple arity implies, plus the subscript form that rank takes
+ * (one joint tuple; a rank-1 key collapses to a bare scalar). Only a literal
+ * key list or one named by a single-line `let static` resolves — a runtime
+ * keys array has nothing to count, and returns undefined.
+ */
+function sparseIdxDetail(doc, text) {
+  const m = /^SparseIdx\s*<([\s\S]*)>\s*$/.exec(text.trim());
+  if (!m) return undefined;
+  const keys = m[1].trim();
+  let listText = keys;
+  let origin = "";
+  if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(keys)) {
+    listText = scanDecls(doc).statics.get(keys);
+    if (!listText) return undefined;
+    origin = `  (let static ${keys})`;
+  }
+  const lm = /^\[\s*([\s\S]*?)\s*\]$/.exec(listText);
+  if (!lm || !lm[1]) return undefined;
+  const entries = splitTopLevel(lm[1], ",");
+  const arities = entries.map((e) => {
+    const t = /^\(\s*([\s\S]*?)\s*\)$/.exec(e);
+    return t ? splitTopLevel(t[1], ",").length : 1;
+  });
+  const rank = arities[0];
+  if (!arities.every((a) => a === rank)) return undefined; // ragged: not a key set
+  const subscript =
+    rank === 1
+      ? "S(c0)"
+      : `S((${Array.from({ length: rank }, (_, i) => `c${i}`).join(", ")}))`;
+  return [`keys           ${entries.length}${origin}`, `rank           ${rank} — index as ${subscript}`].join(
+    "\n"
+  );
+}
+
 /**
  * `name` + `kind` in a code block, with an optional description below a rule.
  * `descIsPlain` renders user-authored text verbatim (no markdown); otherwise
@@ -580,6 +725,18 @@ function typeMarkdown(codeLines, desc, descIsPlain) {
     else md.appendMarkdown(desc);
   }
   return md;
+}
+
+/**
+ * The hover/completion body for a built-in index type: its signature and
+ * description, then — for the compact classes — the shape an array literal
+ * over that class takes. The literal line is deliberately NOT part of `desc`:
+ * `desc` doubles as the one-line comment beside each index in the `Array<...>`
+ * tooltip (arrayMarkdown collapses it to a single line), where an example
+ * would swamp its neighbours.
+ */
+function indexTypeDoc(it) {
+  return "`" + it.sig + "` — " + it.desc + (it.lit ? "\n\n" + it.lit : "");
 }
 
 /** Multi-line Array tooltip: `Array: T like` then one index per line. */
@@ -599,6 +756,36 @@ function arrayMarkdown(arr) {
   return md;
 }
 
+/** The first balanced `Name<...>` occurrence inside `text`, or undefined. */
+function firstAngleForm(text, name) {
+  const at = text.indexOf(name + "<");
+  if (at === -1) return undefined;
+  let depth = 0;
+  for (let i = at + name.length; i < text.length; i++) {
+    if (text[i] === "<") depth++;
+    else if (text[i] === ">" && --depth === 0) return text.slice(at, i + 1);
+  }
+  return undefined;
+}
+
+/**
+ * Append the concrete class of the `OrbIdx<...>` / `SparseIdx<...>` inside
+ * `text` to `md`. `text` is any type string — the spelling at a hover site, a
+ * nominal alias's right-hand side, or a whole `Array<...>` the compiler
+ * reported, which is the only place a DEDUCED wreath class is ever seen.
+ * Silent when there is none or it doesn't resolve, so a half-typed or
+ * runtime-keyed type still gets the family hover.
+ */
+function appendClassDetail(md, doc, text) {
+  if (!text) return;
+  const orb = firstAngleForm(text, "OrbIdx");
+  const sparse = orb ? undefined : firstAngleForm(text, "SparseIdx");
+  const detail = orb ? orbIdxDetail(orb) : sparse ? sparseIdxDetail(doc, sparse) : undefined;
+  if (!detail) return;
+  md.appendMarkdown("\n*this class:*\n");
+  md.appendCodeblock(detail, "blade");
+}
+
 /** Hover for a type name under the cursor, or undefined if it isn't a type. */
 function typeHoverFor(doc, word, wordRange) {
   // Array<...>: parse the element and index args at this location.
@@ -611,13 +798,14 @@ function typeHoverFor(doc, word, wordRange) {
   if (prim !== undefined) {
     return new vscode.Hover(typeMarkdown([word, "Primitive Type"], prim), wordRange);
   }
-  // Index type: name + "Index Type", then a short description with its args.
+  // Index type: name + "Index Type", then a short description with its args,
+  // and — for the two whose identity is entirely in their arguments — the
+  // concrete class written here.
   const it = types.indexTypes[word];
   if (it) {
-    return new vscode.Hover(
-      typeMarkdown([word, "Index Type"], "`" + it.sig + "` — " + it.desc),
-      wordRange
-    );
+    const md = typeMarkdown([word, "Index Type"], indexTypeDoc(it));
+    appendClassDetail(md, doc, collectAngleType(doc, wordRange.start.line, wordRange.start.character));
+    return new vscode.Hover(md, wordRange);
   }
   // Other built-in constructor (Poly, ...).
   const ctor = types.constructors[word];
@@ -633,10 +821,9 @@ function typeHoverFor(doc, word, wordRange) {
     const kindLine = decl.indexLike
       ? `Nominal Index Type: ${decl.parent}`
       : `Type Alias: ${decl.parent}`;
-    return new vscode.Hover(
-      typeMarkdown([`type ${decl.name} = ${decl.parent}`, kindLine], decl.doc, true),
-      wordRange
-    );
+    const md = typeMarkdown([`type ${decl.name} = ${decl.parent}`, kindLine], decl.doc, true);
+    appendClassDetail(md, doc, decl.parent);
+    return new vscode.Hover(md, wordRange);
   }
   // Unit of measure from a source `Unit name [= expr]` declaration.
   const unit = scanDecls(doc).units.get(word);
@@ -1063,6 +1250,10 @@ const hoverProvider = {
         if (b.providerRead) {
           md.appendMarkdown(`\n*from ${b.providerRead.store}.${b.providerRead.member}*\n`);
         }
+        // A wreath class is almost always DEDUCED rather than written (the tie
+        // rule appends a level to a repeated compact argument), so the binding
+        // is where the user first meets it — spell out what it stores.
+        if (!callable) appendClassDetail(md, doc, b.type || "");
         if (callable) {
           appendDeductionLines(md, b.where, b.deducedComm, bindingMinRanks(b));
         } else if (kernel) {
@@ -1420,7 +1611,7 @@ const completionProvider = {
       push(name, vscode.CompletionItemKind.Struct, "Primitive Type", typeMarkdown([name, "Primitive Type"], d));
     }
     for (const [name, t] of Object.entries(types.indexTypes)) {
-      push(name, vscode.CompletionItemKind.Class, t.sig, typeMarkdown([name, "Index Type"], "`" + t.sig + "` — " + t.desc));
+      push(name, vscode.CompletionItemKind.Class, t.sig, typeMarkdown([name, "Index Type"], indexTypeDoc(t)));
     }
     for (const [name, c] of Object.entries(types.constructors)) {
       push(name, vscode.CompletionItemKind.Class, c.sig, typeMarkdown([name, c.kind], "`" + c.sig + "` — " + c.desc));

@@ -19,16 +19,16 @@ const grammar = JSON.parse(
   fs.readFileSync(path.join(root, "syntaxes", "blade.tmLanguage.json"), "utf8")
 );
 
-// The compiler's reserved words — source: GitHub/Blade/src/Lexer.fs:139-218
-// (77 distinct; True/False are lexer aliases of true/false and appear in the
+// The compiler's reserved words — source: GitHub/Blade/src/Lexer.fs:155-245
+// (80 distinct; True/False are lexer aliases of true/false and appear in the
 // grammar's booleans pattern only).
 const LEXER_KEYWORDS = [
   "let", "rec", "const", "mut", "static", "function", "lambda", "type",
   "struct", "interface", "impl", "module", "for", "if", "then",
   "else", "match", "with", "where", "and", "comm", "anticomm", "omp", "cuda",
   "mpi", "reynolds", "true", "false", "in", "import", "from", "as",
-  "Void", "Unit", "Array", "Idx", "SymIdx", "AntisymIdx",
-  "HermitianIdx", "CompoundIdx", "EnumIdx", "DepIdx", "RaggedIdx",
+  "Void", "Unit", "Array", "Idx", "SymIdx", "AntisymIdx", "OrbIdx",
+  "HermitianIdx", "CompoundIdx", "SparseIdx", "EnumIdx", "DepIdx", "RaggedIdx",
   "IrrepsIdx", "method_for", "object_for", "range", "reverse",
   "transpose", "hermitian", "gram", "decompact", "pure", "compute",
   "read", "guard", "sequence", "replicate", "zip", "stack", "arity",

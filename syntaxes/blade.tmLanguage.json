@@ -91,7 +91,7 @@
       "comment": "The index-type family plus Array/like — the signature syntax Array<Elem like Idx1, Idx2>",
       "patterns": [
         {
-          "match": "\\b(Idx|SymIdx|AntisymIdx|HermitianIdx|CompoundIdx|EnumIdx|DepIdx|RaggedIdx|IrrepsIdx)\\b",
+          "match": "\\b(Idx|SymIdx|AntisymIdx|OrbIdx|HermitianIdx|CompoundIdx|SparseIdx|EnumIdx|DepIdx|RaggedIdx|IrrepsIdx)\\b",
           "name": "support.type.index.blade"
         },
         {

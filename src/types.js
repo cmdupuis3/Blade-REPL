@@ -34,7 +34,11 @@ const primitives = {
 };
 
 // The index-type family. `sig` shows the argument shape; `desc` is a very
-// short description of the index type and the arguments it takes.
+// short description of the index type and the arguments it takes. `lit`, on
+// the compact classes only, is the shape an array literal over that class
+// takes — deliberately a SEPARATE field, not more `desc`: `desc` is also the
+// one-line comment beside each index in the `Array<...>` tooltip, and a literal
+// example there would swamp the line it shares.
 const indexTypes = {
   Idx: {
     sig: "Idx<n: Nat>",
@@ -43,18 +47,29 @@ const indexTypes = {
   SymIdx: {
     sig: "SymIdx<r: Nat, n: Nat>",
     desc: "Symmetric index type. \n Rank-r symmetric dimensions over an extent-n index.",
+    lit: "Literal — one bracket level per rank, a row seeded at p holding n − p cells:\n\n`SymIdx<2, 3>` = `[[a00, a01, a02], [a11, a12], [a22]]`",
   },
   AntisymIdx: {
     sig: "AntisymIdx<r: Nat, n: Nat>",
     desc: "Antisymmetric index type. \n Rank-r antisymmetric dimensions over an extent-n index (no diagonal).",
+    lit: "Literal — as SymIdx but strict, so a row seeded at p holds n − p − 1 cells and the last is empty:\n\n`AntisymIdx<2, 3>` = `[[a01, a02], [a12], []]`",
+  },
+  OrbIdx: {
+    sig: "OrbIdx<[(r_i: Nat, s_i: + | -)], n: Nat>",
+    desc: "Orbit index type. \n Iterated wreath of rank-r_i symmetric (+) / antisymmetric (-) levels over an extent-n index, outermost last; a subscript takes Π r_i flat coordinates. Depth 1 is exactly SymIdx / AntisymIdx.",
   },
   HermitianIdx: {
     sig: "HermitianIdx<n: Nat>",
     desc: "Hermitian index type. \n Rank-2 conjugate-symmetric dimensions over an extent-n index (real- and complex-valued only).",
+    lit: "Literal — the SymIdx triangle, each row's leading cell the diagonal, which must be REAL (`A(i, i) = conj(A(i, i))`):\n\n`HermitianIdx<3>` = `[[d0, a01, a02], [d1, a12], [d2]]`",
   },
   CompoundIdx: {
     sig: "CompoundIdx<Tuple<I_j: Idx<n_j: Nat>>, mask: bool^r>",
     desc: "Compound index type.\n Contiguous storage of a masked or sparse view over one or more base index types.",
+  },
+  SparseIdx: {
+    sig: "SparseIdx<keys: (Nat, ...)^m>",
+    desc: "Sparse index type. \n Explicit enumeration of the m valid tuples (edge lists, CG triples); rank is the tuple arity, lookup hashes the tuple, and keys keep their given order. One slot taking one joint tuple — `S((i, j))` — with wildcards and leading prefixes gathered.",
   },
   EnumIdx: {
     sig: "EnumIdx<Enum>",
