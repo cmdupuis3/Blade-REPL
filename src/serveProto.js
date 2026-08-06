@@ -8,16 +8,28 @@
 //
 // NDJSON over stdin/stdout: one JSON object per line, UTF-8. Unlike the REPL
 // (a terminal-shaped prompt/echo protocol), `ide serve` is a plain data pipe
-// — requests and responses correlate by an integer "id" (ping and check
-// only; shutdown has no response and no id). See the plan's frozen protocol
-// spec for the exact message shapes:
+// — requests and responses correlate by an integer "id" (ping, check, eval,
+// resetSession; shutdown has no response and no id). See the plan's frozen
+// protocol spec for the exact message shapes:
 //
 //   request  {"id": N, "cmd": "check", "tier": "fast"|"full", "file": "...", "source": "..."}
 //   request  {"id": N, "cmd": "ping"}
+//   request  {"id": N, "cmd": "eval", "session": "...", "source": "...", "cwd": "..."}  (cwd optional)
+//   request  {"id": N, "cmd": "resetSession", "session": "..."}
 //   request  {"cmd": "shutdown"}
 //   response {"id": N, "ok": true, "serve": 1, "version": "..."}          (ping)
 //   response {"id": N, "tier": "fast"|"full", "diagnostics": [...], ...}  (check)
+//   response {"id": N, "kept": true|false, "exitCode": E, "lane": "interp"|"gpp",
+//             "elapsedMs": M, "stdout": "...", "stderr": "...",
+//             "bindings": [...], "diagnostics": [...]}                    (eval)
+//   response {"id": N, "ok": true}                                        (resetSession)
 //   response {"id": N|null, "error": "..."}                                (error)
+//
+// A compiler that predates notebook support answers "eval"/"resetSession"
+// with the generic {"id", "error": "..."} shape (unknown cmd) rather than
+// rejecting the connection — src/serve.js tags that case (see
+// handleStdout's `protocolError`) so callers can tell "unsupported command"
+// apart from a transport failure (timeout, crash, not found).
 //
 // stderr is free-form compiler logging (never JSON, never parsed here) —
 // src/serve.js routes it straight to the "Blade" output channel.
@@ -32,6 +44,23 @@ function encodeCheck(id, tier, file, source) {
 /** One "ping" request line: {"id","cmd":"ping"}\n */
 function encodePing(id) {
   return JSON.stringify({ id, cmd: "ping" }) + "\n";
+}
+
+/** One "eval" request line: {"id","cmd":"eval","session","source"[,"cwd"]}\n
+ *  — evaluate `source` as the next submission in the named REPL session
+ *  (append, or rebind-in-place by top-level name), same semantics as one
+ *  `blade repl` submission. `cwd` (optional) is the directory relative data
+ *  paths in the snippet resolve against (the notebook file's directory). */
+function encodeEval(id, session, source, cwd) {
+  const req = { id, cmd: "eval", session, source };
+  if (cwd) req.cwd = cwd;
+  return JSON.stringify(req) + "\n";
+}
+
+/** One "resetSession" request line: {"id","cmd":"resetSession","session"}\n
+ *  — discard the named session's accumulated bindings (Restart Kernel). */
+function encodeResetSession(id, session) {
+  return JSON.stringify({ id, cmd: "resetSession", session }) + "\n";
 }
 
 /** The "shutdown" request line: {"cmd":"shutdown"}\n — no id, no response. */
@@ -88,6 +117,8 @@ function createDecoder() {
 module.exports = {
   encodeCheck,
   encodePing,
+  encodeEval,
+  encodeResetSession,
   encodeShutdown,
   decodeLine,
   createDecoder,

@@ -20,6 +20,7 @@ const types = require("./types");
 const keywords = require("./keywords");
 const repl = require("./repl");
 const serve = require("./serve");
+const notebook = require("./notebook");
 
 /** @type {vscode.DiagnosticCollection} */
 let diagnostics;
@@ -2578,7 +2579,16 @@ const codeLensProvider = {
     const lenses = [];
     const key = doc.uri.toString();
     for (const b of bindingsByDoc.get(key) || []) {
-      if (!b.name || !b.line) continue;
+      // bindings[] also carries a "param" entry per function parameter (see
+      // documentSymbols' identical exclusion): a param shares its function's
+      // header line, so without this filter every array-typed param stacks
+      // its own arrow lens on top of the function's signature lens.
+      // `_foreign` (notebook.js's remapPayloadForCell, workstream 5 N3):
+      // a binding pulled into a cell's cache from an EARLIER cell, clamped
+      // to line 1 so hovers/completions still resolve it — without this
+      // skip every later cell would stack a duplicate signature lens for
+      // every earlier cell's binding on top of its own first line.
+      if (!b.name || !b.line || b.kind === "param" || b._foreign) continue;
       const line = Math.max(0, (b.line || 1) - 1);
       const range = new vscode.Range(line, 0, line, 0);
       const callable = Array.isArray(b.params) && b.ret !== undefined;
@@ -2627,6 +2637,11 @@ function activate(context) {
   context.subscriptions.push(diagnostics, output);
   repl.init(context, { findCompiler, reportNoCompiler });
   serve.init(context, { findCompiler, output });
+  // applyCheckPayload is passed through so notebook.js's own concatenated-
+  // session fast check (N3) can fan its remapped response out to each cell's
+  // caches without notebook.js requiring this module back (that would be a
+  // require cycle — extension.js already requires notebook.js).
+  notebook.init(context, { findCompiler, output, applyCheckPayload });
 
   const cfg = () => vscode.workspace.getConfiguration("blade");
 
@@ -2719,6 +2734,7 @@ function activate(context) {
 
 function deactivate() {
   serve.dispose();
+  notebook.dispose();
 }
 
 module.exports = { activate, deactivate };

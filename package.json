@@ -1,8 +1,8 @@
 {
   "name": "blade-language",
   "displayName": "Blade Language",
-  "description": "Live diagnostics, type hovers and lenses, go-to-definition/rename, deduction pinning, and REPL-style evaluation for the Blade DSL (.blade / .edgi)",
-  "version": "0.2.0",
+  "description": "Live diagnostics, type hovers and lenses, go-to-definition/rename, deduction pinning, notebooks, and REPL-style evaluation for the Blade DSL (.blade / .edgi)",
+  "version": "0.3.0",
   "publisher": "blade-local",
   "license": "UNLICENSED",
   "engines": {
@@ -14,10 +14,11 @@
   "main": "./src/extension.js",
   "activationEvents": [],
   "scripts": {
-    "test": "node --check src/extension.js && node --check src/repl.js && node --check src/replProto.js && node --check src/serve.js && node --check src/serveProto.js && node --check src/builtins.js && node --check src/types.js && node --check src/keywords.js && node --check scripts/vscode-mock.js && node --check scripts/provider-test.js && node --check scripts/check-consistency.js && node --check scripts/repl-protocol-test.js && node --check scripts/serve-protocol-test.js && node --check scripts/nav-integration-test.js && node scripts/check-consistency.js && node scripts/provider-test.js",
+    "test": "node --check src/extension.js && node --check src/repl.js && node --check src/replProto.js && node --check src/serve.js && node --check src/serveProto.js && node --check src/notebook.js && node --check src/builtins.js && node --check src/types.js && node --check src/keywords.js && node --check scripts/vscode-mock.js && node --check scripts/provider-test.js && node --check scripts/notebook-test.js && node --check scripts/check-consistency.js && node --check scripts/repl-protocol-test.js && node --check scripts/serve-protocol-test.js && node --check scripts/nav-integration-test.js && node --check scripts/notebook-eval-test.js && node scripts/check-consistency.js && node scripts/provider-test.js && node scripts/notebook-test.js",
     "test:repl": "node scripts/repl-protocol-test.js",
     "test:serve": "node scripts/serve-protocol-test.js",
-    "test:nav": "node scripts/nav-integration-test.js"
+    "test:nav": "node scripts/nav-integration-test.js",
+    "test:nb": "node scripts/notebook-eval-test.js"
   },
   "contributes": {
     "languages": [
@@ -39,6 +40,17 @@
         "language": "blade",
         "scopeName": "source.blade",
         "path": "./syntaxes/blade.tmLanguage.json"
+      }
+    ],
+    "notebooks": [
+      {
+        "type": "blade-notebook",
+        "displayName": "Blade Notebook",
+        "selector": [
+          {
+            "filenamePattern": "*.bladenb"
+          }
+        ]
       }
     ],
     "configuration": {
@@ -134,6 +146,18 @@
       {
         "command": "blade.pinDeduction",
         "title": "Blade: Pin Deduced Clause"
+      },
+      {
+        "command": "blade.newNotebook",
+        "title": "Blade: New Notebook"
+      },
+      {
+        "command": "blade.openAsNotebook",
+        "title": "Blade: Open as Notebook"
+      },
+      {
+        "command": "blade.notebookRestart",
+        "title": "Blade: Restart Notebook Kernel"
       }
     ],
     "keybindings": [
@@ -177,6 +201,18 @@
           "command": "blade.runFile",
           "when": "resourceLangId == blade",
           "group": "blade@2"
+        },
+        {
+          "command": "blade.openAsNotebook",
+          "when": "resourceLangId == blade",
+          "group": "blade@3"
+        }
+      ],
+      "notebook/toolbar": [
+        {
+          "command": "blade.notebookRestart",
+          "when": "notebookType == 'blade-notebook'",
+          "group": "navigation"
         }
       ]
     }

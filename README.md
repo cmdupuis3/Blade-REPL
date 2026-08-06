@@ -21,6 +21,9 @@ A VS Code extension for the [Blade language](https://github.com/cmdupuis3/Blade)
 | Completions (bindings, builtins, deduction pins) | IntelliSense | `Ctrl+Space` |
 | Send selection/line to REPL (inline result) | REPL + inline decoration | `Alt+Enter` |
 | Send file to REPL | REPL terminal | `Alt+Shift+Enter` |
+| Notebooks (`.bladenb`): run cell / run all | notebook UI | `Shift+Enter` and the standard notebook keys |
+| New notebook / open `.blade` as notebook | notebook editor | command palette |
+| Restart notebook kernel (reset session) | notebook toolbar | command palette |
 | Run file (full compile + run) | ▶ editor title button | — |
 | Show generated C++ | side-by-side editor | command palette |
 | Start / Reset REPL session | REPL terminal | command palette |
@@ -33,6 +36,10 @@ A built [Blade compiler](https://github.com/cmdupuis3/Blade). The extension auto
 
 - Compilers with the `ide serve` subcommand get as-you-type checking through a persistent process (two tiers: a fast parse+typecheck+deduce pass while you type, and a full pass through monomorphization on save/idle that upgrades polymorphic value types to their concrete instantiations).
 - Older compilers fall back automatically: `ide check --json` on save/open, or plain-text diagnostics for compilers without the JSON subcommand.
+
+## Notebooks
+
+`.bladenb` files open as native VS Code notebooks. The format is plain Blade text with `// %%` cell markers (`// %% [markdown]` for prose cells), so the same file still runs under `blade run` and diffs cleanly in git. Cells evaluate with exact REPL semantics — an accumulating session, rebind-in-place, typed value echoes (`xs = [1.0, 2.0, 3.0] : Array<Float64 like Idx<3>>`), interpreter-first evaluation with a g++ fallback badge — on a dedicated `ide serve` process, so a slow cell never blocks typing-time checking. Cells also get the full IDE feature set: diagnostics, session-aware hovers and completions (names from earlier cells resolve), and type lenses. "Restart Kernel" resets the session; interrupting kills the evaluator and transparently replays the session on the next run.
 
 ## Settings
 
@@ -57,4 +64,4 @@ Zero dependencies, no build step — plain CommonJS executed by VS Code's Node r
 npm test
 ```
 
-runs the hermetic suite (syntax gates, grammar/table consistency, provider tests against a vscode mock). Live suites need a built compiler (`BLADE_EXE` env var or the standard build locations): `npm run test:serve` (ide-serve protocol), `npm run test:repl` (REPL protocol), `npm run test:nav` (navigation providers against real compiler payloads).
+runs the hermetic suite (syntax gates, grammar/table consistency, provider tests against a vscode mock). Live suites need a built compiler (`BLADE_EXE` env var or the standard build locations): `npm run test:serve` (ide-serve protocol), `npm run test:repl` (REPL protocol), `npm run test:nav` (navigation providers against real compiler payloads), `npm run test:nb` (notebook eval session semantics).

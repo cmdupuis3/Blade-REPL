@@ -1,0 +1,16 @@
+// %% [markdown]
+// # Blade notebook demo
+// Run cells with Shift+Enter. Each cell evaluates with REPL semantics:
+// the session accumulates, rebinding a name replaces it in place, and
+// every result echoes with its concrete type.
+// %%
+let xs = [1.0, 2.0, 3.0]
+// %%
+reduce(xs, (+))
+// %% [markdown]
+// Rebinding `xs` below replaces the definition above for the whole
+// session — re-run the `reduce` cell afterwards to see the new sum.
+// %%
+let xs = [10.0, 20.0, 30.0, 40.0]
+// %%
+let pairs = method_for(xs, xs) <@> lambda(a, b) -> a * b |> compute

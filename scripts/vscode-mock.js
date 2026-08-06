@@ -335,6 +335,153 @@ class ThemeColor {
 const DecorationRangeBehavior = { OpenOpen: 0, ClosedClosed: 1, OpenClosed: 2, ClosedOpen: 3 };
 const ViewColumn = { Active: -1, Beside: -2, One: 1, Two: 2, Three: 3 };
 
+// --- Notebooks (workstream 5, src/notebook.js) ----------------------------------------
+
+const NotebookCellKind = { Markup: 1, Code: 2 };
+
+class NotebookCellData {
+  constructor(kind, value, languageId) {
+    this.kind = kind;
+    this.value = value;
+    this.languageId = languageId;
+    this.outputs = [];
+    this.metadata = undefined;
+    this.executionSummary = undefined;
+  }
+}
+
+class NotebookData {
+  constructor(cells) {
+    this.cells = cells || [];
+    this.metadata = undefined;
+  }
+}
+
+/** Mirrors real vscode's {mime, data} shape (data is a byte buffer — Buffer
+ *  qualifies as a Uint8Array in Node). Tests read `.mime` and decode `.data`
+ *  with `Buffer.from(item.data).toString()` / `JSON.parse(...)`. */
+class NotebookCellOutputItem {
+  constructor(data, mime) {
+    this.data = data;
+    this.mime = mime;
+  }
+  static text(value, mime) {
+    return new NotebookCellOutputItem(Buffer.from(String(value), "utf8"), mime || "text/plain");
+  }
+  static json(value, mime) {
+    return new NotebookCellOutputItem(Buffer.from(JSON.stringify(value), "utf8"), mime || "application/json");
+  }
+  static stdout(value) {
+    return new NotebookCellOutputItem(Buffer.from(String(value), "utf8"), "application/vnd.code.notebook.stdout");
+  }
+  static stderr(value) {
+    return new NotebookCellOutputItem(Buffer.from(String(value), "utf8"), "application/vnd.code.notebook.stderr");
+  }
+  static error(error) {
+    const payload = { name: (error && error.name) || "Error", message: (error && error.message) || "", stack: error && error.stack };
+    return new NotebookCellOutputItem(Buffer.from(JSON.stringify(payload), "utf8"), "application/vnd.code.notebook.error");
+  }
+}
+
+class NotebookCellOutput {
+  constructor(items, metadata) {
+    this.items = items || [];
+    this.metadata = metadata;
+  }
+}
+
+class CancellationTokenSource {
+  constructor() {
+    this._listeners = [];
+    this.token = {
+      isCancellationRequested: false,
+      onCancellationRequested: (listener) => {
+        this._listeners.push(listener);
+        return { dispose: () => {} };
+      },
+    };
+  }
+  cancel() {
+    this.token.isCancellationRequested = true;
+    for (const l of this._listeners) l();
+  }
+  dispose() {
+    this._listeners = [];
+  }
+}
+
+/** A recording NotebookCellExecution: `.start`/`.end`/`.clearOutput`/
+ *  `.replaceOutput`/`.appendOutput` all behave like the real Thenable-
+ *  returning API, and every replaceOutput/appendOutput call's items land in
+ *  `._outputs` (flattened) so a test can assert on exactly what a real
+ *  execution would have shown. `._started`/`._ended`/`._success` record the
+ *  start(t)/end(success,t) calls. */
+function makeNotebookCellExecution(cell, controller) {
+  const exec = {
+    cell,
+    controller,
+    executionOrder: undefined,
+    token: new CancellationTokenSource().token,
+    _outputs: [],
+    _started: undefined,
+    _ended: undefined,
+    _success: undefined,
+    start(t) {
+      this._started = t === undefined ? Date.now() : t;
+    },
+    end(success, t) {
+      this._success = success;
+      this._ended = t === undefined ? Date.now() : t;
+    },
+    clearOutput() {
+      this._outputs = [];
+      return Promise.resolve();
+    },
+    replaceOutput(out) {
+      this._outputs = Array.isArray(out) ? out.slice() : [out];
+      return Promise.resolve();
+    },
+    appendOutput(out) {
+      this._outputs.push(...(Array.isArray(out) ? out : [out]));
+      return Promise.resolve();
+    },
+  };
+  return exec;
+}
+
+/** `notebooks.createNotebookController` records every controller it creates
+ *  (`notebooks._controllers`) so a test can drive `.executeHandler`/
+ *  `.interruptHandler` directly, or just call `.createNotebookCellExecution`
+ *  to get a recording execution for output-assembly tests without going
+ *  through a real execute handler at all. */
+function buildNotebooksNamespace() {
+  const notebooks = {
+    _controllers: [],
+    createNotebookController(id, notebookType, label) {
+      const controller = {
+        id,
+        notebookType,
+        label,
+        supportedLanguages: undefined,
+        supportsExecutionOrder: undefined,
+        executeHandler: undefined,
+        interruptHandler: undefined,
+        description: undefined,
+        _executions: [],
+        createNotebookCellExecution(cell) {
+          const exec = makeNotebookCellExecution(cell, controller);
+          controller._executions.push(exec);
+          return exec;
+        },
+        dispose() {},
+      };
+      notebooks._controllers.push(controller);
+      return controller;
+    },
+  };
+  return notebooks;
+}
+
 // --- Fake TextDocument ---------------------------------------------------------------
 
 /** A minimal fake vscode.TextDocument over a fixed string — no live editing
@@ -432,9 +579,17 @@ function buildMock() {
   }
 
   const appliedEdits = [];
+  const notebookSerializers = new Map(); // notebookType -> {serializer, options}
   const workspace = {
     _config: configStore,
     textDocuments: [],
+    // Mirrors real vscode.workspace.notebookDocuments — src/notebook.js's
+    // findOwningNotebookAndCell (workstream 5 N3) scans this to find which
+    // open notebook owns a given cell TextDocument. Empty by default; a test
+    // that needs it populated pushes a fake {notebookType, getCells()} onto
+    // this array directly (the event registrations below never fire on
+    // their own — see the module header — so nothing else keeps it in sync).
+    notebookDocuments: [],
     workspaceFolders: undefined,
     getConfiguration,
     onDidChangeTextDocument: () => ({ dispose() {} }),
@@ -442,16 +597,35 @@ function buildMock() {
     onDidOpenTextDocument: () => ({ dispose() {} }),
     onDidCloseTextDocument: () => ({ dispose() {} }),
     onDidChangeConfiguration: () => ({ dispose() {} }),
+    onDidCloseNotebookDocument: () => ({ dispose() {} }),
+    onDidOpenNotebookDocument: () => ({ dispose() {} }),
     openTextDocument: (opts) => Promise.resolve(makeDoc((opts && opts.content) || "", "untitled")),
     applyEdit: (edit) => {
       appliedEdits.push(edit);
       return Promise.resolve(true);
     },
     _appliedEdits: appliedEdits,
+    registerNotebookSerializer: (notebookType, serializer, options) => {
+      notebookSerializers.set(notebookType, { serializer, options });
+      return { dispose: () => notebookSerializers.delete(notebookType) };
+    },
+    _notebookSerializers: notebookSerializers,
+    // `content` (a vscode.NotebookData) is what the real API's second
+    // overload — openNotebookDocument(notebookType, content?) — opens as an
+    // UNTITLED notebook. This mock skips actual untitled-document bookkeeping
+    // and just hands back an object shaped enough for src/notebook.js's
+    // commands (uri, notebookType, getCells()).
+    openNotebookDocument: (notebookType, content) =>
+      Promise.resolve({
+        uri: Uri.parse(`untitled:${notebookType}-${Date.now()}`),
+        notebookType,
+        getCells: () => (content ? content.cells : []),
+      }),
   };
 
   const window = {
     activeTextEditor: undefined,
+    activeNotebookEditor: undefined,
     visibleTextEditors: [],
     showWarningMessage: () => undefined,
     showErrorMessage: () => undefined,
@@ -466,6 +640,7 @@ function buildMock() {
     createTerminal: () => ({ sendText() {}, show() {}, dispose() {}, name: "mock" }),
     showTextDocument: (doc) =>
       Promise.resolve({ document: doc, selection: undefined, revealRange() {}, setDecorations() {} }),
+    showNotebookDocument: (doc) => Promise.resolve({ notebook: doc }),
     onDidChangeVisibleTextEditors: () => ({ dispose() {} }),
     onDidChangeActiveTextEditor: () => ({ dispose() {} }),
   };
@@ -530,7 +705,10 @@ function buildMock() {
     SignatureInformation, ParameterInformation, Diagnostic, DiagnosticSeverity,
     EventEmitter, InlayHint, InlayHintKind, ThemeColor, DecorationRangeBehavior,
     ViewColumn,
-    workspace, window, commands, languages,
+    // Notebooks (workstream 5).
+    NotebookCellKind, NotebookCellData, NotebookData, NotebookCellOutputItem,
+    NotebookCellOutput, CancellationTokenSource,
+    workspace, window, commands, languages, notebooks: buildNotebooksNamespace(),
   };
 }
 
