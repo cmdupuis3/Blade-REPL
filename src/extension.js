@@ -1,7 +1,12 @@
 // Blade language support: diagnostics via `Blade check`, type hovers and
 // signature help via `Blade ide check --json` (auto-detected; falls back to
-// text diagnostics against compilers without the JSON subcommand), and an
-// interpreter-backed REPL with inline results (src/repl.js).
+// text diagnostics against compilers without the JSON subcommand), an
+// interpreter-backed REPL with inline results (src/repl.js), and — when the
+// compiler supports it — as-you-type checking through a persistent `blade
+// ide serve` process (src/serve.js) with a fast clock (parse + typecheck +
+// deduce, debounced while typing) and a slow clock (+ monomorphization, on
+// save/open/idle). Compilers without `ide serve` fall back to the original
+// one-shot `ide check --json` / text pipeline unchanged — see checkDocument.
 //
 // Plain CommonJS on purpose — no build step, no dependencies. VS Code's own
 // Node runtime executes this directly.
@@ -14,13 +19,18 @@ const builtins = require("./builtins");
 const types = require("./types");
 const keywords = require("./keywords");
 const repl = require("./repl");
+const serve = require("./serve");
 
 /** @type {vscode.DiagnosticCollection} */
 let diagnostics;
 /** @type {vscode.OutputChannel} */
 let output;
 
-// "unknown" until first probe, then "json" or "text".
+// "unknown" until first probe, then "serve" (persistent `ide serve` process
+// — see src/serve.js), "json" (one-shot `ide check --json`), or "text" (no
+// JSON subcommand at all). Once latched to "json"/"text" for a session,
+// serve is not retried (mirrors serve.available()'s own latch) — see
+// checkDocument.
 let ideMode = "unknown";
 // uri.toString() -> bindings array from the last successful JSON check.
 const bindingsByDoc = new Map();
@@ -38,6 +48,15 @@ const callsByDoc = new Map();
 // deduced comm/anticomm clauses, declared where conjuncts, per-param cell
 // ranks). Span-keyed — hover/completion resolve kernels by position.
 const kernelsByDoc = new Map();
+// uri.toString() -> references array from the last successful JSON check:
+// one entry per BINDER (a function/value/param/local/type name — two
+// shadowing `x`s are two entries), `{name, kind, def, uses}` with 1-based
+// {line,col,endLine,endCol} spans (def nullable when the compiler couldn't
+// recover a name span). Backs go-to-definition, find-references, rename,
+// the hierarchical outline, and the hover shadowing fix below. Absent from
+// today's compiler payload (defaults to [] — see applyCheckPayload), so
+// every consumer degrades gracefully rather than assuming it's populated.
+const referencesByDoc = new Map();
 // Warn about a missing compiler only once per session.
 let warnedNoCompiler = false;
 
@@ -99,6 +118,28 @@ const DIAG_RE = /^(?:Parse error at )?(?:(.+?):)?(\d+):(\d+):\s*(.+)$/;
 const HEADER_RE = /^(error|warning|note)\[(BL\d{4})\]:\s*(.+)$/;
 const ARROW_RE = /^-->\s*(?:(.+?):)?(\d+):(\d+)\s*$/;
 
+// A small, fixed table of BL-codes get a clickable doc link into the
+// compiler's docs (whole file — precise anchors can come later); every other
+// code stays a plain string so a future BL-code can't silently claim a
+// broken link. Deduction/pin codes only today (BL4010 comm, BL4011
+// anticomm, BL4014 rank) — the codes the new code actions/lenses act on.
+const DIAG_DOC_TARGET = vscode.Uri.file("C:\\Users\\cdupu\\Documents\\GitHub\\Blade\\docs\\features.md");
+const DIAG_DOC_CODES = new Set(["BL4010", "BL4011", "BL4014"]);
+
+/** A diagnostic `code` value: `{value, target}` (VS Code renders this as a
+ *  clickable link) for the known deduction/pin codes, the plain string
+ *  otherwise. */
+function diagnosticCode(code) {
+  return code && DIAG_DOC_CODES.has(code) ? { value: code, target: DIAG_DOC_TARGET } : code;
+}
+
+/** The plain string form of a diagnostic's `code`, whether it's still a bare
+ *  string or has been upgraded to `{value, target}` by diagnosticCode. */
+function diagnosticCodeValue(d) {
+  if (!d || d.code === undefined || d.code === null) return undefined;
+  return typeof d.code === "object" ? d.code.value : d.code;
+}
+
 /** @param {vscode.TextDocument} doc */
 function textToDiagnostics(doc, text) {
   const result = [];
@@ -128,7 +169,7 @@ function textToDiagnostics(doc, text) {
             : vscode.DiagnosticSeverity.Error;
       const d = new vscode.Diagnostic(new vscode.Range(start, end), h[3], severity);
       d.source = "blade";
-      d.code = h[2];
+      d.code = diagnosticCode(h[2]);
       result.push(d);
       continue;
     }
@@ -173,15 +214,98 @@ function jsonToDiagnostics(doc, payload) {
     );
     diag.source = "blade";
     // BLxxxx diagnostic code (additive field, compilers >= diagnostics arc).
-    if (d.code) diag.code = d.code;
+    if (d.code) diag.code = diagnosticCode(d.code);
     result.push(diag);
   }
   return result;
 }
 
-/** @param {vscode.TextDocument} doc */
-async function checkDocument(doc) {
+/**
+ * Apply a check response — serve or one-shot `ide check --json`, same
+ * payload shape — to the per-document caches, the diagnostics collection,
+ * and the telemetry line. The one place that does this, so the fast/slow
+ * serve clocks and the one-shot fallback can never drift apart.
+ * @param {vscode.TextDocument} doc
+ */
+function applyCheckPayload(doc, payload) {
+  const key = doc.uri.toString();
+  bindingsByDoc.set(key, payload.bindings || []);
+  cacheProviders(doc, payload.providers || []);
+  callsByDoc.set(key, payload.calls || []);
+  kernelsByDoc.set(key, payload.kernels || []);
+  referencesByDoc.set(key, payload.references || []);
+  diagnostics.set(doc.uri, jsonToDiagnostics(doc, payload));
+  // Concise telemetry so a "no tooltips" report can be pinpointed: empty
+  // bindings ⇒ the file didn't type-check; providers=0 on a provider file ⇒
+  // its data path didn't resolve from the run directory. `tier` is present
+  // on serve responses only (fast/full); absent from the one-shot pipeline.
+  output.appendLine(
+    `[blade] ${path.basename(doc.fileName)}: bindings=${(payload.bindings || []).length}` +
+      ` providers=${(payload.providers || []).length} diagnostics=${(payload.diagnostics || []).length}` +
+      (payload.tier ? ` tier=${payload.tier}` : "")
+  );
+  // Lenses (signature/array/deduction, workstream 4) are computed from the
+  // same caches just updated above — tell VS Code to re-ask so they track
+  // the fast/slow clocks the way diagnostics and hovers already do.
+  codeLensEmitter.fire();
+}
+
+/**
+ * Run a check and apply its results. `tier` picks the compiler pass: "fast"
+ * (parse + typecheck + deduce — the as-you-type clock) or "full" (fast +
+ * monomorphization, upgrading value-binding hovers/lenses to concrete
+ * types — save/open/idle). Serve-backed checks (src/serve.js) are preferred
+ * whenever `blade ide serve` is available; once a session has fallen back to
+ * the one-shot pipeline (ideMode "json"/"text" — old compiler, or serve gave
+ * up after repeated failures) serve is not retried, matching
+ * serve.available()'s own session-long latch.
+ *
+ * "fast" is a serve-only concept: spawning a fresh `ide check --json`
+ * process on every keystroke would defeat the entire point of the fast
+ * clock, so a fast-tier call is simply a no-op when serve isn't available —
+ * save/open continue to work via the unchanged one-shot pipeline below.
+ * @param {vscode.TextDocument} doc
+ * @param {"fast"|"full"} [tier] defaults to "full"
+ */
+async function checkDocument(doc, tier) {
   if (doc.languageId !== "blade" || doc.uri.scheme !== "file") return;
+  const t = tier === "fast" ? "fast" : "full";
+
+  if (ideMode !== "json" && ideMode !== "text") {
+    if (serve.available() !== "no") {
+      const version = doc.version;
+      const source = doc.getText();
+      try {
+        const payload = await serve.check(doc.fileName, source, t);
+        // A newer edit landed while this request was in flight — the
+        // response no longer describes the buffer; drop it (repl.js uses the
+        // same anchor-version guard for stale REPL results).
+        if (doc.version !== version) return;
+        ideMode = "serve";
+        applyCheckPayload(doc, payload);
+        if (t === "fast") scheduleIdleFullCheck(doc);
+        else clearIdleTimer(doc); // a full check answers what idle would have asked
+        return;
+      } catch (e) {
+        if (serve.available() === "no") {
+          output.appendLine(`[blade] ide serve unavailable — falling back to one-shot checks (${e.message})`);
+          // Fall through to the one-shot pipeline below, for this call too.
+        } else {
+          // Transient (backing off / a request timed out): keep last-good
+          // caches rather than spawning a one-shot check per keystroke.
+          output.appendLine(`[blade] serve check skipped (kept last-good hovers): ${e.message}`);
+          return;
+        }
+      }
+    }
+    // else: availability already latched "no" from an earlier call — fall
+    // straight through to the one-shot pipeline, which will set ideMode.
+  }
+
+  // The fast clock only exists through serve — nothing to do on an older
+  // compiler (save/open below still run the full one-shot pipeline).
+  if (t === "fast") return;
+
   const exe = findCompiler();
   // Run from the file's own directory so a provider's relative data path
   // (`z.load("data/…")`) resolves the same way it does when the compiler is
@@ -205,18 +329,7 @@ async function checkDocument(doc) {
     }
     if (payload && typeof payload === "object" && (payload.diagnostics || payload.bindings)) {
       ideMode = "json";
-      bindingsByDoc.set(doc.uri.toString(), payload.bindings || []);
-      cacheProviders(doc, payload.providers || []);
-      callsByDoc.set(doc.uri.toString(), payload.calls || []);
-      kernelsByDoc.set(doc.uri.toString(), payload.kernels || []);
-      diagnostics.set(doc.uri, jsonToDiagnostics(doc, payload));
-      // Concise telemetry so a "no tooltips" report can be pinpointed: empty
-      // bindings ⇒ the file didn't type-check; providers=0 on a provider file
-      // ⇒ its data path didn't resolve from the run directory.
-      output.appendLine(
-        `[blade] ${path.basename(doc.fileName)}: bindings=${(payload.bindings || []).length}` +
-          ` providers=${(payload.providers || []).length} diagnostics=${(payload.diagnostics || []).length}`
-      );
+      applyCheckPayload(doc, payload);
       return;
     }
     // Non-JSON output. If JSON mode was never established this is an old
@@ -258,6 +371,74 @@ async function checkDocument(doc) {
     output.appendLine("[blade] check failed with unparsed output:");
     output.appendLine(res.stderr || res.stdout);
   }
+}
+
+// --- Live checking clocks (fast/slow, serve-backed) --------------------------
+//
+// Two independent per-document timers layered on checkDocument's tier logic:
+// `fastTimers` debounces the as-you-type ("fast") check after each edit;
+// `idleTimers` fires a "full" check after a quiet spell that follows a
+// SUCCESSFUL fast check (not the edit itself) — see checkDocument's
+// `scheduleIdleFullCheck` call. Both are serve-only (see checkDocument's
+// early "t === 'fast' return"); on an older compiler neither timer is ever
+// armed, so save/open remain the only triggers, unchanged.
+
+const fastTimers = new Map(); // uri.toString() -> Timeout
+const idleTimers = new Map(); // uri.toString() -> Timeout
+
+function clearFastTimer(doc) {
+  const key = doc.uri.toString();
+  const t = fastTimers.get(key);
+  if (t) {
+    clearTimeout(t);
+    fastTimers.delete(key);
+  }
+}
+
+function clearIdleTimer(doc) {
+  const key = doc.uri.toString();
+  const t = idleTimers.get(key);
+  if (t) {
+    clearTimeout(t);
+    idleTimers.delete(key);
+  }
+}
+
+function scheduleIdleFullCheck(doc) {
+  clearIdleTimer(doc);
+  const key = doc.uri.toString();
+  const delay = vscode.workspace.getConfiguration("blade").get("fullCheckIdleMs", 2000);
+  idleTimers.set(
+    key,
+    setTimeout(() => {
+      idleTimers.delete(key);
+      checkDocument(doc, "full");
+    }, delay)
+  );
+}
+
+/**
+ * onDidChangeTextDocument handler: debounce a fast-tier check. Any edit
+ * cancels a pending idle-triggered full check — we are no longer idle — so
+ * an idle full check only ever follows a fast check that wasn't itself
+ * immediately followed by more typing.
+ */
+function onDocumentChanged(doc) {
+  if (doc.languageId !== "blade" || doc.uri.scheme !== "file") return;
+  clearIdleTimer(doc);
+  const cfg = vscode.workspace.getConfiguration("blade");
+  if (!cfg.get("liveChecking", true)) return;
+  if (serve.available() === "no") return; // old compiler: fast clock stays off
+  clearFastTimer(doc);
+  const key = doc.uri.toString();
+  const delay = cfg.get("fastCheckDebounceMs", 300);
+  fastTimers.set(
+    key,
+    setTimeout(() => {
+      fastTimers.delete(key);
+      checkDocument(doc, "fast");
+    }, delay)
+  );
 }
 
 function reportNoCompiler(exe) {
@@ -442,9 +623,14 @@ function docCommentAbove(doc, lineIndex) {
  * Scan the document for `type Name = Rhs` aliases, `Unit name [= expr]`
  * unit-of-measure declarations, and single-line `let static Name = Rhs`
  * bindings. Returns { decls, units, statics }: decls maps
- * name -> { name, parent, indexLike, doc }; units maps name -> { name, rhs,
- * doc } (rhs undefined for base units); statics maps name -> rhs (the key
- * lists a `SparseIdx<K>` names). Cached per document version.
+ * name -> { name, parent, indexLike, doc, line }; units maps
+ * name -> { name, rhs, doc, line } (rhs undefined for base units); statics
+ * maps name -> rhs (the key lists a `SparseIdx<K>` names). `line` is 0-based
+ * (a plain doc.lineAt index — this is a local scan, not a compiler payload
+ * span, so it skips that convention's 1-based numbering) and exists purely
+ * for the outline provider (documentSymbols) to build a Range from; every
+ * other consumer of decls/units predates it and ignores the field. Cached
+ * per document version.
  */
 function scanDecls(doc) {
   const key = doc.uri.toString();
@@ -466,13 +652,14 @@ function scanDecls(doc) {
         parent,
         indexLike: INDEX_KEYWORD_RE.test(parent),
         doc: docCommentAbove(doc, l),
+        line: l,
       });
       continue;
     }
     const u = /^\s*Unit\s+([A-Za-z_][A-Za-z0-9_]*)(?:\s*=\s*(.+?))?\s*$/.exec(text);
     if (u) {
       const rhs = u[2] && u[2].replace(/\s*\/\/.*$/, "").trim();
-      units.set(u[1], { name: u[1], rhs: rhs || undefined, doc: docCommentAbove(doc, l) });
+      units.set(u[1], { name: u[1], rhs: rhs || undefined, doc: docCommentAbove(doc, l), line: l });
     }
   }
   const entry = { version: doc.version, decls, units, statics };
@@ -856,6 +1043,294 @@ function lookupBinding(doc, word, line) {
   return best;
 }
 
+// --- References (definition, find-references, rename, outline) -------------
+//
+// Everything below reads the references[] payload (see referencesByDoc's own
+// comment for the shape). A compiler that doesn't emit it yet leaves every
+// document's entry at [] (applyCheckPayload's `payload.references || []`),
+// so every function here degrades to "nothing resolves" / "no entries" —
+// never throws — and documentSymbols falls back to a flat bindings[]-only
+// outline explicitly (the one path this section can exercise against a live
+// compiler today; see its own comment).
+
+/** Does a 1-based reference span `span` contain 1-based position (line, ch)?
+ *  Same before/after containment shape as lookupCall's span comparison
+ *  above — before <=> span starts at or before the position, after <=> span
+ *  ends at or after it. */
+function referenceSpanContains(span, line, ch) {
+  if (!span) return false;
+  const before = span.line < line || (span.line === line && span.col <= ch);
+  const after = span.endLine > line || (span.endLine === line && span.endCol >= ch);
+  return before && after;
+}
+
+/**
+ * The references[] entry covering `position`, plus WHICH of its spans
+ * matched (def or a specific use) — rename's prepareRename needs the exact
+ * span under the cursor for its placeholder range, while everything else
+ * only needs the entry. Def is checked before uses across all entries so a
+ * cursor sitting exactly on a def (defs and uses of DIFFERENT entries should
+ * never overlap — they're distinct name tokens — but def-first is the
+ * defensive tie-break if they ever did).
+ */
+function findReferenceSpanAt(doc, position) {
+  const entries = referencesByDoc.get(doc.uri.toString());
+  if (!entries || !entries.length) return undefined;
+  const line = position.line + 1;
+  const ch = position.character + 1;
+  for (const entry of entries) {
+    if (referenceSpanContains(entry.def, line, ch)) return { entry, span: entry.def };
+  }
+  for (const entry of entries) {
+    for (const u of entry.uses || []) {
+      if (referenceSpanContains(u, line, ch)) return { entry, span: u };
+    }
+  }
+  return undefined;
+}
+
+/** The references[] entry covering `position` (def or any use), or
+ *  undefined — the shared resolver behind go-to-definition, find-references,
+ *  rename, and the hover shadowing fix below. */
+function resolveReference(doc, position) {
+  const hit = findReferenceSpanAt(doc, position);
+  return hit && hit.entry;
+}
+
+/** A 1-based {line,col,endLine,endCol} span (references[]/calls[]
+ *  convention) as a 0-based vscode.Range. */
+function spanToRange(span) {
+  return new vscode.Range(
+    Math.max(0, (span.line || 1) - 1),
+    Math.max(0, (span.col || 1) - 1),
+    Math.max(0, (span.endLine || span.line || 1) - 1),
+    Math.max(0, (span.endCol || span.col || 1) - 1)
+  );
+}
+
+function spanToLocation(uri, span) {
+  return new vscode.Location(uri, spanToRange(span));
+}
+
+/**
+ * Resolve `word` at `position` through references[] first: the entry
+ * covering this exact position names its def LINE precisely, so a binding
+ * declared on that exact line resolves even when an outer binding of the
+ * same name (declared earlier, and therefore also "at or before" the use
+ * line) would otherwise win lookupBinding's nearest-line heuristic — e.g. a
+ * function's own param shadowing an outer value of the same name, hovered
+ * from a LATER, unrelated function where only the outer value is in scope.
+ * Falls back to that heuristic unchanged when references[] has nothing for
+ * this position (older compiler, or the word isn't a tracked binder — a
+ * builtin, keyword, or type name).
+ */
+function lookupBindingPrecise(doc, word, position) {
+  const entry = resolveReference(doc, position);
+  if (entry && entry.name === word && entry.def) {
+    const bindings = bindingsByDoc.get(doc.uri.toString()) || [];
+    const exact = bindings.find((b) => b.name === word && (b.line || 1) === entry.def.line);
+    if (exact) return exact;
+  }
+  return lookupBinding(doc, word, position.line);
+}
+
+const definitionProvider = {
+  provideDefinition(doc, position) {
+    const entry = resolveReference(doc, position);
+    if (!entry || !entry.def) return undefined;
+    return spanToLocation(doc.uri, entry.def);
+  },
+};
+
+const referenceProvider = {
+  provideReferences(doc, position, context) {
+    const entry = resolveReference(doc, position);
+    if (!entry) return undefined;
+    const locations = (entry.uses || []).map((u) => spanToLocation(doc.uri, u));
+    if (context && context.includeDeclaration && entry.def) {
+      locations.push(spanToLocation(doc.uri, entry.def));
+    }
+    return locations;
+  },
+};
+
+/** Is `name` already claimed by a keyword, builtin, or built-in type table —
+ *  the collision check provideRenameEdits runs a new name against. */
+function isReservedName(name) {
+  return Boolean(
+    keywords.keywords[name] ||
+      builtins.identifiers[name] ||
+      types.primitives[name] ||
+      types.indexTypes[name] ||
+      types.constructors[name]
+  );
+}
+
+const IDENTIFIER_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
+const renameProvider = {
+  prepareRename(doc, position) {
+    const hit = findReferenceSpanAt(doc, position);
+    if (!hit || !hit.entry.def) {
+      // No tracked binder here, or the compiler couldn't recover a def span
+      // for it (an old compiler, or a synthesized/phantom name) — VS Code
+      // shows this as "You cannot rename this element."
+      throw new Error("You cannot rename this element.");
+    }
+    return spanToRange(hit.span);
+  },
+  provideRenameEdits(doc, position, newName) {
+    const hit = findReferenceSpanAt(doc, position);
+    if (!hit || !hit.entry.def) return undefined;
+    if (!IDENTIFIER_RE.test(newName)) {
+      throw new Error(`"${newName}" is not a valid Blade identifier.`);
+    }
+    if (isReservedName(newName)) {
+      throw new Error(`"${newName}" is a reserved Blade name and cannot be used here.`);
+    }
+    const entry = hit.entry;
+    const edit = new vscode.WorkspaceEdit();
+    edit.replace(doc.uri, spanToRange(entry.def), newName);
+    for (const u of entry.uses || []) edit.replace(doc.uri, spanToRange(u), newName);
+    return edit;
+  },
+};
+
+/** The 0-based selection range for a top-level binding `b`'s name: the
+ *  matching references[] def when one lines up exactly (precise, multi-
+ *  character span), else a synthesized point-ish range from b.line/b.col
+ *  (bindings[] has no end span yet — see the plan's 2c). */
+function topLevelDefRange(doc, b, references) {
+  const entry = references.find(
+    (e) => (e.kind === "function" || e.kind === "value") && e.name === b.name && e.def && e.def.line === b.line
+  );
+  if (entry) return spanToRange(entry.def);
+  const line = Math.max(0, (b.line || 1) - 1);
+  const col = Math.max(0, (b.col || 1) - 1);
+  return new vscode.Range(line, col, line, col + (b.name ? b.name.length : 0));
+}
+
+/**
+ * Document outline (Ctrl+Shift+O / breadcrumbs). Hierarchical when
+ * references[] is populated: top-level functions (with their params and
+ * locals nested by def-line containment inside the function's [def line,
+ * next top-level def line) range — bindings[] carries no body-extent span at
+ * all, so "until the next top-level binding starts" is the best available
+ * proxy) and top-level values, plus `type` aliases and `Unit` declarations
+ * from scanDecls. Degrades to a flat list from bindings[] + scanDecls (no
+ * nesting — nothing here carries reliable scope info without references[])
+ * when references[] is empty, which is the only path a compiler without the
+ * references[] payload exercises today.
+ */
+function documentSymbols(doc) {
+  const key = doc.uri.toString();
+  // bindingsByDoc also carries a "param" entry per function parameter (pre-
+  // existing, kept for direct-hover lookup) alongside real top-level "let"/
+  // "function"/"static" entries — same array, discriminated only by kind.
+  // Left in, a param's line collapses its OWN function's [start, end) window
+  // to zero width (the param shares its function's line and becomes "the
+  // next ordered binding"), which silently drops that function's nested
+  // params/locals below. Params/locals are already sourced correctly from
+  // references[] in the nesting loop below, so top-level ordering must
+  // exclude them here.
+  const bindings = (bindingsByDoc.get(key) || []).filter((b) => b.name && b.line && b.kind !== "param");
+  const references = referencesByDoc.get(key) || [];
+  const scanned = scanDecls(doc);
+  const symbols = [];
+  const isArrayType = (b) => /^Array\s*</.test(displayType(b) || "");
+
+  if (references.length > 0) {
+    const ordered = bindings.slice().sort((a, b) => (a.line || 0) - (b.line || 0));
+    const funcEntries = []; // { startLine, endLine, symbol } — 0-based [start, end)
+    ordered.forEach((b, i) => {
+      const callable = Array.isArray(b.params) && b.ret !== undefined;
+      const startLine = Math.max(0, (b.line || 1) - 1);
+      const endLine =
+        i + 1 < ordered.length ? Math.max(startLine, (ordered[i + 1].line || 1) - 1) : doc.lineCount;
+      const nameRange = topLevelDefRange(doc, b, references);
+      const fullRange = new vscode.Range(startLine, 0, Math.max(startLine, endLine - 1), 0);
+      if (callable) {
+        const sym = new vscode.DocumentSymbol(
+          b.name,
+          typeNormalizer()(b.ret) || "",
+          vscode.SymbolKind.Function,
+          fullRange,
+          nameRange
+        );
+        symbols.push(sym);
+        funcEntries.push({ startLine, endLine, symbol: sym });
+      } else {
+        const sym = new vscode.DocumentSymbol(
+          b.name,
+          displayType(b) || "",
+          isArrayType(b) ? vscode.SymbolKind.Field : vscode.SymbolKind.Variable,
+          fullRange,
+          nameRange
+        );
+        symbols.push(sym);
+      }
+    });
+
+    // Params (TypeParameter — visually distinct from locals) and locals
+    // (Variable) nest under whichever top-level function's [start, end)
+    // contains their def line.
+    for (const e of references) {
+      if ((e.kind !== "param" && e.kind !== "local") || !e.def) continue;
+      const defLine = e.def.line - 1;
+      const owner = funcEntries.find((f) => defLine >= f.startLine && defLine < f.endLine);
+      if (!owner) continue;
+      const r = spanToRange(e.def);
+      owner.symbol.children.push(
+        new vscode.DocumentSymbol(
+          e.name,
+          "",
+          e.kind === "param" ? vscode.SymbolKind.TypeParameter : vscode.SymbolKind.Variable,
+          r,
+          r
+        )
+      );
+    }
+  } else {
+    // Flat fallback: bindings[] only, no reliable scope info to nest with.
+    for (const b of bindings) {
+      const callable = Array.isArray(b.params) && b.ret !== undefined;
+      const line = Math.max(0, (b.line || 1) - 1);
+      const col = Math.max(0, (b.col || 1) - 1);
+      const r = new vscode.Range(line, col, line, col + b.name.length);
+      const kind = callable
+        ? vscode.SymbolKind.Function
+        : isArrayType(b)
+          ? vscode.SymbolKind.Field
+          : vscode.SymbolKind.Variable;
+      symbols.push(new vscode.DocumentSymbol(b.name, displayType(b) || "", kind, r, r));
+    }
+  }
+
+  // `type` aliases and `Unit` declarations always come from scanDecls,
+  // regardless of tier — the compiler emits no bindings for either.
+  for (const [name, d] of scanned.decls) {
+    if (d.line === undefined) continue;
+    const r = new vscode.Range(d.line, 0, d.line, doc.lineAt(d.line).text.length);
+    symbols.push(new vscode.DocumentSymbol(name, `type ${name} = ${d.parent}`, vscode.SymbolKind.Class, r, r));
+  }
+  for (const [name, u] of scanned.units) {
+    if (u.line === undefined) continue;
+    const r = new vscode.Range(u.line, 0, u.line, doc.lineAt(u.line).text.length);
+    symbols.push(
+      new vscode.DocumentSymbol(name, u.rhs ? `Unit ${name} = ${u.rhs}` : `Unit ${name}`, vscode.SymbolKind.Struct, r, r)
+    );
+  }
+
+  symbols.sort((a, b) => a.range.start.line - b.range.start.line);
+  return symbols;
+}
+
+const documentSymbolProvider = {
+  provideDocumentSymbols(doc) {
+    return documentSymbols(doc);
+  },
+};
+
 // --- Concrete call-site instantiations (calls[]) -----------------------------
 
 /**
@@ -1078,6 +1553,17 @@ function typeNormalizer() {
   };
 }
 
+/**
+ * The type to display for a VALUE binding: the slow tier's `concreteType`
+ * (a more concrete rendering produced by monomorphization, present on "full"
+ * serve responses) when available, else the fast tier's `type`. Callable
+ * bindings render from their structured params/ret instead and never carry
+ * `concreteType` — this only ever applies to plain value bindings.
+ */
+function displayType(b) {
+  return b.concreteType || b.type;
+}
+
 /** Signature header: multi-line function types go below the name. */
 function signatureText(kind, name, type) {
   const norm = typeNormalizer();
@@ -1199,6 +1685,263 @@ function kernelMinRanks(k) {
   return (k.minRanks || []).filter((r) => r.rank > 0);
 }
 
+// --- Deduced-pin computation & header scanning --------------------------------
+//
+// Shared by three surfaces that all need to agree on exactly what's "deduced
+// but not yet pinned" and exactly where a pin would land in the source:
+// deductionCompletions (header completions, below), the CodeActionProvider
+// (workstream 3 — pin/rank quick fixes), and the CodeLensProvider (workstream
+// 4 — the deduction lens's own "— pin" command). pinInfoFor{Function,Kernel}
+// compute the "what"; scanHeaderPunctuation computes the "where" by scanning
+// FORWARD from a known `function`/`lambda` anchor — the mirror image of
+// declContextAt's backward scan from the cursor (declContextAt answers "is
+// the cursor inside a header"; this answers "where exactly does this
+// header's punctuation live", which a cursor position alone can't give when
+// the caller only has a binding/kernel entry, not a cursor).
+
+/** Deduced-but-not-declared comm/anticomm clauses and per-param minimum
+ *  ranks for a function binding (bindings[] entry with params/ret) — the
+ *  "what's worth pinning" computation. Returns undefined when the compiler
+ *  reported no deduction data at all (old compiler / deducedComm absent). */
+function pinInfoForFunction(b) {
+  if (!Array.isArray(b.deducedComm)) return undefined;
+  const declared = commClauses(b.where);
+  return { pinClauses: b.deducedComm.filter((c) => !declared.includes(c)), minRanks: bindingMinRanks(b) };
+}
+
+/** Same as pinInfoForFunction, for a kernels[] entry. Always returns an
+ *  object (kernels carry no "old compiler" absence signal the way a missing
+ *  deducedComm array does for functions — deducedComm/minRanks just default
+ *  to empty). */
+function pinInfoForKernel(k) {
+  const declared = commClauses(k.declaredWhere);
+  const deduced = k.deducedComm || [];
+  return { pinClauses: deduced.filter((c) => !declared.includes(c)), minRanks: kernelMinRanks(k) };
+}
+
+/** Concatenate document text from raw position `from` to `to` ({line,char},
+ *  0-based, half-open at `to`), with a parallel array mapping each output
+ *  character back to its {line,char} — the position-tracked twin of a plain
+ *  doc.getText(range) slice, needed wherever an insertion point must be
+ *  computed FROM a substring match (a where-clause's last conjunct, a
+ *  header's param list). Raw {line,char} pairs throughout this section —
+ *  not vscode.Position — so this scanning stays independent of exactly
+ *  which vscode is running underneath (real or the headless mock). */
+function extractSpan(doc, from, to) {
+  let text = "";
+  const positions = [];
+  for (let l = from.line; l <= to.line; l++) {
+    const line = doc.lineAt(l).text;
+    const start = l === from.line ? from.char : 0;
+    const end = l === to.line ? to.char : line.length;
+    for (let i = start; i < end; i++) {
+      text += line[i];
+      positions.push({ line: l, char: i });
+    }
+  }
+  return { text, positions };
+}
+
+/** Like splitTopLevel, but keeps a position (raw {line,char}) alongside each
+ *  character so a sub-match can be mapped back into the document — used to
+ *  locate individual parameter spans inside a header's param list. */
+function splitTopLevelWithPositions(text, positions, sep) {
+  const parts = [];
+  let depth = 0;
+  let start = 0;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (c === "<" || c === "(" || c === "[") depth++;
+    else if (c === ">" || c === ")" || c === "]") depth--;
+    else if (c === sep && depth === 0) {
+      parts.push({ text: text.slice(start, i), positions: positions.slice(start, i) });
+      start = i + 1;
+    }
+  }
+  parts.push({ text: text.slice(start), positions: positions.slice(start) });
+  return parts;
+}
+
+/**
+ * Forward-scanned header punctuation for a `function NAME(...)` or
+ * `lambda(...)` declaration whose keyword sits at or after
+ * (anchorLine, anchorChar): the parameter list's open/close parens, and —
+ * past the close paren, up to the return-type/body arrow `->` (always
+ * present: every function has an explicit `-> RetType`, every lambda an
+ * explicit `-> body`) — whether a `where` clause already exists and, if so,
+ * the position right after its last conjunct (the append point for a fresh
+ * pin). Bounded to an 8-line window at each stage, matching declContextAt's
+ * own window. Returns undefined when no balanced param list / arrow turns
+ * up within the window (malformed or unusually long header — callers skip
+ * rather than guess).
+ */
+function scanHeaderPunctuation(doc, anchorLine, anchorChar, kind, name) {
+  const openRe = kind === "function" ? new RegExp(`\\bfunction\\s+${name}\\s*\\(`) : /\blambda\s*\(/;
+  let openLine = -1;
+  let openChar = -1;
+  const maxOpenLine = Math.min(doc.lineCount, anchorLine + 8);
+  for (let l = anchorLine; l < maxOpenLine && openLine === -1; l++) {
+    const text = doc.lineAt(l).text;
+    const from = l === anchorLine ? anchorChar : 0;
+    const m = openRe.exec(text.slice(from));
+    if (m) {
+      openLine = l;
+      openChar = from + m.index + m[0].length - 1; // the '(' itself
+    }
+  }
+  if (openLine === -1) return undefined;
+
+  let closeLine = -1;
+  let closeChar = -1;
+  let depth = 0;
+  const maxCloseLine = Math.min(doc.lineCount, openLine + 8);
+  outer: for (let l = openLine; l < maxCloseLine; l++) {
+    const text = doc.lineAt(l).text;
+    const from = l === openLine ? openChar : 0;
+    for (let i = from; i < text.length; i++) {
+      const c = text[i];
+      if (c === "(" || c === "[" || c === "{") depth++;
+      else if (c === ")" || c === "]" || c === "}") {
+        depth--;
+        if (depth === 0) {
+          closeLine = l;
+          closeChar = i;
+          break outer;
+        }
+      }
+    }
+  }
+  if (closeLine === -1) return undefined;
+
+  let arrowLine = -1;
+  let arrowChar = -1;
+  const maxArrowLine = Math.min(doc.lineCount, closeLine + 8);
+  for (let l = closeLine; l < maxArrowLine && arrowLine === -1; l++) {
+    const text = doc.lineAt(l).text;
+    const from = l === closeLine ? closeChar + 1 : 0;
+    const idx = text.indexOf("->", from);
+    if (idx !== -1) {
+      arrowLine = l;
+      arrowChar = idx;
+    }
+  }
+  if (arrowLine === -1) return undefined;
+
+  let whereLine = -1;
+  let whereChar = -1;
+  for (let l = closeLine; l <= arrowLine; l++) {
+    const text = doc.lineAt(l).text;
+    const from = l === closeLine ? closeChar + 1 : 0;
+    const to = l === arrowLine ? arrowChar : text.length;
+    const wm = /\bwhere\b/.exec(text.slice(from, to));
+    if (wm) {
+      whereLine = l;
+      whereChar = from + wm.index;
+      break;
+    }
+  }
+
+  let lastConjunctEnd;
+  if (whereLine !== -1) {
+    const span = extractSpan(doc, { line: whereLine, char: whereChar + 5 }, { line: arrowLine, char: arrowChar });
+    for (let i = span.text.length - 1; i >= 0; i--) {
+      if (!/\s/.test(span.text[i])) {
+        lastConjunctEnd = { line: span.positions[i].line, char: span.positions[i].char + 1 };
+        break;
+      }
+    }
+  }
+
+  return {
+    openParen: { line: openLine, char: openChar },
+    closeParen: { line: closeLine, char: closeChar },
+    arrow: { line: arrowLine, char: arrowChar },
+    hasWhere: whereLine !== -1,
+    lastConjunctEnd,
+  };
+}
+
+/** True when `range` (the CodeActionProvider's query range, or a diagnostic
+ *  range) overlaps the header scanned into `h`, from its anchor line through
+ *  the return-type/body arrow. */
+function headerOverlapsRange(h, anchorLine, range) {
+  return range.start.line <= h.arrow.line && range.end.line >= anchorLine;
+}
+
+/** Do two vscode.Range values overlap (touching at a shared boundary point
+ *  counts)? */
+function rangesOverlap(a, b) {
+  const beforeA = b.end.line < a.start.line || (b.end.line === a.start.line && b.end.character < a.start.character);
+  const afterA = b.start.line > a.end.line || (b.start.line === a.end.line && b.start.character > a.end.character);
+  return !beforeA && !afterA;
+}
+
+/**
+ * The exact text edit for pinning `clause` (e.g. "comm(A, B)") into the
+ * header `h` (from scanHeaderPunctuation): append " <clause>" after the
+ * last existing where-conjunct, or open a fresh " where <clause>" right
+ * after the parameter list's close paren (naturally lands before the
+ * return-type arrow for a function, before the body arrow for a lambda —
+ * both are the same "->" scanHeaderPunctuation already found).
+ */
+function pinEditFromHeader(h, clause) {
+  if (h.hasWhere && h.lastConjunctEnd) {
+    return { position: new vscode.Position(h.lastConjunctEnd.line, h.lastConjunctEnd.char), text: ` ${clause}` };
+  }
+  return { position: new vscode.Position(h.closeParen.line, h.closeParen.char + 1), text: ` where ${clause}` };
+}
+
+/** Number of names inside a "comm(a, b, c)" / "anticomm(...)" clause. */
+function clauseArity(clause) {
+  const m = /\(([^)]*)\)/.exec(clause);
+  return m ? splitTopLevel(m[1], ",").length : 0;
+}
+
+/**
+ * Compact-vs-dense cell counts for a deduced comm/anticomm group of arity
+ * `groupSize` applied to `arrayTypeString` (a binding's declared return-array
+ * type): find `groupSize` literal-extent `Idx<n>` occurrences sharing the
+ * SAME extent n among the type's top-level index args (parseArrayTypeAt-
+ * style parsing via splitOnLike/splitTopLevel), and fold binom's exact-int64
+ * arithmetic the same way orbIdxDetail does — dense = n^groupSize, compact =
+ * C(n+groupSize-1, groupSize) for a commuting (+) group, C(n, groupSize) for
+ * an anticommuting (-) group. Reuses binom/INT64_MAX directly rather than
+ * re-deriving or re-parsing orbIdxDetail's rendered text, so orbIdxDetail's
+ * own hover output stays untouched. Returns undefined when the type isn't an
+ * `Array<...>`, doesn't carry `groupSize` matching-extent literal `Idx<n>`
+ * axes, or the fold overflows — callers omit the cells segment entirely
+ * rather than guessing.
+ */
+function deducedClassCells(arrayTypeString, groupSize, plus) {
+  if (!arrayTypeString || groupSize < 2) return undefined;
+  const m = /^Array\s*<([\s\S]*)>\s*$/.exec(arrayTypeString.trim());
+  if (!m) return undefined;
+  const inner = m[1];
+  const likeParts = splitOnLike(inner);
+  const idxText = likeParts ? likeParts[1] : splitTopLevel(inner, ",").slice(1).join(", ");
+  const indices = splitTopLevel(idxText, ",");
+  const byExtent = new Map();
+  for (const ix of indices) {
+    const im = /^Idx\s*<\s*(\d+)\s*>$/.exec(ix.trim());
+    if (!im) continue;
+    byExtent.set(im[1], (byExtent.get(im[1]) || 0) + 1);
+  }
+  let extent;
+  for (const [n, count] of byExtent) {
+    if (count >= groupSize) {
+      extent = n;
+      break;
+    }
+  }
+  if (extent === undefined) return undefined;
+  const n = BigInt(extent);
+  const dense = n ** BigInt(groupSize);
+  const top = plus ? n + BigInt(groupSize) - 1n : n;
+  const compact = binom(top, groupSize);
+  if (dense > INT64_MAX || compact > INT64_MAX) return undefined;
+  return { compact: compact.toString(), dense: dense.toString() };
+}
+
 /** Longest operator from the builtins table covering `character` in `lineText`. */
 function operatorAt(lineText, character) {
   let best;
@@ -1235,15 +1978,17 @@ const hoverProvider = {
       // of an inline kernel, or a let-bound kernel's use-site reference)
       // enriches whatever hover the word produces with its deduction block.
       const kernel = kernelAt(doc, wordRange);
-      // Source bindings win over the builtin table (shadowing).
-      const b = lookupBinding(doc, word, position.line);
+      // Source bindings win over the builtin table (shadowing). Resolved
+      // through references[] first when available (exact scope; see
+      // lookupBindingPrecise), falling back to the nearest-line heuristic.
+      const b = lookupBindingPrecise(doc, word, position);
       if (b) {
         // Functions (anything with structured params/ret) render as a full
         // callable signature; plain values keep the `kind name : type` form.
         const callable = Array.isArray(b.params) && b.ret !== undefined;
         const sig = callable
           ? renderCallable(b.kind || "function", b.name, b.params, b.ret, b.where)
-          : signatureText(b.kind || "", b.name, b.type);
+          : signatureText(b.kind || "", b.name, displayType(b));
         const md = new vscode.MarkdownString();
         md.appendCodeblock(sig, "blade");
         // A top-level provider read carries its source member as a badge.
@@ -1253,7 +1998,7 @@ const hoverProvider = {
         // A wreath class is almost always DEDUCED rather than written (the tie
         // rule appends a level to a repeated compact argument), so the binding
         // is where the user first meets it — spell out what it stores.
-        if (!callable) appendClassDetail(md, doc, b.type || "");
+        if (!callable) appendClassDetail(md, doc, displayType(b) || "");
         if (callable) {
           appendDeductionLines(md, b.where, b.deducedComm, bindingMinRanks(b));
         } else if (kernel) {
@@ -1496,28 +2241,22 @@ function declContextAt(doc, position) {
 function deductionCompletions(doc, position) {
   const ctx = declContextAt(doc, position);
   if (!ctx) return [];
-  let deduced = [];
-  let declared = [];
-  const rankByParam = new Map();
+  let info;
   if (ctx.kind === "function") {
     if (!ctx.name) return [];
     const b = (bindingsByDoc.get(doc.uri.toString()) || []).find(
       (x) => x.name === ctx.name && Array.isArray(x.params) && x.ret !== undefined
     );
-    if (!b || !Array.isArray(b.deducedComm)) return [];
-    deduced = b.deducedComm;
-    declared = commClauses(b.where);
-    for (const r of bindingMinRanks(b)) rankByParam.set(r.param, r.rank);
+    info = b && pinInfoForFunction(b);
   } else {
     // Inline lambda: the kernels[] entry whose span starts on the header line.
     const k = (kernelsByDoc.get(doc.uri.toString()) || []).find(
       (e) => (e.line || 1) - 1 === ctx.line
     );
-    if (!k) return [];
-    deduced = k.deducedComm || [];
-    declared = commClauses(k.declaredWhere);
-    for (const r of kernelMinRanks(k)) rankByParam.set(r.param, r.rank);
+    info = k && pinInfoForKernel(k);
   }
+  if (!info) return [];
+  const rankByParam = new Map(info.minRanks.map((r) => [r.param, r.rank]));
   const items = [];
   if (ctx.inParams) {
     const k = ctx.currentParam && rankByParam.get(ctx.currentParam);
@@ -1533,7 +2272,7 @@ function deductionCompletions(doc, position) {
       items.push(item);
     }
   } else if (ctx.afterParams && !(ctx.kind === "function" && ctx.afterArrow)) {
-    for (const clause of deduced.filter((c) => !declared.includes(c))) {
+    for (const clause of info.pinClauses) {
       const label = ctx.afterWhere ? clause : `where ${clause}`;
       const item = new vscode.CompletionItem(label, vscode.CompletionItemKind.Snippet);
       item.detail = clause.startsWith("anticomm(")
@@ -1585,7 +2324,7 @@ const completionProvider = {
       push(
         b.name,
         callable ? vscode.CompletionItemKind.Function : vscode.CompletionItemKind.Variable,
-        b.type,
+        displayType(b),
         b.doc ? new vscode.MarkdownString().appendText(b.doc) : undefined
       );
     }
@@ -1630,6 +2369,256 @@ const completionProvider = {
   },
 };
 
+// --- Code actions (pin deduced comm/anticomm, annotate deduced rank) --------
+//
+// Both actions work against TODAY's payload (bindings[]/kernels[] deduction
+// fields, already used by deductionCompletions/hover above) — no
+// references[] needed, so this workstream is fully live-testable.
+
+/**
+ * "Pin deduced comm/anticomm" actions for one header: one CodeAction per
+ * still-unpinned clause, inserting it via pinEditFromHeader. QuickFix when a
+ * BL4010/BL4011 diagnostic already overlaps the query range (VS Code has
+ * already filtered `context.diagnostics` to the range, so `hasPinDiagnostic`
+ * is a single doc-wide check made once by the caller); RefactorRewrite
+ * (lightbulb, no diagnostic required) otherwise.
+ */
+function pinActions(doc, h, clauses, hasPinDiagnostic, diagnostics) {
+  const out = [];
+  for (const clause of clauses) {
+    const edit = pinEditFromHeader(h, clause);
+    if (!edit) continue;
+    const action = new vscode.CodeAction(
+      `Pin deduced ${clause}`,
+      hasPinDiagnostic ? vscode.CodeActionKind.QuickFix : vscode.CodeActionKind.RefactorRewrite
+    );
+    const we = new vscode.WorkspaceEdit();
+    we.insert(doc.uri, edit.position, edit.text);
+    action.edit = we;
+    if (hasPinDiagnostic) action.diagnostics = diagnostics;
+    out.push(action);
+  }
+  return out;
+}
+
+/**
+ * "Annotate deduced rank: T^k" actions for one header: each unannotated
+ * param whose deduced minimum rank is > 0 and whose NAME span overlaps
+ * `range` gets an action inserting `: T^k` right after its name. Param
+ * spans come from depth-aware comma-splitting the exact document text
+ * between the header's parens (splitTopLevelWithPositions — not a
+ * line-wide regex, so a name appearing inside a DIFFERENT param's type
+ * can't be mistaken for the real one).
+ */
+function rankActions(doc, h, minRanks, range) {
+  if (!minRanks.length) return [];
+  const rankByParam = new Map(minRanks.map((r) => [r.param, r.rank]));
+  const span = extractSpan(
+    doc,
+    { line: h.openParen.line, char: h.openParen.char + 1 },
+    { line: h.closeParen.line, char: h.closeParen.char }
+  );
+  const parts = splitTopLevelWithPositions(span.text, span.positions, ",");
+  const actions = [];
+  for (const part of parts) {
+    const m = /^(\s*)([A-Za-z_]\w*)/.exec(part.text);
+    if (!m || part.positions.length === 0) continue;
+    const name = m[2];
+    const rank = rankByParam.get(name);
+    if (!rank) continue;
+    if (/^\s*[A-Za-z_]\w*\s*:/.test(part.text)) continue; // already annotated
+    const nameStartIdx = m[1].length;
+    const nameEndIdx = nameStartIdx + name.length - 1;
+    if (nameEndIdx >= part.positions.length) continue;
+    const startPos = part.positions[nameStartIdx];
+    const endPos = part.positions[nameEndIdx];
+    const nameRange = new vscode.Range(
+      new vscode.Position(startPos.line, startPos.char),
+      new vscode.Position(endPos.line, endPos.char + 1)
+    );
+    if (!rangesOverlap(nameRange, range)) continue;
+    const insertPos = new vscode.Position(endPos.line, endPos.char + 1);
+    const action = new vscode.CodeAction(`Annotate deduced rank: T^${rank}`, vscode.CodeActionKind.RefactorRewrite);
+    const edit = new vscode.WorkspaceEdit();
+    edit.insert(doc.uri, insertPos, `: T^${rank}`);
+    action.edit = edit;
+    actions.push(action);
+  }
+  return actions;
+}
+
+const codeActionProvider = {
+  provideCodeActions(doc, range, context) {
+    const actions = [];
+    const key = doc.uri.toString();
+    const diags = (context && context.diagnostics) || [];
+    const hasPinDiagnostic = diags.some((d) => {
+      const code = diagnosticCodeValue(d);
+      return code === "BL4010" || code === "BL4011";
+    });
+
+    for (const b of bindingsByDoc.get(key) || []) {
+      if (!(Array.isArray(b.params) && b.ret !== undefined) || !b.line) continue;
+      const anchorLine = Math.max(0, (b.line || 1) - 1);
+      const h = scanHeaderPunctuation(doc, anchorLine, 0, "function", b.name);
+      if (!h) continue;
+      const info = pinInfoForFunction(b);
+      if (info) {
+        if (headerOverlapsRange(h, anchorLine, range)) {
+          actions.push(...pinActions(doc, h, info.pinClauses, hasPinDiagnostic, diags));
+        }
+        actions.push(...rankActions(doc, h, info.minRanks, range));
+      }
+    }
+    for (const k of kernelsByDoc.get(key) || []) {
+      if (!k.line) continue;
+      const anchorLine = Math.max(0, (k.line || 1) - 1);
+      const anchorChar = Math.max(0, (k.col || 1) - 1);
+      const h = scanHeaderPunctuation(doc, anchorLine, anchorChar, "lambda");
+      if (!h) continue;
+      const info = pinInfoForKernel(k);
+      if (headerOverlapsRange(h, anchorLine, range)) {
+        actions.push(...pinActions(doc, h, info.pinClauses, hasPinDiagnostic, diags));
+      }
+      actions.push(...rankActions(doc, h, info.minRanks, range));
+    }
+    return actions;
+  },
+};
+
+// --- Type lenses (CodeLens: function/array signatures, deduction) -----------
+//
+// One resolve-free provider: every lens is returned fully formed (no
+// resolveCodeLens), and applyCheckPayload fires codeLensEmitter so lenses
+// stay in step with the fast/slow clocks (workstream 1) exactly like
+// diagnostics and hovers already do.
+
+const codeLensEmitter = new vscode.EventEmitter();
+
+/**
+ * Render an `Array<...>` type string in index-arrow notation:
+ * `Array<Elem like I1, I2>` (or the pretty-printer form `Array<Elem, I1,
+ * I2>`) becomes `I1 -> I2 -> Elem` — the Ionide-style "an array IS a
+ * function from its indices" reading. Nested Array elements recurse (an
+ * array of arrays becomes a longer arrow chain). Pure string work, no
+ * document access — reuses splitTopLevel/splitOnLike, the same
+ * top-level-nesting-aware helpers parseArrayTypeAt uses for hovers. Returns
+ * null for a non-Array type, or one with no index args at all — the caller
+ * skips the lens rather than showing something misleading.
+ */
+function arrowNotation(typeString) {
+  if (!typeString) return null;
+  const s = typeString.trim();
+  const m = /^Array\s*<([\s\S]*)>\s*$/.exec(s);
+  if (!m) return null;
+  const inner = m[1];
+  let elem;
+  let idxText;
+  const parts = splitOnLike(inner);
+  if (parts) {
+    elem = parts[0].trim();
+    idxText = parts[1];
+  } else {
+    const commaParts = splitTopLevel(inner, ",");
+    if (commaParts.length === 0) return null;
+    elem = commaParts[0];
+    idxText = commaParts.slice(1).join(", ");
+  }
+  const indices = splitTopLevel(idxText, ",");
+  if (indices.length === 0) return null;
+  const elemArrow = arrowNotation(elem);
+  return indices.concat([elemArrow || elem]).join(" -> ");
+}
+
+/**
+ * The deduction lenses for one function binding or kernel: one per
+ * still-unpinned clause, `deduced <clause> · <storage> [: C vs D cells]
+ * — pin`. Clicking runs blade.pinDeduction with the SAME edit ingredients
+ * pinEditFromHeader would give the code action, so the two surfaces can
+ * never disagree about where the pin lands. Cell counts only for function
+ * bindings (kernels carry no return-type string to check) and only when the
+ * return type's relevant axes have a literal extent (deducedClassCells).
+ */
+function deductionLenses(doc, source, info, kind, name) {
+  if (!info || !info.pinClauses.length) return [];
+  const anchorLine = Math.max(0, (source.line || 1) - 1);
+  const anchorChar = kind === "lambda" ? Math.max(0, (source.col || 1) - 1) : 0;
+  const h = scanHeaderPunctuation(doc, anchorLine, anchorChar, kind, name);
+  if (!h) return [];
+  const range = new vscode.Range(anchorLine, 0, anchorLine, 0);
+  const lenses = [];
+  for (const clause of info.pinClauses) {
+    const edit = pinEditFromHeader(h, clause);
+    if (!edit) continue;
+    const plus = !clause.startsWith("anticomm(");
+    const storage = plus ? "symmetric storage" : "strict-triangular storage";
+    const cells = kind === "function" ? deducedClassCells(source.ret, clauseArity(clause), plus) : undefined;
+    const cellsText = cells ? `: ${cells.compact} vs ${cells.dense} cells` : "";
+    const lens = new vscode.CodeLens(range);
+    lens.command = {
+      title: `deduced ${clause} · ${storage}${cellsText} — pin`,
+      command: "blade.pinDeduction",
+      arguments: [doc.uri.toString(), { line: edit.position.line, character: edit.position.character }, edit.text],
+    };
+    lenses.push(lens);
+  }
+  return lenses;
+}
+
+const codeLensProvider = {
+  onDidChangeCodeLenses: codeLensEmitter.event,
+  provideCodeLenses(doc) {
+    if (doc.languageId !== "blade") return [];
+    const cfg = vscode.workspace.getConfiguration("blade");
+    const showFn = cfg.get("signatureLens.functions", true);
+    const showArr = cfg.get("signatureLens.arrays", true);
+    const showDed = cfg.get("deductionLens", true);
+    if (!showFn && !showArr && !showDed) return [];
+
+    const lenses = [];
+    const key = doc.uri.toString();
+    for (const b of bindingsByDoc.get(key) || []) {
+      if (!b.name || !b.line) continue;
+      const line = Math.max(0, (b.line || 1) - 1);
+      const range = new vscode.Range(line, 0, line, 0);
+      const callable = Array.isArray(b.params) && b.ret !== undefined;
+      if (callable && showFn) {
+        const norm = typeNormalizer();
+        const sig = (b.params || []).map((p) => norm(p.type)).concat([norm(b.ret)]).join(" -> ");
+        const lens = new vscode.CodeLens(range);
+        lens.command = { title: `${b.name} : ${sig}`, command: "" };
+        lenses.push(lens);
+      } else if (!callable && showArr) {
+        const arrow = arrowNotation(displayType(b) || "");
+        if (arrow) {
+          const lens = new vscode.CodeLens(range);
+          lens.command = { title: `${b.name} : ${typeNormalizer()(arrow)}`, command: "" };
+          lenses.push(lens);
+        }
+      }
+      if (showDed) lenses.push(...deductionLenses(doc, b, pinInfoForFunction(b), "function", b.name));
+    }
+    if (showDed) {
+      for (const k of kernelsByDoc.get(key) || []) {
+        if (!k.line) continue;
+        lenses.push(...deductionLenses(doc, k, pinInfoForKernel(k), "lambda"));
+      }
+    }
+    return lenses;
+  },
+};
+
+/** blade.pinDeduction command body: apply the {position, text} insertion a
+ *  pin code action / deduction lens computed, to `uriString`'s document.
+ *  Exported separately from its registration (see activate()) so tests can
+ *  call it directly without going through vscode.commands. */
+function pinDeductionCommand(uriString, position, text) {
+  const uri = vscode.Uri.parse(uriString);
+  const edit = new vscode.WorkspaceEdit();
+  edit.insert(uri, new vscode.Position(position.line, position.character), text);
+  return vscode.workspace.applyEdit(edit);
+}
+
 // --- Activation ---------------------------------------------------------------
 
 function activate(context) {
@@ -1637,6 +2626,7 @@ function activate(context) {
   output = vscode.window.createOutputChannel("Blade");
   context.subscriptions.push(diagnostics, output);
   repl.init(context, { findCompiler, reportNoCompiler });
+  serve.init(context, { findCompiler, output });
 
   const cfg = () => vscode.workspace.getConfiguration("blade");
 
@@ -1652,9 +2642,26 @@ function activate(context) {
 
     vscode.languages.registerCompletionItemProvider({ language: "blade" }, completionProvider),
 
+    // Navigation (workstream 2): definition/references/rename/outline all
+    // degrade gracefully when references[] is absent (see their own
+    // comments) — safe to register unconditionally, on every compiler.
+    vscode.languages.registerDefinitionProvider({ language: "blade" }, definitionProvider),
+    vscode.languages.registerReferenceProvider({ language: "blade" }, referenceProvider),
+    vscode.languages.registerRenameProvider({ language: "blade" }, renameProvider),
+    vscode.languages.registerDocumentSymbolProvider({ language: "blade" }, documentSymbolProvider),
+
+    // Code actions (workstream 3): pin deduced comm/anticomm, annotate
+    // deduced rank — works against today's payload, no references[] needed.
+    vscode.languages.registerCodeActionsProvider({ language: "blade" }, codeActionProvider, {
+      providedCodeActionKinds: [vscode.CodeActionKind.QuickFix, vscode.CodeActionKind.RefactorRewrite],
+    }),
+
+    // Type lenses (workstream 4): function/array signatures, deduction pin.
+    vscode.languages.registerCodeLensProvider({ language: "blade" }, codeLensProvider),
+
     vscode.commands.registerCommand("blade.check", () => {
       const doc = vscode.window.activeTextEditor?.document;
-      if (doc) checkDocument(doc);
+      if (doc) checkDocument(doc, "full");
     }),
 
     vscode.commands.registerCommand("blade.runFile", commandRunFile),
@@ -1663,13 +2670,25 @@ function activate(context) {
     vscode.commands.registerCommand("blade.runSelection", commandSendSelectionToRepl),
     vscode.commands.registerCommand("blade.sendFileToRepl", commandSendFileToRepl),
     vscode.commands.registerCommand("blade.replReset", () => repl.resetRepl()),
+    // Internal (menus.commandPalette "when": false in package.json) — the
+    // deduction lens's own command, sharing pinEditFromHeader's insertion
+    // point with the "Pin deduced ..." code action.
+    vscode.commands.registerCommand("blade.pinDeduction", pinDeductionCommand),
+
+    // Fast clock: debounced as-you-type checks, serve-only (see
+    // onDocumentChanged). checkOnSave/checkOnOpen below always run the full
+    // tier regardless of blade.liveChecking — that setting only gates the
+    // change-triggered clock.
+    vscode.workspace.onDidChangeTextDocument((e) => {
+      if (e.contentChanges.length > 0) onDocumentChanged(e.document);
+    }),
 
     vscode.workspace.onDidSaveTextDocument((doc) => {
-      if (cfg().get("checkOnSave", true)) checkDocument(doc);
+      if (cfg().get("checkOnSave", true)) checkDocument(doc, "full");
     }),
 
     vscode.workspace.onDidOpenTextDocument((doc) => {
-      if (cfg().get("checkOnOpen", true)) checkDocument(doc);
+      if (cfg().get("checkOnOpen", true)) checkDocument(doc, "full");
     }),
 
     vscode.workspace.onDidCloseTextDocument((doc) => {
@@ -1678,23 +2697,29 @@ function activate(context) {
       providersByDoc.delete(doc.uri.toString());
       callsByDoc.delete(doc.uri.toString());
       kernelsByDoc.delete(doc.uri.toString());
+      referencesByDoc.delete(doc.uri.toString());
       typeDeclCache.delete(doc.uri.toString());
+      clearFastTimer(doc);
+      clearIdleTimer(doc);
     }),
 
     vscode.workspace.onDidChangeConfiguration((e) => {
       if (e.affectsConfiguration("blade.compilerPath")) {
         warnedNoCompiler = false;
-        ideMode = "unknown"; // a new compiler may support JSON mode
+        ideMode = "unknown"; // a new compiler may support serve or JSON mode
+        serve.dispose(); // kill the old process; the next check() re-probes fresh
       }
     })
   );
 
   if (cfg().get("checkOnOpen", true)) {
-    for (const doc of vscode.workspace.textDocuments) checkDocument(doc);
+    for (const doc of vscode.workspace.textDocuments) checkDocument(doc, "full");
   }
 }
 
-function deactivate() {}
+function deactivate() {
+  serve.dispose();
+}
 
 module.exports = { activate, deactivate };
 
@@ -1708,6 +2733,34 @@ module.exports._test = {
   declContextAt,
   bindingsByDoc,
   kernelsByDoc,
+  applyCheckPayload,
+  displayType,
+  // Navigation (workstream 2).
+  referencesByDoc,
+  resolveReference,
+  lookupBinding,
+  lookupBindingPrecise,
+  definitionProvider,
+  referenceProvider,
+  renameProvider,
+  documentSymbolProvider,
+  documentSymbols,
+  isReservedName,
+  // Code actions (workstream 3).
+  codeActionProvider,
+  scanHeaderPunctuation,
+  pinEditFromHeader,
+  pinInfoForFunction,
+  pinInfoForKernel,
+  // Type lenses (workstream 4).
+  codeLensProvider,
+  arrowNotation,
+  deducedClassCells,
+  clauseArity,
+  pinDeductionCommand,
+  // Diagnostic doc links.
+  diagnosticCode,
+  diagnosticCodeValue,
   setOutput: (o) => {
     output = o;
   },

@@ -18,7 +18,7 @@ type Tri = Idx<3>
 let dense: Array<Float64 like Lat, Lon> = [[10.0, 20.0], [30.0, 40.0]]
 let msk: Array<Bool like Lat, Lon> = [[true, false], [true, true]]
 let B = compound(dense, msk)
-let picked = B((0, 0))
+let picked = B(0, 0)
 
 static function tri_extent(i: Tri) -> Tri = i
 
@@ -26,15 +26,10 @@ function ragged_sum(A: Array<Float64 like DepIdx<Tri, tri_extent>>) -> Float64 =
     0.0
 }
 
-// Doubles each weight and accumulates the sum.
+// Doubles each weight and accumulates the sum (additive `reduce`, not an
+// imperative loop — see tests/corpus/ad/007_reduce_grad.blade upstream).
 // w: the weights to accumulate
-function total(w: Array<Float64 like Idx<3>>) -> Float64 = {
-    let mut s = 0.0
-    for k in 0..3 {
-        s += w(k) * 2.0
-    }
-    s
-}
+function total(w: Array<Float64 like Idx<3>>) -> Float64 = reduce(w, (+)) * 2.0
 
 // Rank-2 outer product with a commutativity assertion.
 // A: left samples

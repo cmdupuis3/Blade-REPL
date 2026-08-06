@@ -1,0 +1,94 @@
+// Wire protocol for the compiler's `blade ide serve` subcommand, factored out
+// of the VS Code layer so scripts/serve-protocol-test.js can drive the SAME
+// framing logic against a real compiler process, and so src/serve.js (the
+// process owner) stays free of parsing detail. Zero dependencies, no vscode
+// require — everything here is pure string/JSON work. Modeled on
+// src/replProto.js's dependency-free split, for the identical reason: the
+// live protocol test needs this module without pulling in VS Code.
+//
+// NDJSON over stdin/stdout: one JSON object per line, UTF-8. Unlike the REPL
+// (a terminal-shaped prompt/echo protocol), `ide serve` is a plain data pipe
+// — requests and responses correlate by an integer "id" (ping and check
+// only; shutdown has no response and no id). See the plan's frozen protocol
+// spec for the exact message shapes:
+//
+//   request  {"id": N, "cmd": "check", "tier": "fast"|"full", "file": "...", "source": "..."}
+//   request  {"id": N, "cmd": "ping"}
+//   request  {"cmd": "shutdown"}
+//   response {"id": N, "ok": true, "serve": 1, "version": "..."}          (ping)
+//   response {"id": N, "tier": "fast"|"full", "diagnostics": [...], ...}  (check)
+//   response {"id": N|null, "error": "..."}                                (error)
+//
+// stderr is free-form compiler logging (never JSON, never parsed here) —
+// src/serve.js routes it straight to the "Blade" output channel.
+
+"use strict";
+
+/** One "check" request line: {"id","cmd":"check","tier","file","source"}\n */
+function encodeCheck(id, tier, file, source) {
+  return JSON.stringify({ id, cmd: "check", tier, file, source }) + "\n";
+}
+
+/** One "ping" request line: {"id","cmd":"ping"}\n */
+function encodePing(id) {
+  return JSON.stringify({ id, cmd: "ping" }) + "\n";
+}
+
+/** The "shutdown" request line: {"cmd":"shutdown"}\n — no id, no response. */
+function encodeShutdown() {
+  return JSON.stringify({ cmd: "shutdown" }) + "\n";
+}
+
+/**
+ * Parse one already-newline-stripped line into a message object. A line that
+ * isn't valid JSON, or is valid JSON but not an object (e.g. a bare number,
+ * or stray compiler output that leaked onto stdout), decodes to an error
+ * object shaped like the protocol's own error responses (`{id: null, error}`)
+ * instead of throwing — the caller can route it straight to the output
+ * channel exactly like a real `{"error": "..."}` response.
+ */
+function decodeLine(line) {
+  let obj;
+  try {
+    obj = JSON.parse(line);
+  } catch (e) {
+    return { id: null, error: `malformed JSON from 'ide serve': ${e.message} — ${line.slice(0, 200)}` };
+  }
+  if (!obj || typeof obj !== "object" || Array.isArray(obj)) {
+    return { id: null, error: `non-object JSON line from 'ide serve': ${line.slice(0, 200)}` };
+  }
+  return obj;
+}
+
+/**
+ * A stateful line decoder for one child process's stdout: feed it chunks as
+ * they arrive (`push`), get back the complete messages they contained (zero,
+ * one, or several — fast consecutive responses can coalesce into a single
+ * `data` event). Tolerates `\r\n` line endings. The trailing partial line (no
+ * `\n` yet) is retained across calls until it completes.
+ */
+function createDecoder() {
+  let buf = "";
+  return {
+    push(chunk) {
+      buf += chunk;
+      const lines = buf.split("\n");
+      buf = lines.pop(); // last element is the trailing partial line (or "")
+      const messages = [];
+      for (const raw of lines) {
+        const line = raw.endsWith("\r") ? raw.slice(0, -1) : raw;
+        if (line.trim() === "") continue;
+        messages.push(decodeLine(line));
+      }
+      return messages;
+    },
+  };
+}
+
+module.exports = {
+  encodeCheck,
+  encodePing,
+  encodeShutdown,
+  decodeLine,
+  createDecoder,
+};

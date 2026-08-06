@@ -1,8 +1,8 @@
 {
   "name": "blade-language",
   "displayName": "Blade Language",
-  "description": "Syntax highlighting, diagnostics, type hovers, and REPL-style evaluation for the Blade DSL (.blade / .edgi)",
-  "version": "0.1.0",
+  "description": "Live diagnostics, type hovers and lenses, go-to-definition/rename, deduction pinning, and REPL-style evaluation for the Blade DSL (.blade / .edgi)",
+  "version": "0.2.0",
   "publisher": "blade-local",
   "license": "UNLICENSED",
   "engines": {
@@ -14,8 +14,10 @@
   "main": "./src/extension.js",
   "activationEvents": [],
   "scripts": {
-    "test": "node --check src/extension.js && node --check src/repl.js && node --check src/replProto.js && node --check src/builtins.js && node --check src/types.js && node --check src/keywords.js && node scripts/check-consistency.js",
-    "test:repl": "node scripts/repl-protocol-test.js"
+    "test": "node --check src/extension.js && node --check src/repl.js && node --check src/replProto.js && node --check src/serve.js && node --check src/serveProto.js && node --check src/builtins.js && node --check src/types.js && node --check src/keywords.js && node --check scripts/vscode-mock.js && node --check scripts/provider-test.js && node --check scripts/check-consistency.js && node --check scripts/repl-protocol-test.js && node --check scripts/serve-protocol-test.js && node --check scripts/nav-integration-test.js && node scripts/check-consistency.js && node scripts/provider-test.js",
+    "test:repl": "node scripts/repl-protocol-test.js",
+    "test:serve": "node scripts/serve-protocol-test.js",
+    "test:nav": "node scripts/nav-integration-test.js"
   },
   "contributes": {
     "languages": [
@@ -66,6 +68,36 @@
           "type": "boolean",
           "default": true,
           "description": "Show each REPL evaluation's result inline at the end of the evaluated line (green value / red error; full output and timing on hover). Cleared when the document changes."
+        },
+        "blade.liveChecking": {
+          "type": "boolean",
+          "default": true,
+          "description": "Check the file as you type (fast tier: parse + typecheck + deduce, no monomorphization) via a persistent 'blade ide serve' process. Only takes effect when the compiler supports 'ide serve'; older compilers are unaffected and keep checking on save/open only. Turning this off disables the as-you-type clock but leaves checkOnSave/checkOnOpen behavior unchanged."
+        },
+        "blade.fastCheckDebounceMs": {
+          "type": "number",
+          "default": 300,
+          "description": "Milliseconds of typing inactivity before a fast (as-you-type) check is sent to 'blade ide serve'. Only applies when blade.liveChecking is on and the compiler supports 'ide serve'."
+        },
+        "blade.fullCheckIdleMs": {
+          "type": "number",
+          "default": 2000,
+          "description": "Milliseconds of no further edits after a successful fast check before a full check (fast tier plus monomorphization, upgrading hover/lens types to concrete instantiations) runs automatically. Full checks always also run on save and open, regardless of this setting."
+        },
+        "blade.signatureLens.functions": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show an Ionide-style abstract signature lens above each function/lambda binding (e.g. 'name : T1 -> T2 -> Ret')."
+        },
+        "blade.signatureLens.arrays": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show an index-arrow signature lens above each array-typed value binding (e.g. 'a : Idx<3> -> Float64')."
+        },
+        "blade.deductionLens": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show a clickable lens above functions/kernels with a deduced-but-unpinned comm/anticomm clause (e.g. 'deduced comm(a, b) · symmetric storage — pin'); clicking inserts the pin."
         }
       }
     },
@@ -98,6 +130,10 @@
       {
         "command": "blade.emitFile",
         "title": "Blade: Show Generated C++"
+      },
+      {
+        "command": "blade.pinDeduction",
+        "title": "Blade: Pin Deduced Clause"
       }
     ],
     "keybindings": [
@@ -118,6 +154,12 @@
       }
     ],
     "menus": {
+      "commandPalette": [
+        {
+          "command": "blade.pinDeduction",
+          "when": "false"
+        }
+      ],
       "editor/title/run": [
         {
           "command": "blade.runFile",
