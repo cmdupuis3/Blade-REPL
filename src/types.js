@@ -9,6 +9,10 @@
 // `primitive-types` / `index-types` groups. Alias facts (Int = Int32,
 // Double = Float64, Char stored as Int32) mirror the checker's resolution
 // table (TypeCheck.fs resolveTypeExpr).
+//
+// Extent parameters follow builtins.js's convention: uppercase N (then M, P,
+// Q) for a polymorphic extent, lowercase for every other type-level Nat —
+// so `SymIdx<r: Nat, N: Nat>` reads rank-then-extent without a legend.
 
 "use strict";
 
@@ -41,35 +45,35 @@ const primitives = {
 // example there would swamp the line it shares.
 const indexTypes = {
   Idx: {
-    sig: "Idx<n: Nat>",
-    desc: "Simple index type.\n Index type of extent n: Nat.",
+    sig: "Idx<N: Nat>",
+    desc: "Simple index type.\n Index type of extent N: Nat.",
   },
   SymIdx: {
-    sig: "SymIdx<r: Nat, n: Nat>",
-    desc: "Symmetric index type. \n Rank-r symmetric dimensions over an extent-n index.",
-    lit: "Literal — one bracket level per rank, a row seeded at p holding n − p cells:\n\n`SymIdx<2, 3>` = `[[a00, a01, a02], [a11, a12], [a22]]`",
+    sig: "SymIdx<r: Nat, N: Nat>",
+    desc: "Symmetric index type. \n Rank-r symmetric dimensions over an extent-N index.",
+    lit: "Literal — one bracket level per rank, a row seeded at p holding N − p cells:\n\n`SymIdx<2, 3>` = `[[a00, a01, a02], [a11, a12], [a22]]`",
   },
   AntisymIdx: {
-    sig: "AntisymIdx<r: Nat, n: Nat>",
-    desc: "Antisymmetric index type. \n Rank-r antisymmetric dimensions over an extent-n index (no diagonal).",
-    lit: "Literal — as SymIdx but strict, so a row seeded at p holds n − p − 1 cells and the last is empty:\n\n`AntisymIdx<2, 3>` = `[[a01, a02], [a12], []]`",
+    sig: "AntisymIdx<r: Nat, N: Nat>",
+    desc: "Antisymmetric index type. \n Rank-r antisymmetric dimensions over an extent-N index (no diagonal).",
+    lit: "Literal — as SymIdx but strict, so a row seeded at p holds N − p − 1 cells and the last is empty:\n\n`AntisymIdx<2, 3>` = `[[a01, a02], [a12], []]`",
   },
   OrbIdx: {
-    sig: "OrbIdx<[(r_i: Nat, s_i: + | -)], n: Nat>",
-    desc: "Orbit index type. \n Iterated wreath of rank-r_i symmetric (+) / antisymmetric (-) levels over an extent-n index, outermost last; a subscript takes Π r_i flat coordinates. Depth 1 is exactly SymIdx / AntisymIdx.",
+    sig: "OrbIdx<[(r_i: Nat, s_i: + | -)], N: Nat>",
+    desc: "Orbit index type. \n Iterated wreath of rank-r_i symmetric (+) / antisymmetric (-) levels over an extent-N index, outermost last; a subscript takes Π r_i flat coordinates. Depth 1 is exactly SymIdx / AntisymIdx.",
   },
   HermitianIdx: {
-    sig: "HermitianIdx<n: Nat>",
-    desc: "Hermitian index type. \n Rank-2 conjugate-symmetric dimensions over an extent-n index (real- and complex-valued only).",
+    sig: "HermitianIdx<N: Nat>",
+    desc: "Hermitian index type. \n Rank-2 conjugate-symmetric dimensions over an extent-N index (real- and complex-valued only).",
     lit: "Literal — the SymIdx triangle, each row's leading cell the diagonal, which must be REAL (`A(i, i) = conj(A(i, i))`):\n\n`HermitianIdx<3>` = `[[d0, a01, a02], [d1, a12], [d2]]`",
   },
   CompoundIdx: {
-    sig: "CompoundIdx<Tuple<I_j: Idx<n_j: Nat>>, mask: bool^r>",
+    sig: "CompoundIdx<Tuple<I_j: Idx<N_j: Nat>>, mask: bool^r>",
     desc: "Compound index type.\n Contiguous storage of a masked or sparse view over one or more base index types.",
   },
   SparseIdx: {
-    sig: "SparseIdx<keys: (Nat, ...)^m>",
-    desc: "Sparse index type. \n Explicit enumeration of the m valid tuples (edge lists, CG triples); rank is the tuple arity, lookup hashes the tuple, and keys keep their given order. One slot taking one joint tuple — `S((i, j))` — with wildcards and leading prefixes gathered.",
+    sig: "SparseIdx<keys: (Nat, ...)^N>",
+    desc: "Sparse index type. \n Explicit enumeration of the N valid tuples (edge lists, CG triples); rank is the tuple arity, lookup hashes the tuple, and keys keep their given order. One slot taking one joint tuple — `S((i, j))` — with wildcards and leading prefixes gathered.",
   },
   EnumIdx: {
     sig: "EnumIdx<Enum>",
@@ -80,8 +84,8 @@ const indexTypes = {
     desc: "Dependent index type. \n Per-parent extent given by a function f (ragged / jagged shapes).",
   },
   RaggedIdx: {
-    sig: "RaggedIdx<I: Idx<Nat>, n: Nat>",
-    desc: "Ragged index type. \n Variable inner extent of length n per outer position.",
+    sig: "RaggedIdx<I: Idx<Nat>, N: Nat>",
+    desc: "Ragged index type. \n Variable inner extent of length N per outer position.",
   },
   IrrepsIdx: {
     sig: "IrrepsIdx<l: Nat, parity: bool, mult: Nat>",

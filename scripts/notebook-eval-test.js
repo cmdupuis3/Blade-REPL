@@ -1,11 +1,13 @@
-// Drives a REAL `blade ide serve` process's "eval"/"resetSession" commands
-// DIRECTLY through src/serveProto.js (no notebook UI, no src/notebook.js
-// involved) — modeled on scripts/serve-protocol-test.js, same BLADE_EXE /
-// newest-mtime Debug-Release discovery, same hand-rolled check()/watchdog
-// shape. This is the session-semantics contract from the plan's frozen
-// protocol: let-binding eval with a typed value, bare-expression echo,
+// Drives a REAL `blade ide serve` process's "eval"/"resetSession"/"checkCells"
+// commands DIRECTLY through src/serveProto.js (no notebook UI, no
+// src/notebook.js involved) — modeled on scripts/serve-protocol-test.js, same
+// BLADE_EXE / newest-mtime Debug-Release discovery, same hand-rolled check()/
+// watchdog shape. This is the session-semantics contract from the plan's
+// frozen protocol: let-binding eval with a typed value, bare-expression echo,
 // rebind-in-place, resetSession, a rejected snippet leaving the session
-// usable, and isolation between two independently-named sessions.
+// usable, isolation between two independently-named sessions, and the
+// compiler-side cell assembly (`checkCells`) the extension's notebook
+// checking rides on.
 //
 // The compiler-side `eval` command was being built CONCURRENTLY with this
 // extension-side work, against the SAME frozen protocol spec. A compiler
@@ -22,12 +24,6 @@ const cp = require("child_process");
 const fs = require("fs");
 const path = require("path");
 const proto = require("../src/serveProto");
-// sessionSource is pure (no vscode APIs at runtime) but notebook.js still
-// unconditionally `require("vscode")`s at module load — install the mock
-// purely so that require succeeds, exactly like scripts/notebook-test.js
-// does for the same reason. Nothing below touches any vscode-mock object.
-require("./vscode-mock").install();
-const nbSessionSource = require("../src/notebook")._test.sessionSource;
 
 function findExe() {
   if (process.env.BLADE_EXE) return process.env.BLADE_EXE;
@@ -127,9 +123,9 @@ function resetReq(session, timeoutMs) {
   return send(id, (i) => proto.encodeResetSession(i, session), timeoutMs);
 }
 
-function checkReq(tier, file, source, timeoutMs) {
+function checkCellsReq(tier, file, cells, timeoutMs) {
   const id = nextId++;
-  return send(id, (i) => proto.encodeCheck(i, tier, file, source), timeoutMs);
+  return send(id, (i) => proto.encodeCheckCells(i, tier, file, cells), timeoutMs);
 }
 
 let failures = 0;
@@ -224,6 +220,50 @@ const EVAL_TIMEOUT_MS = 30000;
     rebindEcho
   );
 
+  // --- 3b. Rebind referencing a LATER binding (dependency-ordered splice) -----
+  //
+  // Split one cell into two after the fact: the session already holds
+  // `pairs`, then `xloop` joins AFTER it, then `pairs` is rebound to
+  // reference `xloop`. An in-place splice would put the use above the
+  // definition in the flat session file ("Unbound variable: xloop" — the
+  // demo.bladenb regression); the engine must place the rebind after its
+  // last later dependency instead.
+  const dep = "notebook-eval-test-session-dep";
+  await evalReq(dep, "let base: Int64 = 2", undefined, EVAL_TIMEOUT_MS);
+  await evalReq(dep, "let pairs: Int64 = base * 10", undefined, EVAL_TIMEOUT_MS);
+  await evalReq(dep, "let xloop: Int64 = 7", undefined, EVAL_TIMEOUT_MS);
+  const depRebind = await evalReq(dep, "let pairs: Int64 = xloop + 1", undefined, EVAL_TIMEOUT_MS);
+  check(
+    "rebind referencing a later binding: kept (moved after its dependency, not spliced in place)",
+    depRebind.kept === true,
+    JSON.stringify(depRebind).slice(0, 300)
+  );
+  const depEcho = await evalReq(dep, "pairs", undefined, EVAL_TIMEOUT_MS);
+  check(
+    "rebind referencing a later binding: pairs now reads the dependency (8)",
+    depEcho.kept === true && (depEcho.bindings || [])[0] && (depEcho.bindings || [])[0].value === "8",
+    JSON.stringify(depEcho).slice(0, 300)
+  );
+
+  // --- 3c. |> compute of an eager value still echoes ---------------------------
+  //
+  // `reduce(xs, (+))` is eager; piping it through `compute` is a no-op that
+  // must NOT silence the echo (the demo.bladenb empty-value regression).
+  const cmp = "notebook-eval-test-session-compute";
+  await evalReq(cmp, "let xs = [1.0, 2.0, 3.0]", undefined, EVAL_TIMEOUT_MS);
+  const cmpEcho = await evalReq(cmp, "reduce(xs, (+)) |> compute", undefined, EVAL_TIMEOUT_MS);
+  const cmpBinding = (cmpEcho.bindings || [])[0];
+  check(
+    "reduce |> compute: kept with a bare-expression echo",
+    cmpEcho.kept === true && !!cmpBinding && cmpBinding.name === "",
+    JSON.stringify(cmpEcho).slice(0, 300)
+  );
+  check(
+    "reduce |> compute: echoes the reduced value (6), not an empty string",
+    !!cmpBinding && cmpBinding.value === "6" && cmpBinding.type === "Float64",
+    cmpBinding
+  );
+
   // --- 4. Rejected snippet leaves the session usable --------------------------
 
   const r5 = await evalReq(sess, 'let y: Int64 = "not a number"', undefined, EVAL_TIMEOUT_MS);
@@ -271,43 +311,46 @@ const EVAL_TIMEOUT_MS = 30000;
     JSON.stringify(isoB).slice(0, 300)
   );
 
-  // --- 7. Two-cell session source through serve.check's fast tier (N3) ------
+  // --- 7. Two-cell notebook check through `checkCells` (N3) -----------------
   //
-  // Proves the CONCATENATION path (src/notebook.js's sessionSource) against
-  // the real compiler: two "cells" joined into one source, checked with a
-  // single fast-tier `check` request (exactly what runNotebookCheck sends),
-  // and both cells' bindings coming back at the line each cell's own window
-  // says it should. The remap-fan-out LOGIC itself (windows -> per-cell
-  // payload) is covered hermetically, against canned payloads, in
-  // scripts/notebook-test.js — this only needs to show the compiler agrees
-  // with sessionSource's own line bookkeeping.
-  const nbCells = [
-    { kind: "code", text: "let helper: Int64 = 41" },
-    { kind: "code", text: "let answer: Int64 = helper + 1" },
-  ];
-  const { source: sessionSrc, windows: cellWindows } = nbSessionSource(nbCells);
-  // Any directory that exists is enough — a plain check with no data-provider
-  // reads never touches the file itself, "file" only anchors the per-request chdir.
+  // The exact request src/notebook.js's runNotebookCheck sends: the ordered
+  // code-cell sources in, one fast-tier check of the compiler's OWN assembled
+  // session source back, plus a `windows` entry per cell saying where that
+  // cell's text landed. Notebook checking has no fallback path anymore, so an
+  // "unknown cmd" here is a FAILURE, not a skip. The remap-fan-out LOGIC
+  // itself (windows -> per-cell payload) is covered hermetically, against
+  // canned payloads, in scripts/notebook-test.js — this only needs to show
+  // that the compiler's windows really do bracket the bindings it reports.
+  const nbCells = ["let helper: Int64 = 41", "let answer: Int64 = helper + 1"];
+  // Any directory that exists is enough — a check with no data-provider reads
+  // never touches the file itself, "file" only anchors the per-request chdir.
   const checkFile = path.join(__dirname, "..", "samples", "demo.blade");
-  const checkResp = await checkReq("fast", checkFile, sessionSrc, EVAL_TIMEOUT_MS);
-  check("session-source check echoes tier \"fast\"", checkResp.tier === "fast", JSON.stringify(checkResp).slice(0, 300));
+  const cellsResp = (await checkCellsReq("fast", checkFile, nbCells, EVAL_TIMEOUT_MS)) || {};
   check(
-    "session-source check has no diagnostics (cell 1 resolves cell 0's binding)",
-    (checkResp.diagnostics || []).length === 0,
-    JSON.stringify(checkResp.diagnostics)
+    "checkCells is supported (notebook checking requires it — no fallback)",
+    cellsResp.error === undefined,
+    JSON.stringify(cellsResp).slice(0, 300)
   );
-  const helperBinding = (checkResp.bindings || []).find((b) => b.name === "helper");
-  const answerBinding = (checkResp.bindings || []).find((b) => b.name === "answer");
-  check("concatenated check returns a binding for cell 0's 'helper'", !!helperBinding, JSON.stringify(checkResp.bindings));
-  check("concatenated check returns a binding for cell 1's 'answer'", !!answerBinding, JSON.stringify(checkResp.bindings));
+  check("checkCells echoes tier \"fast\"", cellsResp.tier === "fast", JSON.stringify(cellsResp).slice(0, 300));
   check(
-    "helper's reported line falls inside cell 0's sessionSource window",
-    !!helperBinding && helperBinding.line >= cellWindows[0].startLine && helperBinding.line <= cellWindows[0].endLine,
+    "checkCells has no diagnostics (cell 1 resolves cell 0's binding)",
+    (cellsResp.diagnostics || []).length === 0,
+    JSON.stringify(cellsResp.diagnostics)
+  );
+  const cellWindows = cellsResp.windows || [];
+  check("checkCells returns one window per input cell", cellWindows.length === nbCells.length, JSON.stringify(cellWindows));
+  const helperBinding = (cellsResp.bindings || []).find((b) => b.name === "helper");
+  const answerBinding = (cellsResp.bindings || []).find((b) => b.name === "answer");
+  check("checkCells returns a binding for cell 0's 'helper'", !!helperBinding, JSON.stringify(cellsResp.bindings));
+  check("checkCells returns a binding for cell 1's 'answer'", !!answerBinding, JSON.stringify(cellsResp.bindings));
+  check(
+    "helper's reported line falls inside cell 0's window",
+    !!helperBinding && !!cellWindows[0] && helperBinding.line >= cellWindows[0].startLine && helperBinding.line <= cellWindows[0].endLine,
     { helperBinding, window: cellWindows[0] }
   );
   check(
-    "answer's reported line falls inside cell 1's sessionSource window",
-    !!answerBinding && answerBinding.line >= cellWindows[1].startLine && answerBinding.line <= cellWindows[1].endLine,
+    "answer's reported line falls inside cell 1's window",
+    !!answerBinding && !!cellWindows[1] && answerBinding.line >= cellWindows[1].startLine && answerBinding.line <= cellWindows[1].endLine,
     { answerBinding, window: cellWindows[1] }
   );
 

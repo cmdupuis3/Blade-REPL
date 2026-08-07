@@ -331,111 +331,67 @@ async function testRestartClearsStateWithoutLiveClient() {
   _test.sessionStates.delete(key);
 }
 
-// --- 5. Session-aware IDE features (N3): sessionSource + rebind blanking ---
+// --- 5. Session-aware IDE features (N3): the checkCells remap contract ---
+//
+// Session assembly itself is the compiler's now (checkCells), so what is left
+// to pin on this side is the coordinate arithmetic over the `windows` array
+// it answers with: literal windows in, cell-local payloads out.
 
-function testSessionSourceOffsetsWithMarkdownInterleaved() {
-  const cells = [
-    { kind: "code", text: "let a = 1" },
-    { kind: "markdown", text: "# notes\nsome prose" },
-    { kind: "code", text: "let b = 2\nlet c = 3" },
+function testRemapUnshiftsWrappedLineColumns() {
+  // The windows a `checkCells` response carries for two cells whose second is
+  // a bare expression: cell 0 is a plain decl on line 1, cell 1 landed on
+  // line 2 wrapped in the compiler's synthetic `let __cell1 = `.
+  const prefixLen = "let __cell1 = ".length;
+  const windows = [
+    { startLine: 1, endLine: 1 },
+    { startLine: 2, endLine: 2, wrapLine: 2, wrapCol: prefixLen },
   ];
-  const { source, windows } = _test.sessionSource(cells);
+  const payload = {
+    diagnostics: [
+      // As the compiler reports it: against the WRAPPED line, cols shifted
+      // right by the prefix. `reduce(` is 7 chars, so `ys` starts at col 8
+      // cell-locally = col 8 + prefixLen in the assembled source.
+      { severity: "error", line: 2, col: 8 + prefixLen, endLine: 2, endCol: 10 + prefixLen, message: "Unbound variable: ys" },
+    ],
+    bindings: [
+      { name: "xs", line: 1, col: 5 },
+      { name: "__cell1", line: 2, col: 5 }, // the synthetic wrapper itself
+    ],
+    references: [{ name: "__cell1", kind: "value", def: { line: 2, col: 5, endLine: 2, endCol: 14 }, uses: [] }],
+    calls: [],
+    kernels: [{ line: 2, col: 1 + prefixLen }],
+    providers: [],
+  };
+  const cell1 = _test.remapPayloadForCell(payload, windows, 1);
   check(
-    "markdown cells contribute nothing to the concatenated source",
-    source === "let a = 1\nlet b = 2\nlet c = 3",
-    source
-  );
-  check("2 windows (one per code cell, markdown excluded)", windows.length === 2, windows);
-  check("window 0 starts at line 1, ends at line 1 (single-line cell)", windows[0].startLine === 1 && windows[0].endLine === 1, windows[0]);
-  check(
-    "window 1 starts right after window 0, spans its own 2 lines",
-    windows[1].startLine === 2 && windows[1].endLine === 3,
-    windows[1]
-  );
-}
-
-function testDeclaredNamesExtraction() {
-  const text = [
-    "let mut x = 1",
-    "function f() -> Int64 = 1",
-    "let rec g = h",
-    "type T = Int64",
-    "Unit Meter",
-    "let y = 2",
-  ].join("\n");
-  const names = _test.declaredNames(text);
-  check(
-    "declaredNames finds every decl form across multiple lines in one cell",
-    names.size === 6 && ["x", "f", "g", "T", "Meter", "y"].every((n) => names.has(n)),
-    Array.from(names)
-  );
-}
-
-function testDeclaredNamesEmptyForBareExpression() {
-  const names = _test.declaredNames("1 + 1\nprint(x)");
-  check("a cell with no top-level decls defines nothing", names.size === 0, Array.from(names));
-}
-
-function testRebindBlankingFullSupersedeBlanksWithEqualLineCount() {
-  const cells = [
-    { kind: "code", text: "let x = 1\nlet y = 2" }, // both x and y get redefined below
-    { kind: "code", text: "let x = 10\nlet y = 20" },
-  ];
-  const { source, windows } = _test.sessionSource(cells);
-  check(
-    "fully-superseded earlier cell becomes equal-count empty lines",
-    source === "\n\nlet x = 10\nlet y = 20",
-    source
+    "diagnostic columns on the wrapped line shift back to cell-local",
+    cell1.diagnostics.length === 1 && cell1.diagnostics[0].line === 1 && cell1.diagnostics[0].col === 8 && cell1.diagnostics[0].endCol === 10,
+    cell1.diagnostics
   );
   check(
-    "offsets stay stable (line COUNT unchanged by blanking)",
-    windows[0].startLine === 1 && windows[0].endLine === 2 && windows[1].startLine === 3 && windows[1].endLine === 4,
-    windows
+    "the synthetic __cell binding never reaches any cell's payload",
+    !cell1.bindings.some((b) => /^__cell\d+$/.test(b.name)),
+    cell1.bindings
+  );
+  check(
+    "the synthetic __cell reference entry is filtered too",
+    cell1.references.length === 0,
+    cell1.references
+  );
+  check(
+    "kernel point spans on the wrapped line unshift as well",
+    cell1.kernels.length === 1 && cell1.kernels[0].col === 1,
+    cell1.kernels
+  );
+  const cell0 = _test.remapPayloadForCell(payload, windows, 0);
+  check(
+    "the synthetic binding is not offered as a foreign binding in other cells either",
+    !cell0.bindings.some((b) => /^__cell\d+$/.test(b.name)),
+    cell0.bindings
   );
 }
 
-function testRebindBlankingPartialSupersedeLeavesBothIntact() {
-  const cells = [
-    { kind: "code", text: "let x = 1\nlet y = 2" }, // only x gets redefined; y never does
-    { kind: "code", text: "let x = 10" },
-  ];
-  const { source } = _test.sessionSource(cells);
-  check(
-    "partially-superseded earlier cell is left intact — both cells' text survive",
-    source === "let x = 1\nlet y = 2\nlet x = 10",
-    source
-  );
-}
-
-function testRebindBlankingSpreadAcrossMultipleLaterCells() {
-  // Cell 0 defines {x, y}; neither later cell alone redefines both, but
-  // together every name IS redefined — cell 0 must still be blanked (the
-  // plan: "not necessarily the same later cell for every name").
-  const cells = [
-    { kind: "code", text: "let x = 1\nlet y = 2" },
-    { kind: "code", text: "let x = 10" },
-    { kind: "code", text: "let y = 20" },
-  ];
-  const { source } = _test.sessionSource(cells);
-  check(
-    "supersede spread across two different later cells still blanks cell 0",
-    source === "\n\nlet x = 10\nlet y = 20",
-    source
-  );
-}
-
-function testDeclaredNamesCellNeverBlankedWhenEmpty() {
-  // A bare-expression cell defines nothing, so it can never be "fully
-  // superseded" — it must never be vacuously blanked.
-  const cells = [
-    { kind: "code", text: "1 + 1" },
-    { kind: "code", text: "2 + 2" },
-  ];
-  const { source } = _test.sessionSource(cells);
-  check("a cell defining nothing is never blanked", source === "1 + 1\n2 + 2", source);
-}
-
-// --- 6. Remap fan-out: canned concatenated payload, two cells --------------
+// --- 6. Remap fan-out: canned checkCells payload, two cells ----------------
 
 function testRemapFanOut() {
   // cell0 window [1,2] defines `helper`; cell1 window [3,4] uses it and
@@ -561,13 +517,7 @@ function testRemapFanOut() {
   await testWarningDiagnosticsOnKept();
   await testStderrOutput();
 
-  testSessionSourceOffsetsWithMarkdownInterleaved();
-  testDeclaredNamesExtraction();
-  testDeclaredNamesEmptyForBareExpression();
-  testRebindBlankingFullSupersedeBlanksWithEqualLineCount();
-  testRebindBlankingPartialSupersedeLeavesBothIntact();
-  testRebindBlankingSpreadAcrossMultipleLaterCells();
-  testDeclaredNamesCellNeverBlankedWhenEmpty();
+  testRemapUnshiftsWrappedLineColumns();
   testRemapFanOut();
 
   testInterruptMarksReplay();

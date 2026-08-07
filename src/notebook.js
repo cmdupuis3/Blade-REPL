@@ -438,7 +438,7 @@ async function resetNotebookSession(notebookDoc) {
   state.needsReplay = false;
 }
 
-// --- Session-aware IDE features (N3): concatenated fast check + fan-out ----
+// --- Session-aware IDE features (N3): compiler-assembled check + fan-out ---
 //
 // Hovers/completions/signature help/lenses already FIRE inside cells —
 // every provider in extension.js is registered against `{language:"blade"}`,
@@ -450,115 +450,57 @@ async function resetNotebookSession(notebookDoc) {
 // "file"`, and that gate is left alone (see the module header) — this
 // section drives cell checking itself instead.
 //
-// One concatenated fast check per notebook edit (sessionSource below), fanned
+// One `checkCells` request per notebook edit (runNotebookCheck below), fanned
 // out per code cell (remapPayloadForCell below) through applyCheckPayload
 // (injected via init()'s deps). Deliberately the DEFAULT serve singleton
-// (serve.check), NOT a notebook's own dedicated eval client (clientFor/
+// (serve.checkCells), NOT a notebook's own dedicated eval client (clientFor/
 // clients above): checks are stateless per request — there is no session to
 // keep separate — and routing them through the dedicated client would
 // serialize typing-time checks behind whatever multi-second g++ eval that
 // client happens to be running, exactly the stall the dedicated client
 // exists to avoid (see the module header and the plan's risk section).
 
-/** Top-level names one code cell's raw text (re)defines, scanned line-by-
- *  line — a NOTEBOOK CELL may hold several `let`/`function`/`type`/`Unit`
- *  declarations, unlike a single REPL submission (the compiler's own
- *  ReplSession.bindingName, src/ReplSession.fs, only ever looks at a
- *  snippet's first line because a REPL submission is always one
- *  declaration). Matches `let [mut|static|rec] NAME`, `function NAME`,
- *  `type NAME`, `Unit NAME`. A best-effort textual heuristic — it can be
- *  fooled by a name-shaped token inside a comment or string — accepted for
- *  v1 exactly like scanDecls' scanning in extension.js. */
-const DECL_NAME_RE = /^\s*(?:let\s+(?:mut\s+|static\s+|rec\s+)?|function\s+|type\s+|Unit\s+)([A-Za-z_]\w*)/;
-function declaredNames(text) {
-  const names = new Set();
-  for (const line of text.split(/\r?\n/)) {
-    const m = DECL_NAME_RE.exec(line);
-    if (m) names.add(m[1]);
-  }
-  return names;
-}
+// ASSEMBLY IS THE COMPILER'S JOB. `checkCells` carries the ordered code-cell
+// sources and the compiler splices them into one session source itself
+// (ReplSession.assembleCells — the same rebind-in-place and bare-expression
+// wrapping its eval path already performs), so a cell's hover shows the type
+// running the notebook would actually produce. This module used to
+// reimplement those rules textually over cell text; the copy drifted from the
+// engine it was imitating and reported wrong types, so it is gone with no
+// fallback — a compiler that doesn't know `checkCells` answers with the
+// generic protocol error and its notebooks simply get no checking.
+//
+// The response is an ordinary check payload plus `windows`: one entry per
+// INPUT cell, in input order, `{startLine, endLine}` (1-based, inclusive —
+// the payload's own line convention) naming the region of the assembled
+// source that cell's text landed in. `{wrapLine, wrapCol}` appear only when
+// the compiler wrapped that cell in a synthetic binding (absolute line /
+// prefix length, so shiftSpan can pull the wrapped line's columns back to
+// cell-local); a cell whose definition a later cell superseded gets a
+// one-line BLANK range — its own text is not in the assembly at all, so no
+// span can land inside it and nothing fans out, while it still occupies a
+// distinct line so no two cells' windows ever overlap. Everything below consumes
+// only that array: pure coordinate arithmetic, no knowledge of how the
+// compiler arrived at the layout.
 
-/**
- * Build ONE concatenated "session source" covering every code cell in a
- * notebook for a single fast check, plus the per-cell coordinate windows a
- * response against it needs for remapPayloadForCell.
- *
- * `cells`: `[{kind: "code"|"markdown", text}]` in notebook order — a caller
- * gets this by mapping `vscode.NotebookCell[]` (kind, `.document.getText()`)
- * — kept vscode-free here so this stays a pure, hermetically testable
- * function (see the module header's PURE-core/adapter split; parseCells is
- * this function's sibling).
- *
- * Markdown cells contribute NOTHING — no source text, no window entry.
- *
- * REBIND BLANKING mirrors the REPL's rebind-in-place splice (Cli.replLoop /
- * ReplSession.fs): when EVERY name an earlier code cell defines
- * (declaredNames) is redefined by SOME later code cell — not necessarily the
- * SAME later cell for every name, and not necessarily all in one cell — that
- * earlier cell's text is replaced with an EQUAL COUNT of empty lines before
- * joining. Offsets stay stable, the compiler's own duplicate-definition
- * diagnostics for that name vanish, and the later redefinition is what the
- * concatenated check actually sees — matching what eval-order execution
- * would have done. A cell that defines NOTHING is never blanked: an empty
- * declared-name set can't be "every name redefined", which would otherwise
- * vacuously blank every plain-expression cell.
- *
- * When only SOME of an earlier cell's names are redefined later, BOTH cells
- * are left intact and the compiler's own duplicate-definition diagnostics
- * fire on the earlier cell — correct-looking for the name(s) still only
- * defined there, spurious-looking for the one that got redefined.
- *
- * KNOWN LIMITATION (documented, not fixed — see the plan): a genuinely EARLY
- * use of a name whose only SURVIVING definition comes from a LATER cell
- * reads as unbound in this top-to-bottom static concatenation, even though
- * out-of-order REPL execution made it valid at eval time — static checking
- * only ever sees source order, never the actual eval order a user ran cells
- * in.
- *
- * Returns `{ source, windows }`: `windows[i]` = `{startLine, endLine}`
- * (1-based, inclusive — the compiler payload's own line convention) for the
- * i-th CODE cell; `windows.length` === the number of code cells, so zipping
- * it against `cells.filter(c => c.kind === "code")` (or the matching
- * `vscode.NotebookCell[]`, built the same way) lines each window up with its
- * cell.
- */
-function sessionSource(cells) {
-  const codeCells = cells.filter((c) => c.kind === "code");
-  const declsByCell = codeCells.map((c) => declaredNames(c.text));
-  const blanked = declsByCell.map((names, i) => {
-    if (names.size === 0) return false;
-    for (const n of names) {
-      const redefinedLater = declsByCell.some((later, j) => j > i && later.has(n));
-      if (!redefinedLater) return false;
-    }
-    return true;
-  });
-
-  const parts = codeCells.map((c, i) => {
-    if (!blanked[i]) return c.text;
-    const lineCount = c.text.split(/\r?\n/).length;
-    return new Array(lineCount).fill("").join("\n");
-  });
-
-  const windows = [];
-  let line = 1; // 1-based, matching the compiler payload's own convention
-  for (const text of parts) {
-    const lineCount = text.split(/\r?\n/).length;
-    windows.push({ startLine: line, endLine: line + lineCount - 1 });
-    line += lineCount;
-  }
-
-  return { source: parts.join("\n"), windows };
-}
+/** The compiler's synthetic wrapper binding for a bare-expression cell
+ *  (`let __cellK = `, k = the 0-based cell index) — an implementation detail
+ *  of the assembly, never a hover/completion/lens candidate. */
+const SYNTHETIC_NAME_RE = /^__cell\d+$/;
 
 /** Shift a span's `line`/`endLine` (whichever are present) into `win`'s
  *  cell-local coordinate system — `win.startLine` (1-based, inclusive)
- *  becomes local line 1. Every other field (col/endCol/severity/message/
- *  name/args/ret/params/deducedComm/...) passes through unchanged: columns
- *  are untouched by cell splicing, only line numbers move. */
+ *  becomes local line 1. Columns are untouched by cell splicing EXCEPT on a
+ *  wrapped cell's `win.wrapLine` (the line the compiler prepended a synthetic
+ *  `let __cellK = ` to — see the windows contract above), where they shift
+ *  back by `win.wrapCol`. Every other field (severity/message/name/args/ret/params/
+ *  deducedComm/...) passes through unchanged. */
 function shiftSpan(span, win) {
   const out = Object.assign({}, span);
+  if (win.wrapLine !== undefined) {
+    if (out.line === win.wrapLine && out.col !== undefined) out.col = Math.max(1, out.col - win.wrapCol);
+    if (out.endLine === win.wrapLine && out.endCol !== undefined) out.endCol = Math.max(1, out.endCol - win.wrapCol);
+  }
   if (out.line !== undefined) out.line = out.line - win.startLine + 1;
   if (out.endLine !== undefined) out.endLine = out.endLine - win.startLine + 1;
   return out;
@@ -579,14 +521,17 @@ function spanFullyInWindow(win, span) {
 }
 
 /**
- * Remap ONE concatenated fast-check response (against sessionSource's
- * `source`) to `windows[cellIndex]`'s cell-local coordinates — the fan-out
- * step: `applyCheckPayload(cellDoc, remapPayloadForCell(payload, windows,
- * i))` is what actually lights up hovers/completions/diagnostics/lenses in a
- * cell, because every provider in extension.js reads the per-doc caches that
- * call fills.
+ * Remap ONE `checkCells` response to `windows[cellIndex]`'s cell-local
+ * coordinates — the fan-out step: `applyCheckPayload(cellDoc,
+ * remapPayloadForCell(payload, windows, i))` is what actually lights up
+ * hovers/completions/diagnostics/lenses in a cell, because every provider in
+ * extension.js reads the per-doc caches that call fills.
  *
  * Per-field rules (the plan's frozen remap contract):
+ *  - every shifted span: on a WRAPPED cell (the compiler's synthetic
+ *    `let __cellK = ` prefix), columns on the wrapped line shift back by
+ *    the prefix length (shiftSpan); `__cellK` bindings/references are
+ *    filtered out entirely — the wrapper is an implementation detail.
  *  - diagnostics: kept only when FULLY inside the window, line/endLine shifted.
  *  - bindings: def line INSIDE the window -> kept, shifted. Def line from an
  *    EARLIER cell -> kept but CLAMPED to `{line:1, col:1}` and tagged
@@ -618,6 +563,10 @@ function remapPayloadForCell(payload, windows, cellIndex) {
 
   const bindings = [];
   for (const b of payload.bindings || []) {
+    // A synthetic `__cellK` wrapper binding (the compiler's bare-expression
+    // wrap) is an implementation detail — never a hover/completion/lens
+    // candidate in ANY cell.
+    if (b.name && SYNTHETIC_NAME_RE.test(b.name)) continue;
     const line = b.line || 1;
     if (lineInWindow(win, line)) {
       bindings.push(shiftSpan(b, win));
@@ -627,9 +576,11 @@ function remapPayloadForCell(payload, windows, cellIndex) {
     // line > win.endLine (a later cell): not yet in scope top-to-bottom — dropped.
   }
 
+  const notSynthetic = (e) => !(e.name && SYNTHETIC_NAME_RE.test(e.name));
+
   const referenceFullyInWindow = (e) =>
     e.def && spanFullyInWindow(win, e.def) && (e.uses || []).every((u) => spanFullyInWindow(win, u));
-  const references = (payload.references || []).filter(referenceFullyInWindow).map((e) =>
+  const references = (payload.references || []).filter(notSynthetic).filter(referenceFullyInWindow).map((e) =>
     Object.assign({}, e, {
       def: shiftSpan(e.def, win),
       uses: (e.uses || []).map((u) => shiftSpan(u, win)),
@@ -679,22 +630,15 @@ function fileForCheckSource(notebookDoc) {
   return path.join(folders[0].uri.fsPath, "untitled.blade");
 }
 
-/** Every OPEN cell of `notebookDoc`, in notebook order, as sessionSource's
- *  pure `{kind, text}` shape. */
-function cellsForSource(notebookDoc) {
-  return notebookDoc.getCells().map((c) => ({
-    kind: c.kind === vscode.NotebookCellKind.Code ? "code" : "markdown",
-    text: c.document.getText(),
-  }));
-}
-
 /**
- * Run one concatenated fast check for `notebookDoc` and fan its response out
- * to every code cell via applyCheckPayload. Version-guarded like
- * extension.js's checkDocument: if ANY code cell's document changed while
- * the request was in flight, the WHOLE response is dropped (it no longer
- * describes what's on screen) — the debounce that triggered this call will
- * fire again for whatever edit invalidated it.
+ * Run one fast `checkCells` for `notebookDoc` — every code cell's source, in
+ * notebook order, assembled and checked compiler-side — and fan the response
+ * out to those same cells via applyCheckPayload, using the `windows` it
+ * answers with. Version-guarded like extension.js's checkDocument: if ANY
+ * code cell's document changed while the request was in flight, the WHOLE
+ * response is dropped (it no longer describes what's on screen) — the
+ * debounce that triggered this call will fire again for whatever edit
+ * invalidated it.
  */
 async function runNotebookCheck(notebookDoc) {
   if (serve.available() === "no") return;
@@ -705,21 +649,28 @@ async function runNotebookCheck(notebookDoc) {
   if (!file) return; // untitled notebook, no workspace to anchor a synthetic path — skip
 
   const versions = codeCells.map((c) => c.document.version);
-  const { source, windows } = sessionSource(cellsForSource(notebookDoc));
+  const sources = codeCells.map((c) => c.document.getText());
 
   let payload;
   try {
-    payload = await serve.check(file, source, "fast");
+    payload = await serve.checkCells(file, sources, "fast");
   } catch (_) {
-    // Best-effort: extension.js's own fast/full clocks already surface
-    // serve-availability problems in the output channel; no need to repeat
-    // that here for every open notebook too.
+    // Best-effort, and this is also where an old compiler lands: it answers
+    // `{"error": "unknown cmd 'checkCells'"}`, serve.js rejects with
+    // protocolError, and the notebook goes unchecked. extension.js's own
+    // fast/full clocks already surface serve-availability problems in the
+    // output channel; no need to repeat that here for every open notebook.
     return;
   }
   if (codeCells.some((c, i) => c.document.version !== versions[i])) return;
+  // No windows = nothing says where any cell's text landed, so there is no
+  // honest fan-out to do (a compiler answering `check`-shaped payloads to
+  // `checkCells` would otherwise remap every span against garbage).
+  const windows = payload && payload.windows;
+  if (!Array.isArray(windows)) return;
 
   codeCells.forEach((cell, i) => {
-    deps.applyCheckPayload(cell.document, remapPayloadForCell(payload, windows, i));
+    if (windows[i]) deps.applyCheckPayload(cell.document, remapPayloadForCell(payload, windows, i));
   });
 }
 
@@ -756,8 +707,8 @@ function findOwningNotebookAndCell(doc) {
 /** onDidChangeTextDocument handler for notebook CELL documents specifically
  *  — extension.js's own handler ignores these (checkDocument gates on
  *  `scheme !== "file"`). Markdown cells (languageId "markdown", never
- *  "blade") are excluded by the languageId check alone; sessionSource
- *  wouldn't have included their text anyway. */
+ *  "blade") are excluded by the languageId check alone; the `checkCells`
+ *  request wouldn't have carried their text anyway. */
 function onCellDocumentChanged(doc) {
   if (doc.uri.scheme !== "vscode-notebook-cell" || doc.languageId !== "blade") return;
   const hit = findOwningNotebookAndCell(doc);
@@ -826,9 +777,9 @@ function init(context, dependencies) {
     vscode.commands.registerCommand("blade.notebookRestart", commandRestart),
     vscode.workspace.onDidCloseNotebookDocument(cleanupNotebook),
     // N3: session-aware IDE features. "once when a notebook opens" (see
-    // sessionSource's caller, runNotebookCheck) plus every subsequent code
-    // cell edit (onCellDocumentChanged) — both funnel through the same
-    // debounced scheduleNotebookCheck.
+    // runNotebookCheck) plus every subsequent code cell edit
+    // (onCellDocumentChanged) — both funnel through the same debounced
+    // scheduleNotebookCheck.
     vscode.workspace.onDidOpenNotebookDocument((nb) => {
       if (nb.notebookType === NOTEBOOK_TYPE) scheduleNotebookCheck(nb);
     }),
@@ -880,14 +831,11 @@ module.exports._test = {
   commandOpenAsNotebook,
   commandRestart,
   // Session-aware IDE features (N3).
-  declaredNames,
-  sessionSource,
   shiftSpan,
   lineInWindow,
   spanFullyInWindow,
   remapPayloadForCell,
   fileForCheckSource,
-  cellsForSource,
   runNotebookCheck,
   scheduleNotebookCheck,
   findOwningNotebookAndCell,

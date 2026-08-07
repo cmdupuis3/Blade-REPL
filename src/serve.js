@@ -64,7 +64,7 @@ function workspaceRoot() {
  * "Blade" output channel, so a second client (e.g. the notebook's dedicated
  * process) doesn't read as the same process in the log.
  *
- * Returns `{ available, check, eval, resetSession, dispose }` — see the
+ * Returns `{ available, check, checkCells, eval, resetSession, dispose }` — see the
  * matching functions below for behavior; every doc comment that used to live
  * on the bare module-level function now applies here verbatim, the only
  * change is that all mutable state (proc, pending requests, availability
@@ -345,6 +345,35 @@ function createClient(dependencies, label) {
   }
 
   /**
+   * Check a whole notebook at `tier`: `cells` is the ordered source text of
+   * every CODE cell, and the COMPILER assembles them into one session source
+   * (rebind-in-place, bare-expression wrapping — ReplSession.assembleCells)
+   * before checking it. Stateless, exactly like check(): the entire notebook
+   * travels in the request, nothing is remembered between them.
+   *
+   * Resolves with a normal check payload PLUS `windows` — one
+   * `{startLine, endLine[, wrapLine, wrapCol]}` per input cell, in input
+   * order, naming where that cell's text landed in the assembled source
+   * (src/notebook.js's remapPayloadForCell consumes it). Rejects like eval():
+   * `err.protocolError === true` means the process answered LIVE but doesn't
+   * know "checkCells" (a compiler predating notebook checking); anything else
+   * is a transport failure.
+   * @param {string} fileName absolute path the compiler chdirs to the
+   *   directory of, same role as check()'s
+   * @param {string[]} cells code-cell sources in notebook order
+   * @param {"fast"|"full"} tier
+   * @param {number} [timeoutMs] default 10s (fast) / 30s (full)
+   */
+  function checkCells(fileName, cells, tier, timeoutMs) {
+    const t = tier === "full" ? "full" : "fast";
+    const ms = timeoutMs || DEFAULT_TIMEOUT_MS[t];
+    return ensureReady().then(() => {
+      if (!proc) throw new Error("blade ide serve unavailable");
+      return sendRequest((id) => proto.encodeCheckCells(id, t, fileName, cells), ms);
+    });
+  }
+
+  /**
    * Evaluate `source` as the next submission in REPL session `session`
    * (created on first use; append or rebind-in-place by top-level name —
    * same semantics as one `blade repl` submission). Lazily spawns and pings
@@ -411,7 +440,7 @@ function createClient(dependencies, label) {
     handshake = null;
   }
 
-  return { available, check, eval: evalCode, resetSession, dispose };
+  return { available, check, checkCells, eval: evalCode, resetSession, dispose };
 }
 
 // --- Default singleton (extension.js's fast/slow check clocks) --------------
@@ -442,4 +471,13 @@ function check(fileName, source, tier, timeoutMs) {
   return defaultClient.check(fileName, source, tier, timeoutMs);
 }
 
-module.exports = { init, available, check, dispose, createClient };
+/** Notebook checking rides the DEFAULT client too (src/notebook.js's
+ *  runNotebookCheck): it is a stateless check like any other, and keeping it
+ *  off a notebook's dedicated eval process is the whole point — see the
+ *  module header. */
+function checkCells(fileName, cells, tier, timeoutMs) {
+  if (!defaultClient) return Promise.reject(new Error("blade ide serve: init() not called"));
+  return defaultClient.checkCells(fileName, cells, tier, timeoutMs);
+}
+
+module.exports = { init, available, check, checkCells, dispose, createClient };

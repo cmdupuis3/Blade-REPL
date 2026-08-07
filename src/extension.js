@@ -822,7 +822,7 @@ function orbIdxDetail(text) {
   const extent = parts[1];
 
   // A rank-1 level is the trivial group and drops at either sign; the empty
-  // class is `Idx<n>` and a single survivor is the exact Sym/Antisym record.
+  // class is `Idx<N>` and a single survivor is the exact Sym/Antisym record.
   const kept = levels.filter((l) => l.rank !== 1);
   const lines = [];
   if (kept.length === 0) lines.push(`normalizes to  Idx<${extent}>`);
@@ -2637,10 +2637,10 @@ function activate(context) {
   context.subscriptions.push(diagnostics, output);
   repl.init(context, { findCompiler, reportNoCompiler });
   serve.init(context, { findCompiler, output });
-  // applyCheckPayload is passed through so notebook.js's own concatenated-
-  // session fast check (N3) can fan its remapped response out to each cell's
-  // caches without notebook.js requiring this module back (that would be a
-  // require cycle — extension.js already requires notebook.js).
+  // applyCheckPayload is passed through so notebook.js's own per-notebook
+  // `checkCells` fast check (N3) can fan its remapped response out to each
+  // cell's caches without notebook.js requiring this module back (that would
+  // be a require cycle — extension.js already requires notebook.js).
   notebook.init(context, { findCompiler, output, applyCheckPayload });
 
   const cfg = () => vscode.workspace.getConfiguration("blade");

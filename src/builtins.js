@@ -23,10 +23,20 @@
 // (polymorphic) element/result types are written as abstract type variables
 // — OCaml-style but without the apostrophe, drawn in order from T, U, V, W,
 // X, Y, Z — so a reduction kernel reads `U -> T -> U` (accumulator U,
-// element T). A function type is an "arrow" (domain -> codomain), written as
-// a plain ML-style curried arrow — `T -> U`, never `lambda(T) -> U` (the
-// wrapper is redundant; `lambda(x) -> expr` appears only where an argument
-// must syntactically BE a lambda literal, e.g. dist_map). Arrays are the
+// element T). Polymorphic EXTENTS get their own uppercase pool, drawn N, M,
+// P, Q: a lone extent is `Idx<N>`, a pair is `Idx<M>, Idx<N>` in that order
+// (an M x N matrix), then P and Q. Uppercase means extent; every other
+// type-level Nat stays lowercase — rank `r` in `SymIdx<r, N>`, loop arity `n`
+// in `MethodLoop<n>`, tower order `r`/`q` — so a signature says which is
+// which at a glance. An extent that is DERIVED rather than free keeps its
+// meaningful name and the formula defining it (`Idx<wdim>` with `wdim =
+// ml.hom_dim(...)`, `Idx<count>`, `Idx<n0>`), since the name carries more
+// than a letter would.
+//
+// A function type is an "arrow" (domain -> codomain), written as a plain
+// ML-style curried arrow — `T -> U`, never `lambda(T) -> U` (the wrapper is
+// redundant; `lambda(x) -> expr` appears only where an argument must
+// syntactically BE a lambda literal, e.g. dist_map). Arrays are the
 // other kind of arrow, written `Array<T like ...>`. (Types the compiler
 // reports are normalized the same way at display time — see typeNormalizer
 // in extension.js.)
@@ -147,16 +157,16 @@ const identifiers = {
     params: [
       { name: "a, ...", type: "(Idx... -> T)...", doc: "same-shaped arrays to stack" },
     ],
-    ret: "Idx<n> -> Idx... -> T",
+    ret: "Idx<N> -> Idx... -> T",
   },
   sort: {
     category: "core",
     doc: "Sorts a rank-1 array (stable, ascending by key). Rearrangement combinator; forces deferred inputs.",
     params: [
-      { name: "array", type: "Idx<n> -> T", doc: "Rank-1 array of values to sort" },
+      { name: "array", type: "Idx<N> -> T", doc: "Rank-1 array of values to sort" },
       { name: "key", type: "T -> U  (optional)", doc: "Sort key; defaults to the element itself" },
     ],
-    ret: "Idx<n> -> T",
+    ret: "Idx<N> -> T",
   },
   unique: {
     category: "core",
@@ -164,7 +174,7 @@ const identifiers = {
     params: [
       { name: "array", type: "Idx... -> T", doc: "source values" },
     ],
-    ret: "Idx<u> -> T  (fresh dynamic-extent axis)",
+    ret: "Idx<N> -> T  (fresh dynamic-extent axis)",
   },
   intersect: {
     category: "core",
@@ -173,7 +183,7 @@ const identifiers = {
       { name: "a", type: "Idx... -> T", doc: "left operand" },
       { name: "b", type: "Idx... -> T", doc: "right operand" },
     ],
-    ret: "Idx<u> -> T  (fresh dynamic-extent axis)",
+    ret: "Idx<N> -> T  (fresh dynamic-extent axis)",
   },
   union: {
     category: "core",
@@ -182,7 +192,7 @@ const identifiers = {
       { name: "a", type: "Idx... -> T", doc: "left operand" },
       { name: "b", type: "Idx... -> T", doc: "right operand" },
     ],
-    ret: "Idx<u> -> T  (fresh dynamic-extent axis)",
+    ret: "Idx<N> -> T  (fresh dynamic-extent axis)",
   },
   contains: {
     category: "core",
@@ -224,19 +234,19 @@ const identifiers = {
     category: "core",
     doc: "Expands a compacted dimension (e.g., SymIdx/AntisymIdx storage) into a dense form. Forces materialization.",
     params: [
-      { name: "array", type: "Array<T like CompactIdx<r, n>, ...>", doc: "Compacted array (any compact index type allowed)" },
+      { name: "array", type: "Array<T like CompactIdx<r, N>, ...>", doc: "Compacted array (any compact index type allowed)" },
       { name: "dim", type: "Int", doc: "which compacted dimension to expand" },
     ],
-    ret: "Array<T like Idx<n>, ..., Idx<n>>",
+    ret: "Array<T like Idx<N>, ..., Idx<N>>",
   },
   gram: {
     category: "core",
     doc: "Gram product gram(A, B) = A * B^H: result[i, j] = sum_k A[i, k] * conj(B[j, k]) over the shared trailing axis (complex element iff either operand is complex). gram(A) — or B syntactically the same array — yields the square symmetric (real) / Hermitian (complex) form, packed triangular.",
     params: [
-      { name: "a", type: "Array<T like Idx<m>, Idx<n>>", doc: "left factor (rank 2)" },
-      { name: "b", type: "Array<T like Idx<p>, Idx<n>>  (optional)", doc: "right factor sharing the trailing axis; defaults to `a`" },
+      { name: "a", type: "Array<T like Idx<M>, Idx<N>>", doc: "left factor (rank 2)" },
+      { name: "b", type: "Array<T like Idx<P>, Idx<N>>  (optional)", doc: "right factor sharing the trailing axis; defaults to `a`" },
     ],
-    ret: "| Idx<m> -> Idx<p> -> T (A =/= B)  \n| SymIdx<2, m> -> T (A == B, real-valued) \n| HermitianIdx<m> -> T (A == B, complex-valued)",
+    ret: "| Idx<M> -> Idx<P> -> T (A =/= B)  \n| SymIdx<2, M> -> T (A == B, real-valued) \n| HermitianIdx<M> -> T (A == B, complex-valued)",
   },
   replicate: {
     category: "core",
@@ -249,11 +259,11 @@ const identifiers = {
   },
   sequence: {
     category: "core",
-    doc: "Assembles same-typed expressions into an array along a fresh leading Idx<n> axis.",
+    doc: "Assembles same-typed expressions into an array along a fresh leading Idx<N> axis.",
     params: [
       { name: "e, ...", type: "T", doc: "expressions, evaluated left to right" },
     ],
-    ret: "Idx<n> -> T",
+    ret: "Idx<N> -> T",
   },
   extents: {
     category: "core",
@@ -284,9 +294,9 @@ const identifiers = {
     category: "core",
     doc: "Conjugate transpose (adjoint) A^H — sugar for conj(transpose(A, 0, 1)). The name is the operation, not the property: the result is a plain dense array, NOT a Hermitian-typed matrix (that producer is gram on a complex array).",
     params: [
-      { name: "array", type: "Array<Complex128, Idx<m>, Idx<n>>", doc: "complex matrix (rank 2)" },
+      { name: "array", type: "Array<Complex128, Idx<M>, Idx<N>>", doc: "complex matrix (rank 2)" },
     ],
-    ret: "Array<Complex128, Idx<n>, Idx<m>>",
+    ret: "Array<Complex128, Idx<N>, Idx<M>>",
   },
   guard: {
     category: "core",
@@ -341,7 +351,7 @@ const identifiers = {
     category: "core",
     doc: "Fused fiber product-sum: sums the elementwise product of k equal-extent rank-1 arrays (the k-fold generalized dot product) in one pass. The kernel the PPL moment formers are built from.",
     params: [
-      { name: "x1..xk", type: "Array<Float, Idx<n>>", doc: "equal-extent rank-1 factors" },
+      { name: "x1..xk", type: "Array<Float, Idx<N>>", doc: "equal-extent rank-1 factors" },
     ],
     ret: "Float64",
   },
@@ -479,7 +489,7 @@ const PPL_FORMERS = {
       { name: "X", type: "Array<Float, ..., SampleIdx>", doc: "annotated module-level sample array" },
       { name: "k_or_Y", type: "2 | Array<Float, ..., SampleIdx>", doc: "the static order 2 (same-array), or a second array (cross block)" },
     ],
-    ret: "Array<Float, SymIdx<2, d>> | Array<Float, Idx<d1>, Idx<d2>>  (same-array / cross block)",
+    ret: "Array<Float, SymIdx<2, N>> | Array<Float, Idx<M>, Idx<N>>  (same-array / cross block)",
   },
   cumulants: {
     doc: "Cumulant tower kappa_1..kappa_r of a sample array (Möbius inversion over set partitions).",
@@ -510,14 +520,14 @@ const PPL_FORMERS = {
   comoments_merge: {
     doc: "Merges two data chunks' pair comoments into the whole-data covariance: takes each chunk's comoments, means, and static size.",
     params: [
-      { name: "cA", type: "Array<Float, SymIdx<2, d>>", doc: "pair comoments of the first chunk (a module-level comoments binding, by name)" },
-      { name: "mA", type: "Array<Float, Idx<d>>", doc: "per-variable means of the first chunk (by name)" },
+      { name: "cA", type: "Array<Float, SymIdx<2, N>>", doc: "pair comoments of the first chunk (a module-level comoments binding, by name)" },
+      { name: "mA", type: "Array<Float, Idx<N>>", doc: "per-variable means of the first chunk (by name)" },
       { name: "nA", type: "Int (static)", doc: "first chunk's sample count, >= 1" },
-      { name: "cB", type: "Array<Float, SymIdx<2, d>>", doc: "pair comoments of the second chunk (by name)" },
-      { name: "mB", type: "Array<Float, Idx<d>>", doc: "per-variable means of the second chunk (by name)" },
+      { name: "cB", type: "Array<Float, SymIdx<2, N>>", doc: "pair comoments of the second chunk (by name)" },
+      { name: "mB", type: "Array<Float, Idx<N>>", doc: "per-variable means of the second chunk (by name)" },
       { name: "nB", type: "Int (static)", doc: "second chunk's sample count, >= 1" },
     ],
-    ret: "Array<Float, SymIdx<2, d>>  (merged pair comoments)",
+    ret: "Array<Float, SymIdx<2, N>>  (merged pair comoments)",
   },
   dist: {
     doc: "Constructs a Dist cumulant tower from a sample array: carries kappa_1..kappa_r over the variable axes. Project with ppl.cumulant(d, k); combine with +, scalar *, dist_add, dist_scale under declared independence.",
@@ -544,9 +554,9 @@ const PPL_FORMERS = {
     ret: "Dist",
   },
   dist_affine: {
-    doc: "Affine pushforward of a dist through a static m×n matrix W (an annotated module-level Array<Elem like Idx<m>, Idx<n>>): returns the pushed-forward cumulant arrays for tuple-destructuring.",
+    doc: "Affine pushforward of a dist through a static M×N matrix W (an annotated module-level Array<Elem like Idx<M>, Idx<N>>): returns the pushed-forward cumulant arrays for tuple-destructuring.",
     params: [
-      { name: "W", type: "Array<Float like Idx<m>, Idx<n>>", doc: "annotated module-level matrix, extents static" },
+      { name: "W", type: "Array<Float like Idx<M>, Idx<N>>", doc: "annotated module-level matrix, extents static" },
       { name: "d", type: "Dist", doc: "previously declared dist binding" },
     ],
     ret: "(h1, h2, ...) pushed cumulant arrays",
@@ -950,12 +960,12 @@ identifiers.rand = {
 identifiers.spectra = {
   category: "module",
   sig: "import spectra as sp",
-  doc: "Spectral-analysis module. Surface (qualified through the import's alias): fft(x) — unnormalized forward DFT of a real signal, Array<Complex128 like Idx<n>>; ifft(X) — real inverse synthesis of a complex spectrum (carries the 1/n); fft2(x) / ifft2(X) — the rank-2 field forms; power(x) — |FFT(x)|^2 per bin (real); polyspec(x1, ..., xk) — order-k cross-polyspectrum, k = the call-site arity, 2..4 (2 cross-power, 3 bispectrum, 4 trispectrum). Ops read the DECLARED shape (the pass runs before type inference), so an array argument must carry an annotation: an annotated let or parameter, a call of a function with an annotated array return type, or an ascription `(expr : Array<...>)`.",
+  doc: "Spectral-analysis module. Surface (qualified through the import's alias): fft(x) — unnormalized forward DFT of a real signal, Array<Complex128 like Idx<N>>; ifft(X) — real inverse synthesis of a complex spectrum (carries the 1/N); fft2(x) / ifft2(X) — the rank-2 field forms; power(x) — |FFT(x)|^2 per bin (real); polyspec(x1, ..., xk) — order-k cross-polyspectrum, k = the call-site arity, 2..4 (2 cross-power, 3 bispectrum, 4 trispectrum). Ops read the DECLARED shape (the pass runs before type inference), so an array argument must carry an annotation: an annotated let or parameter, a call of a function with an annotated array return type, or an ascription `(expr : Array<...>)`.",
 };
 identifiers.sgs = {
   category: "module",
   sig: "import sgs as sgs",
-  doc: "Subgrid-scale closure module: field formers over (3, n, n, n) velocity fields. Surface (qualified through the import's alias; W a `let static` name or literal): grad(U, DX) — velocity-gradient field (3, 3, n, n, n) with G(c, d, i, j, k) = d_d u_c, 2nd-order central differences, periodic; box_filter(U, W) — tile means (3, m, m, m), m = n/W; stress(U, W) — exact subgrid stress tau_ij = mean(u_i u_j | tile) - mean_i mean_j, packed (6, m, m, m) in upper-triangle row-major order. Ops read the DECLARED shape, so the field argument must carry an annotation (annotated let/parameter, annotated-return function call, or ascription).",
+  doc: "Subgrid-scale closure module: field formers over (3, N, N, N) velocity fields. Surface (qualified through the import's alias; W a `let static` name or literal): grad(U, DX) — velocity-gradient field (3, 3, N, N, N) with G(c, d, i, j, k) = d_d u_c, 2nd-order central differences, periodic; box_filter(U, W) — tile means (3, M, M, M), M = N/W; stress(U, W) — exact subgrid stress tau_ij = mean(u_i u_j | tile) - mean_i mean_j, packed (6, M, M, M) in upper-triangle row-major order. Ops read the DECLARED shape, so the field argument must carry an annotation (annotated let/parameter, annotated-return function call, or ascription).",
 };
 
 // --- Operators ----------------------------------------------------------------

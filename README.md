@@ -14,7 +14,7 @@ A VS Code extension for the [Blade language](https://github.com/cmdupuis3/Blade)
 | Rename symbol | in-file rename | `F2` |
 | Document outline / breadcrumbs | outline view | `Ctrl+Shift+O` |
 | Quick fix: pin deduced comm/anticomm, annotate deduced rank | lightbulb | `Ctrl+.` |
-| Signature lens (functions; arrays as `Idx<n> -> T`) | above-line lens | always on (settings toggles) |
+| Signature lens (functions; arrays as `Idx<N> -> T`) | above-line lens | always on (settings toggles) |
 | Deduction lens (`deduced comm(a, b) · storage — pin`) | above-line lens, clickable | click applies the pin |
 | Type/keyword/builtin/provider hovers | hover | mouse hover |
 | Signature help | parameter hints | `(` and `,` while typing a call |
@@ -35,7 +35,8 @@ All navigation features land on VS Code's standard keys — no custom chords to 
 A built [Blade compiler](https://github.com/cmdupuis3/Blade). The extension auto-detects the most recently built of `bin/Release` / `bin/Debug` in the standard repo location, or `Blade` on PATH; override with `blade.compilerPath`.
 
 - Compilers with the `ide serve` subcommand get as-you-type checking through a persistent process (two tiers: a fast parse+typecheck+deduce pass while you type, and a full pass through monomorphization on save/idle that upgrades polymorphic value types to their concrete instantiations).
-- Older compilers fall back automatically: `ide check --json` on save/open, or plain-text diagnostics for compilers without the JSON subcommand.
+- Older compilers fall back automatically for `.blade` files: `ide check --json` on save/open, or plain-text diagnostics for compilers without the JSON subcommand.
+- Notebooks are the exception — there is no fallback. Running cells needs `ide serve`'s `eval`/`resetSession`, and in-cell checking (diagnostics, hovers, completions, lenses) needs its `checkCells` command, which assembles the cells into one session source compiler-side. On a compiler without them, cells report the missing support when run and simply go unchecked while you type; `.blade` files in the same window are unaffected.
 
 ## Notebooks
 
@@ -53,7 +54,7 @@ A built [Blade compiler](https://github.com/cmdupuis3/Blade). The extension auto
 | `blade.runTimeoutSeconds` | `180` | Timeout for `Blade run` (first runs invoke g++) |
 | `blade.inlineReplResults` | `true` | Inline green/red REPL results at the evaluated line |
 | `blade.signatureLens.functions` | `true` | Abstract signature lens above functions |
-| `blade.signatureLens.arrays` | `true` | Index-arrow lens above array bindings (`Idx<n> -> Float64`) |
+| `blade.signatureLens.arrays` | `true` | Index-arrow lens above array bindings (`Idx<N> -> Float64`) |
 | `blade.deductionLens` | `true` | Deduced comm/anticomm + storage lens with one-click pin |
 
 ## Development

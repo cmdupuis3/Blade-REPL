@@ -6,11 +6,13 @@
 // %%
 let xs = [1.0, 2.0, 3.0]
 // %%
-reduce(xs, (+))
+reduce(xs, (+)) |> compute
 // %% [markdown]
 // Rebinding `xs` below replaces the definition above for the whole
 // session — re-run the `reduce` cell afterwards to see the new sum.
 // %%
 let xs = [10.0, 20.0, 30.0, 40.0]
 // %%
-let pairs = method_for(xs, xs) <@> lambda(a, b) -> a * b |> compute
+let xloop = method_for(xs, xs)
+// %%
+let pairs = xloop <@> lambda(a, b) where comm(a, b) -> a * b |> compute

@@ -8,26 +8,30 @@
 //
 // NDJSON over stdin/stdout: one JSON object per line, UTF-8. Unlike the REPL
 // (a terminal-shaped prompt/echo protocol), `ide serve` is a plain data pipe
-// — requests and responses correlate by an integer "id" (ping, check, eval,
-// resetSession; shutdown has no response and no id). See the plan's frozen
-// protocol spec for the exact message shapes:
+// — requests and responses correlate by an integer "id" (ping, check,
+// checkCells, eval, resetSession; shutdown has no response and no id). See the
+// plan's frozen protocol spec for the exact message shapes:
 //
 //   request  {"id": N, "cmd": "check", "tier": "fast"|"full", "file": "...", "source": "..."}
 //   request  {"id": N, "cmd": "ping"}
+//   request  {"id": N, "cmd": "checkCells", "file": "...", "cells": ["...", ...], "tier": "fast"|"full"}
 //   request  {"id": N, "cmd": "eval", "session": "...", "source": "...", "cwd": "..."}  (cwd optional)
 //   request  {"id": N, "cmd": "resetSession", "session": "..."}
 //   request  {"cmd": "shutdown"}
 //   response {"id": N, "ok": true, "serve": 1, "version": "..."}          (ping)
 //   response {"id": N, "tier": "fast"|"full", "diagnostics": [...], ...}  (check)
+//   response {"id": N, "tier": "...", "diagnostics": [...], ...,
+//             "windows": [{"startLine": S, "endLine": E,
+//                          "wrapLine": L, "wrapCol": C}, ...]}            (checkCells)
 //   response {"id": N, "kept": true|false, "exitCode": E, "lane": "interp"|"gpp",
 //             "elapsedMs": M, "stdout": "...", "stderr": "...",
 //             "bindings": [...], "diagnostics": [...]}                    (eval)
 //   response {"id": N, "ok": true}                                        (resetSession)
 //   response {"id": N|null, "error": "..."}                                (error)
 //
-// A compiler that predates notebook support answers "eval"/"resetSession"
-// with the generic {"id", "error": "..."} shape (unknown cmd) rather than
-// rejecting the connection — src/serve.js tags that case (see
+// A compiler that predates notebook support answers "eval"/"resetSession"/
+// "checkCells" with the generic {"id", "error": "..."} shape (unknown cmd)
+// rather than rejecting the connection — src/serve.js tags that case (see
 // handleStdout's `protocolError`) so callers can tell "unsupported command"
 // apart from a transport failure (timeout, crash, not found).
 //
@@ -39,6 +43,21 @@
 /** One "check" request line: {"id","cmd":"check","tier","file","source"}\n */
 function encodeCheck(id, tier, file, source) {
   return JSON.stringify({ id, cmd: "check", tier, file, source }) + "\n";
+}
+
+/**
+ * One "checkCells" request line: {"id","cmd":"checkCells","file","cells","tier"}\n
+ * — `cells` is the ordered source text of every CODE cell of a notebook
+ * (markdown cells are the caller's to filter out). The compiler assembles them
+ * into ONE session source itself (ReplSession.assembleCells: rebind-in-place,
+ * bare-expression wrapping) and checks that, so the extension never has to
+ * reimplement REPL session semantics. Stateless — no "session" field; the
+ * whole notebook is in the request. The response is a normal check payload
+ * plus a `windows` entry per input cell saying where that cell's text landed
+ * (see the header, and src/notebook.js's fan-out).
+ */
+function encodeCheckCells(id, tier, file, cells) {
+  return JSON.stringify({ id, cmd: "checkCells", file, cells, tier }) + "\n";
 }
 
 /** One "ping" request line: {"id","cmd":"ping"}\n */
@@ -116,6 +135,7 @@ function createDecoder() {
 
 module.exports = {
   encodeCheck,
+  encodeCheckCells,
   encodePing,
   encodeEval,
   encodeResetSession,
