@@ -21,6 +21,7 @@ const keywords = require("./keywords");
 const repl = require("./repl");
 const serve = require("./serve");
 const notebook = require("./notebook");
+const plots = require("./plots");
 
 /** @type {vscode.DiagnosticCollection} */
 let diagnostics;
@@ -657,10 +658,15 @@ function scanDecls(doc) {
       });
       continue;
     }
-    const u = /^\s*Unit\s+([A-Za-z_][A-Za-z0-9_]*)(?:\s*=\s*(.+?))?\s*$/.exec(text);
+    // '=' is a structural unit (rhs is a unit-algebra expression); ':' is a
+    // Quantity — a nominal tag entailing the rhs unit's dims. Quantities are
+    // terminal (never valid as another unit expression's rhs), but that's a
+    // compiler-side check — here we just remember which form was written.
+    const u = /^\s*Unit\s+([A-Za-z_][A-Za-z0-9_]*)(?:\s*([=:])\s*(.+?))?\s*$/.exec(text);
     if (u) {
-      const rhs = u[2] && u[2].replace(/\s*\/\/.*$/, "").trim();
-      units.set(u[1], { name: u[1], rhs: rhs || undefined, doc: docCommentAbove(doc, l), line: l });
+      const rhs = u[3] && u[3].replace(/\s*\/\/.*$/, "").trim();
+      const kind = u[2] === ":" ? "quantity" : "unit";
+      units.set(u[1], { name: u[1], kind, rhs: rhs || undefined, doc: docCommentAbove(doc, l), line: l });
     }
   }
   const entry = { version: doc.version, decls, units, statics };
@@ -1013,12 +1019,21 @@ function typeHoverFor(doc, word, wordRange) {
     appendClassDetail(md, doc, decl.parent);
     return new vscode.Hover(md, wordRange);
   }
-  // Unit of measure from a source `Unit name [= expr]` declaration.
+  // Unit of measure / Quantity from a source `Unit name [= expr]` or
+  // `Unit name: expr` declaration.
   const unit = scanDecls(doc).units.get(word);
   if (unit) {
-    const declLine = unit.rhs ? `Unit ${unit.name} = ${unit.rhs}` : `Unit ${unit.name}`;
+    const isQuantity = unit.kind === "quantity";
+    const declLine = !unit.rhs
+      ? `Unit ${unit.name}`
+      : isQuantity
+        ? `Unit ${unit.name}: ${unit.rhs}`
+        : `Unit ${unit.name} = ${unit.rhs}`;
+    const kindLine = isQuantity
+      ? unit.rhs === "1" ? "Quantity (dimensionless)" : "Quantity"
+      : "Unit of Measure";
     return new vscode.Hover(
-      typeMarkdown([declLine, "Unit of Measure"], unit.doc, true),
+      typeMarkdown([declLine, kindLine], unit.doc, true),
       wordRange
     );
   }
@@ -1317,8 +1332,11 @@ function documentSymbols(doc) {
   for (const [name, u] of scanned.units) {
     if (u.line === undefined) continue;
     const r = new vscode.Range(u.line, 0, u.line, doc.lineAt(u.line).text.length);
+    // Quantities (`Unit speed: mps`) keep their `:` separator in the outline,
+    // mirroring typeHoverFor/provideCompletionItems.
+    const sep = u.kind === "quantity" ? ": " : " = ";
     symbols.push(
-      new vscode.DocumentSymbol(name, u.rhs ? `Unit ${name} = ${u.rhs}` : `Unit ${name}`, vscode.SymbolKind.Struct, r, r)
+      new vscode.DocumentSymbol(name, u.rhs ? `Unit ${name}${sep}${u.rhs}` : `Unit ${name}`, vscode.SymbolKind.Struct, r, r)
     );
   }
 
@@ -2363,7 +2381,13 @@ const completionProvider = {
       push(name, vscode.CompletionItemKind.Class, `type ${name} = ${d.parent}`, d.doc ? new vscode.MarkdownString().appendText(d.doc) : undefined);
     }
     for (const [name, u] of scanned.units) {
-      push(name, vscode.CompletionItemKind.Unit, u.rhs ? `Unit ${name} = ${u.rhs}` : `Unit ${name}`, u.doc ? new vscode.MarkdownString().appendText(u.doc) : undefined);
+      const isQuantity = u.kind === "quantity";
+      const detail = !u.rhs ? `Unit ${name}` : isQuantity ? `Unit ${name}: ${u.rhs}` : `Unit ${name} = ${u.rhs}`;
+      // Quantities get their own icon (EnumMember) — a nominal tag is a
+      // different completion-time concept from a structural unit, even
+      // though both land in the same `Float<...>` annotation position.
+      const kind = isQuantity ? vscode.CompletionItemKind.EnumMember : vscode.CompletionItemKind.Unit;
+      push(name, kind, detail, u.doc ? new vscode.MarkdownString().appendText(u.doc) : undefined);
     }
 
     return items;
@@ -2642,6 +2666,10 @@ function activate(context) {
   // cell's caches without notebook.js requiring this module back (that would
   // be a require cycle — extension.js already requires notebook.js).
   notebook.init(context, { findCompiler, output, applyCheckPayload });
+  // Plots panel: subscribes to the display-frame hub (src/display.js) and
+  // registers blade.plotDemo. No wiring beyond this — every frame reaches it
+  // through the hub, never through this module.
+  plots.init(context, { output });
 
   const cfg = () => vscode.workspace.getConfiguration("blade");
 
@@ -2735,6 +2763,7 @@ function activate(context) {
 function deactivate() {
   serve.dispose();
   notebook.dispose();
+  plots.dispose();
 }
 
 module.exports = { activate, deactivate };

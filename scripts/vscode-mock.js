@@ -123,6 +123,12 @@ class Uri {
     if (m) return new Uri(m[1], m[2]);
     return new Uri("file", s);
   }
+  /** Real vscode's Uri.joinPath (1.45+) — src/plots.js resolves media/ and
+   *  media/plotly.min.js through it. Path-only, like the real one. */
+  static joinPath(base, ...parts) {
+    const joined = [base.path.replace(/\/+$/, "")].concat(parts).join("/");
+    return new Uri(base.scheme, joined);
+  }
 }
 
 // --- Markdown / Hover ------------------------------------------------------------
@@ -410,6 +416,66 @@ class CancellationTokenSource {
   }
 }
 
+// --- Webview panels (src/plots.js) ------------------------------------------------
+
+/** A recording WebviewPanel. `.webview.html` is a plain property the test
+ *  reads back after the panel is built; `._posted` collects every
+ *  postMessage payload (what the panel told the webview to render);
+ *  `.webview._send(msg)` drives the reverse direction (what the webview's
+ *  toolbar would post back); `._revealed` records reveal(column,
+ *  preserveFocus) calls. asWebviewUri rewrites to a fake webview origin the
+ *  same way the real one does — the PATH survives, which is what CSP/asset
+ *  assertions care about. */
+function makeWebviewPanel(viewType, title, showOptions, options) {
+  const inbound = [];
+  const disposeListeners = [];
+  const panel = {
+    viewType,
+    title,
+    options: options || {},
+    viewColumn: showOptions && showOptions.viewColumn !== undefined ? showOptions.viewColumn : showOptions,
+    active: true,
+    visible: true,
+    _posted: [],
+    _revealed: [],
+    _disposed: false,
+    webview: {
+      html: "",
+      options: options || {},
+      cspSource: "vscode-webview://mock-webview",
+      asWebviewUri: (uri) => Uri.parse(`https://mock-webview.vscode-cdn.net${uri.path}`),
+      postMessage(msg) {
+        panel._posted.push(msg);
+        return Promise.resolve(true);
+      },
+      onDidReceiveMessage(fn) {
+        inbound.push(fn);
+        return { dispose: () => {} };
+      },
+      _send(msg) {
+        for (const fn of inbound.slice()) fn(msg);
+      },
+    },
+    reveal(viewColumn, preserveFocus) {
+      panel._revealed.push({ viewColumn, preserveFocus });
+      panel.visible = true;
+    },
+    onDidDispose(fn) {
+      disposeListeners.push(fn);
+      return { dispose: () => {} };
+    },
+    onDidChangeViewState() {
+      return { dispose: () => {} };
+    },
+    dispose() {
+      if (panel._disposed) return;
+      panel._disposed = true;
+      for (const fn of disposeListeners.slice()) fn();
+    },
+  };
+  return panel;
+}
+
 /** A recording NotebookCellExecution: `.start`/`.end`/`.clearOutput`/
  *  `.replaceOutput`/`.appendOutput` all behave like the real Thenable-
  *  returning API, and every replaceOutput/appendOutput call's items land in
@@ -643,6 +709,12 @@ function buildMock() {
     showNotebookDocument: (doc) => Promise.resolve({ notebook: doc }),
     onDidChangeVisibleTextEditors: () => ({ dispose() {} }),
     onDidChangeActiveTextEditor: () => ({ dispose() {} }),
+    _webviewPanels: [],
+    createWebviewPanel(viewType, title, showOptions, options) {
+      const panel = makeWebviewPanel(viewType, title, showOptions, options);
+      window._webviewPanels.push(panel);
+      return panel;
+    },
   };
 
   const commandRegistry = new Map();

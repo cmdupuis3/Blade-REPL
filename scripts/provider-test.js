@@ -217,6 +217,20 @@ function testOutline() {
   const fFlat = flat.find((s) => s.name === "f");
   check("flat fallback: still lists f and d", flat.some((s) => s.name === "f") && flat.some((s) => s.name === "d"), flat.map((s) => s.name));
   check("flat fallback: f has NO nested children (no scope info without references[])", !!fFlat && fFlat.children.length === 0, fFlat && fFlat.children);
+
+  // Unit declarations reach the outline via scanDecls, not bindings — a
+  // Quantity keeps its `:` separator in the label (same rule as hovers).
+  const unitText = ["Unit mps = meters / seconds", "Unit speed: mps", "Unit levels: 1"].join("\n");
+  const doc3 = makeDoc(unitText, "outline_units.blade");
+  _test.applyCheckPayload(doc3, { bindings: [], references: [] });
+  const unitSyms = _test.documentSymbolProvider.provideDocumentSymbols(doc3);
+  const detailOf = (n) => {
+    const s = unitSyms.find((x) => x.name === n);
+    return s && s.detail;
+  };
+  check("outline: structural unit label keeps ' = '", detailOf("mps") === "Unit mps = meters / seconds", detailOf("mps"));
+  check("outline: quantity label uses ': '", detailOf("speed") === "Unit speed: mps", detailOf("speed"));
+  check("outline: dimensionless quantity label", detailOf("levels") === "Unit levels: 1", detailOf("levels"));
 }
 
 // --- 3. arrowNotation (pure renderer) ----------------------------------------
@@ -591,7 +605,63 @@ function testHoverShadowing() {
   check("hover on g's use reflects the correct (Int64) binding, not Float64", !!md && md.includes("Int64") && !md.includes("Float64"), md);
 }
 
-// --- 9. Activation smoke test --------------------------------------------------
+// --- 9. Unit / Quantity declarations (scanDecls, hover, completions) -----------
+
+function testUnitQuantityDecls() {
+  const text = [
+    "// Base length dimension.",
+    "Unit meters",
+    "Unit seconds",
+    "// Meters per second.",
+    "Unit mps = meters / seconds",
+    "// A tagged velocity quantity.",
+    "Unit speed: mps",
+    "// Dimensionless option marker.",
+    "Unit levels: 1",
+  ].join("\n");
+  const doc = makeDoc(text, "units.blade");
+
+  const hoverAt = (line1, word) => {
+    const col0 = findWordCol(doc.lineAt(line1 - 1).text, word, 1);
+    const pos = new mock.Position(line1 - 1, col0);
+    const h = _test.hoverProvider.provideHover(doc, pos);
+    return h && h.contents[0].value;
+  };
+
+  const meters = hoverAt(2, "meters");
+  check("bare unit hover: declaration line unchanged", !!meters && meters.includes("Unit meters"), meters);
+  check("bare unit hover: still badged Unit of Measure", !!meters && meters.includes("Unit of Measure"), meters);
+
+  const mps = hoverAt(5, "mps");
+  check("structural (=) unit hover: declaration line unchanged", !!mps && mps.includes("Unit mps = meters / seconds"), mps);
+  check("structural (=) unit hover: still badged Unit of Measure, not Quantity", !!mps && mps.includes("Unit of Measure") && !mps.includes("Quantity"), mps);
+
+  const speed = hoverAt(7, "speed");
+  check("quantity (:) hover: declaration line uses colon form", !!speed && speed.includes("Unit speed: mps"), speed);
+  check("quantity (:) hover: badged Quantity, not Unit of Measure", !!speed && speed.includes("Quantity") && !speed.includes("Unit of Measure"), speed);
+  check("quantity hover: doc comment carries through", !!speed && speed.includes("A tagged velocity quantity."), speed);
+
+  const levels = hoverAt(9, "levels");
+  check("dimensionless quantity hover: rhs `1` kept verbatim", !!levels && levels.includes("Unit levels: 1"), levels);
+  check("dimensionless quantity hover: kind line notes dimensionless", !!levels && levels.includes("Quantity (dimensionless)"), levels);
+
+  const lastLine = doc.lineCount - 1;
+  const items = _test.completionProvider.provideCompletionItems(doc, new mock.Position(lastLine, 0));
+  const byLabel = new Map(items.map((i) => [typeof i.label === "string" ? i.label : i.label.label, i]));
+
+  const mpsItem = byLabel.get("mps");
+  check("completion: structural unit keeps Unit kind", !!mpsItem && mpsItem.kind === mock.CompletionItemKind.Unit, mpsItem && mpsItem.kind);
+  check("completion: structural unit detail uses = form", !!mpsItem && mpsItem.detail === "Unit mps = meters / seconds", mpsItem && mpsItem.detail);
+
+  const speedItem = byLabel.get("speed");
+  check("completion: quantity gets a distinct kind (EnumMember)", !!speedItem && speedItem.kind === mock.CompletionItemKind.EnumMember, speedItem && speedItem.kind);
+  check("completion: quantity detail uses : form", !!speedItem && speedItem.detail === "Unit speed: mps", speedItem && speedItem.detail);
+
+  const levelsItem = byLabel.get("levels");
+  check("completion: dimensionless quantity detail keeps rhs `1`", !!levelsItem && levelsItem.detail === "Unit levels: 1", levelsItem && levelsItem.detail);
+}
+
+// --- 10. Activation smoke test --------------------------------------------------
 
 function testActivationSmoke() {
   const ctx = { subscriptions: [] };
@@ -619,6 +689,7 @@ function testActivationSmoke() {
   testSignatureLenses();
   testDiagnosticDocLinks();
   testHoverShadowing();
+  testUnitQuantityDecls();
   testActivationSmoke();
 
   if (failures) {

@@ -28,6 +28,7 @@
 const vscode = require("vscode");
 const path = require("path");
 const serve = require("./serve");
+const display = require("./display");
 
 const NOTEBOOK_TYPE = "blade-notebook";
 
@@ -201,23 +202,59 @@ function formatDiagnosticLine(d) {
 }
 
 /**
+ * One display frame (docs/display-frames.md) as a notebook output. The rich
+ * item comes FIRST — VS Code renders the highest-priority mime it has a
+ * renderer for — followed by a `text/plain` summary that shows instead when
+ * nothing can render the rich one (no plotly notebook renderer is contributed
+ * yet, so today a plotly frame reads as that summary in the cell while the
+ * Blade Plots panel draws it for real).
+ */
+function displayOutput(frame) {
+  const items = [];
+  if (frame.encoding === "json") {
+    items.push(vscode.NotebookCellOutputItem.json(frame.data, frame.mime));
+  } else if (frame.encoding === "base64") {
+    items.push(new vscode.NotebookCellOutputItem(Buffer.from(frame.data.replace(/\s+/g, ""), "base64"), frame.mime));
+  } else {
+    items.push(vscode.NotebookCellOutputItem.text(frame.data, frame.mime));
+  }
+  const title = frame.meta && frame.meta.title ? ` — ${frame.meta.title}` : "";
+  items.push(vscode.NotebookCellOutputItem.text(`[${frame.mime}${title}]`, "text/plain"));
+  return new vscode.NotebookCellOutput(items, frame.meta && Object.keys(frame.meta).length ? { blade: frame.meta } : undefined);
+}
+
+/**
  * Turn one `eval` response into the ordered NotebookCellOutput[] a
  * successful (or rejected) execution should show. Pure — no execution/client
- * involved — so hermetic tests can feed it canned responses directly.
+ * involved — so hermetic tests can feed it canned responses directly; the
+ * only state it touches is `seenFrameIds`, an optional Set the CALLER owns
+ * (see sessionStateFor) — passing none simply disables replay suppression.
  *
  * kept:false (rejected, session unchanged): a single error output carrying
  * the FIRST diagnostic's bare message (the red VS Code error card), plus —
  * when there's more than one diagnostic — a text output listing the rest as
  * cell-local `line:col message` lines.
  *
- * kept:true: stdout (if any) — warning-severity diagnostics as a text output
+ * kept:true: stdout (if any) — display frames (if any: one MIME-typed output
+ * each, plus a text output naming any frame that failed to decode, so a
+ * malformed frame degrades to text instead of vanishing) — warning-severity
+ * diagnostics as a text output
  * (if any) — one output per binding (a text/plain echo PLUS a parallel
  * `application/x-blade-value+json` item carrying the raw {name,type,value},
  * the hook a future rich renderer attaches to) — stderr (if any) — and, when
  * the compiler fell back to g++ for this snippet, a small "[compiled via g++
  * fallback]" badge.
+ *
+ * Display frames get one more filter first: a Blade session re-runs every
+ * accumulated snippet, so `resp.display` can carry an EARLIER cell's frame
+ * replayed under the same stable `meta.id` (docs/display-frames.md §10). A
+ * frame whose id is already in `seenFrameIds` belongs to that earlier cell
+ * and is skipped here — it already reached the Blade Plots panel via the
+ * unconditional route() call in applyEvalResult, whose merge-by-id absorbs
+ * the replay. A frame with no `meta.id` can never be told apart from a fresh
+ * one, so it is always attached.
  */
-function assembleOutputs(resp) {
+function assembleOutputs(resp, seenFrameIds) {
   const outputs = [];
 
   if (!resp.kept) {
@@ -238,6 +275,23 @@ function assembleOutputs(resp) {
 
   if (resp.stdout) {
     outputs.push(new vscode.NotebookCellOutput([vscode.NotebookCellOutputItem.text(resp.stdout, "text/plain")]));
+  }
+
+  const shown = display.framesFromEval(resp);
+  for (const frame of shown.frames) {
+    const id = frame.meta && frame.meta.id;
+    if (id !== undefined && seenFrameIds) {
+      if (seenFrameIds.has(id)) continue; // replayed — already shown by an earlier cell
+      seenFrameIds.add(id);
+    }
+    outputs.push(displayOutput(frame));
+  }
+  if (shown.errors.length > 0) {
+    outputs.push(
+      new vscode.NotebookCellOutput([
+        vscode.NotebookCellOutputItem.text(shown.errors.join("\n"), "text/plain"),
+      ])
+    );
   }
 
   const warnings = (resp.diagnostics || []).filter((d) => d.severity === "warning");
@@ -293,7 +347,15 @@ function evalErrorOutputs(e) {
  * canned response and a real mock execution, without a live compiler.
  */
 async function applyEvalResult(execution, resp, source, state) {
-  await execution.replaceOutput(assembleOutputs(resp));
+  // Cell outputs are the notebook's own rendering surface; the SAME frames
+  // also go to the Blade Plots panel (src/plots.js) so a plot from a notebook
+  // cell is navigable beside one from the REPL. Routed here rather than in
+  // assembleOutputs, which stays a pure response -> outputs function. This
+  // routing is UNCONDITIONAL — every frame, replayed or not — the panel
+  // merges by meta.id itself (docs/display-frames.md §10); only the cell
+  // output below is filtered against state.seenFrameIds.
+  display.route(display.framesFromEval(resp), "notebook");
+  await execution.replaceOutput(assembleOutputs(resp, state.seenFrameIds));
   if (resp.kept) state.keptSources.push(source);
   execution.end(!!resp.kept && resp.exitCode === 0, Date.now());
 }
@@ -304,10 +366,22 @@ async function applyEvalResult(execution, resp, source, state) {
 // notebook — see the module header for why this isn't the extension-wide
 // singleton).
 const clients = new Map();
-// notebook URI string -> { keptSources: string[], needsReplay: boolean }.
+// notebook URI string -> { keptSources: string[], needsReplay: boolean,
+// seenFrameIds: Set<string> }.
 // keptSources only ever grows by appending (never rewritten in place) — a
 // rebind is just another entry with the same top-level name; the compiler's
 // session splices by name on replay, this side doesn't need to track that.
+// seenFrameIds is the cell-output replay filter of docs/display-frames.md
+// §10: every `meta.id` already attached to some cell's output in this
+// session, so a later eval's replay of that same frame is recognized and
+// skipped (see assembleOutputs). It resets everywhere a session logically
+// starts over: resetNotebookSession (kernel restart) below, and implicitly
+// whenever this map's entry is dropped (cleanupNotebook on close, dispose()
+// on deactivate) since the next sessionStateFor() call builds a fresh Set.
+// It is deliberately NOT cleared on interrupt (interruptHandler) — that
+// replays the SAME accumulated keptSources through a fresh process, and
+// meta.id is stable across exactly that kind of replay, so the ids already
+// shown are still valid to suppress.
 const sessionStates = new Map();
 // notebook URI strings whose serve client has already answered eval with a
 // protocol error (old compiler) — don't retry per session; report once.
@@ -327,7 +401,7 @@ function clientFor(notebookDoc) {
 
 function sessionStateFor(key) {
   let s = sessionStates.get(key);
-  if (!s) sessionStates.set(key, (s = { keptSources: [], needsReplay: false }));
+  if (!s) sessionStates.set(key, (s = { keptSources: [], needsReplay: false, seenFrameIds: new Set() }));
   return s;
 }
 
@@ -421,7 +495,10 @@ function interruptHandler(notebookDoc) {
  *  forget the session's bindings. Also clears keptSources (there's nothing
  *  left to replay) and gives a previously "unsupported" session another
  *  chance (a successful reset proves the compiler understands the command
- *  family after all). */
+ *  family after all). Also clears seenFrameIds: a fresh compiler session
+ *  means the next run's `<SessionTag><ordinal>` ids start over too, so the
+ *  old seen-set would otherwise wrongly suppress what are, post-restart,
+ *  first-time frames (docs/display-frames.md §10). */
 async function resetNotebookSession(notebookDoc) {
   const key = notebookDoc.uri.toString();
   const client = clientFor(notebookDoc);
@@ -436,6 +513,7 @@ async function resetNotebookSession(notebookDoc) {
   }
   state.keptSources = [];
   state.needsReplay = false;
+  state.seenFrameIds = new Set();
 }
 
 // --- Session-aware IDE features (N3): compiler-assembled check + fan-out ---
@@ -815,6 +893,7 @@ module.exports._test = {
   serializer,
   formatBinding,
   formatDiagnosticLine,
+  displayOutput,
   assembleOutputs,
   applyEvalResult,
   executeCell,

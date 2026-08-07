@@ -331,6 +331,45 @@ async function testRestartClearsStateWithoutLiveClient() {
   _test.sessionStates.delete(key);
 }
 
+/** docs/display-frames.md §10: a fresh compiler session restarts its
+ *  `<SessionTag><ordinal>` id generation from scratch, so the per-session
+ *  seen-frame-id set (assembleOutputs' replay-suppression filter) must reset
+ *  right alongside keptSources/needsReplay — a stale seen-set after restart
+ *  would wrongly treat a genuinely first-time post-restart frame as an
+ *  already-shown replay and suppress it from the cell that produced it. */
+async function testRestartClearsSeenFrameIds() {
+  const fakeUri = mock.Uri.parse("file:///restart-seen.bladenb");
+  const notebookDoc = { uri: fakeUri, notebookType: "blade-notebook" };
+  const key = fakeUri.toString();
+  const state = _test.sessionStateFor(key);
+  state.seenFrameIds.add("S1");
+
+  _test.setDeps({ findCompiler: () => "definitely-not-a-real-binary-xyz", output: { appendLine() {} } });
+  await _test.resetNotebookSession(notebookDoc);
+
+  check("restart clears the seen-frame-id set", state.seenFrameIds.size === 0, Array.from(state.seenFrameIds));
+
+  // Functional check, not just bookkeeping: a frame carrying the SAME id as
+  // before the restart must be attached again post-restart, not suppressed
+  // as if it were a replay of the pre-restart run.
+  const outputs = _test.assembleOutputs(
+    {
+      kept: true,
+      exitCode: 0,
+      stdout: "",
+      stderr: "",
+      bindings: [],
+      diagnostics: [],
+      display: [{ mime: "image/png", data: "AA==", meta: { id: "S1" } }],
+    },
+    state.seenFrameIds
+  );
+  check("restart: a pre-restart id is attached again post-restart, not suppressed", outputs.length === 1, outputs.length);
+
+  _test.cleanupNotebook(notebookDoc);
+  _test.sessionStates.delete(key);
+}
+
 // --- 5. Session-aware IDE features (N3): the checkCells remap contract ---
 //
 // Session assembly itself is the compiler's now (checkCells), so what is left
@@ -522,6 +561,7 @@ function testRemapFanOut() {
 
   testInterruptMarksReplay();
   await testRestartClearsStateWithoutLiveClient();
+  await testRestartClearsSeenFrameIds();
 
   if (failures) {
     console.error(`\n${failures} notebook check(s) failed.`);

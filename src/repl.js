@@ -24,6 +24,7 @@ const vscode = require("vscode");
 const cp = require("child_process");
 const path = require("path");
 const proto = require("./replProto");
+const display = require("./display");
 
 // Injected by init(): { findCompiler, reportNoCompiler } from extension.js.
 let deps;
@@ -47,6 +48,10 @@ let queue = []; // submissions not yet written to stdin
 let stdoutBuf = ""; // buffered stdout while a programmatic frame is open
 let streamTail = ""; // rolling tail of streamed stdout (prompt detection)
 let typed = ""; // interactive line being edited in the terminal
+// Display-frame scanner for the INTERACTIVE path (src/display.js). The
+// programmatic path scans whole frames in finishFrame instead — by then the
+// submission's output is complete, so no incremental state is needed.
+let streamScan = display.createStreamScanner();
 
 function termWrite(s) {
   if (writeEmitter) writeEmitter.fire(s.replace(/\r?\n/g, "\r\n"));
@@ -114,6 +119,12 @@ function failSession(message) {
   queue = [];
   stdoutBuf = "";
   streamTail = "";
+  // A partial line withheld by the frame scanner never completes now — show
+  // it rather than dropping it (docs/display-frames.md § Error behavior: the
+  // text channel is never silently reduced).
+  const stranded = streamScan.flush();
+  if (stranded) termWrite(stranded);
+  streamScan = display.createStreamScanner();
   ready = false;
   const p = proc;
   proc = undefined;
@@ -139,9 +150,15 @@ function onStdout(chunk) {
     }
     return;
   }
-  // Interactive / banner output streams straight through, prompts included.
-  termWrite(chunk);
-  streamTail = (streamTail + chunk).slice(-proto.PROMPT.length);
+  // Interactive / banner output streams straight through, prompts included —
+  // minus any display frames, which are routed to the plots panel instead of
+  // printed. Prompt detection runs on the post-scan text: a frame line always
+  // ends in a newline, so it can never hide or fake a trailing prompt.
+  const scanned = streamScan.push(chunk);
+  display.route(scanned, "repl");
+  if (scanned.text === "") return;
+  termWrite(scanned.text);
+  streamTail = (streamTail + scanned.text).slice(-proto.PROMPT.length);
   if (proto.frameDone(streamTail)) {
     ready = true;
     pump();
@@ -153,13 +170,18 @@ function onStderr(chunk) {
   termWrite(colorErr(chunk));
 }
 
-function finishFrame(sub, out) {
+function finishFrame(sub, rawOut) {
   // Output can arrive during the stderr grace window (a line typed into the
   // terminal mid-flight executes right after the frame) and re-trigger frame
   // detection for the same submission — finish at most once.
   if (sub.done) return;
   sub.done = true;
   const ms = Date.now() - sub.t0;
+  // Display frames leave the text stream here: the terminal transcript and
+  // the inline decoration both see the submission's output WITHOUT them (a
+  // 4 MB base64 PNG is not a REPL result summary), and a frame that fails to
+  // decode stays in the text so nothing is silently lost.
+  const out = display.ingestReplText(rawOut, "repl");
   termWrite(out);
   termWrite(proto.PROMPT);
   inflight = null;

@@ -27,6 +27,7 @@ A VS Code extension for the [Blade language](https://github.com/cmdupuis3/Blade)
 | Run file (full compile + run) | ▶ editor title button | — |
 | Show generated C++ | side-by-side editor | command palette |
 | Start / Reset REPL session | REPL terminal | command palette |
+| Plots (contours, images) from REPL/notebook output | "Blade Plots" panel beside the editor | automatic when evaluated code emits a display frame; `Blade: Plot Demo` renders a sample |
 
 All navigation features land on VS Code's standard keys — no custom chords to learn beyond the three REPL/check bindings.
 
@@ -41,6 +42,25 @@ A built [Blade compiler](https://github.com/cmdupuis3/Blade). The extension auto
 ## Notebooks
 
 `.bladenb` files open as native VS Code notebooks. The format is plain Blade text with `// %%` cell markers (`// %% [markdown]` for prose cells), so the same file still runs under `blade run` and diffs cleanly in git. Cells evaluate with exact REPL semantics — an accumulating session, rebind-in-place, typed value echoes (`xs = [1.0, 2.0, 3.0] : Array<Float64 like Idx<3>>`), interpreter-first evaluation with a g++ fallback badge — on a dedicated `ide serve` process, so a slow cell never blocks typing-time checking. Cells also get the full IDE feature set: diagnostics, session-aware hovers and completions (names from earlier cells resolve), and type lenses. "Restart Kernel" resets the session; interrupting kills the evaluator and transparently replays the session on the next run.
+
+## Plots
+
+Evaluated code that produces a plot ships it to the extension as a **display frame** — a `{mime, data}` payload carried alongside stdout on the REPL and `ide serve` channels ([wire format](docs/display-frames.md)). Frames render in a "Blade Plots" webview docked beside the editor: plot history with prev/next, PNG/SVG export, and a backend toggle (plotly is live; GR is stubbed for a later release). plotly.js is bundled in the extension, so the panel works offline. `Blade: Plot Demo` pushes a sample contour through the same path without needing compiler support.
+
+Plots come from the compiler's `plot` stdlib module. Options are **tagged by quantity** rather than by position, so they can be given in any order — and axis labels can be read straight off the data's units:
+
+```blade
+import units.SI
+import plot
+import display as d
+
+let t: Array<Float64<second> like Idx<4>> = [0.0, 1.0, 2.0, 3.0]
+let v: Array<Float64<meter> like Idx<4>> = [0.0, 2.5, 6.0, 9.5]
+
+let _ = plot.line(t, v, "drift": title, d.unit_label(t): xlabel, d.unit_label(v): ylabel)
+```
+
+`plot` provides `contourf`, `contour`, `heatmap`, `line`, and `scatter`; option slots are `levels`, `cmap`, `title`, `xlabel`, and `ylabel`, each with a default, so `plot.contourf(x, y, z)` alone is valid.
 
 ## Settings
 

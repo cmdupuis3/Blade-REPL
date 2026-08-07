@@ -28,6 +28,14 @@
 //             "bindings": [...], "diagnostics": [...]}                    (eval)
 //   response {"id": N, "ok": true}                                        (resetSession)
 //   response {"id": N|null, "error": "..."}                                (error)
+//   event    {"event": "display", "id": N, "frame": {...}}                 (unsolicited)
+//
+// An eval response may additionally carry "display": [frame, ...] — rich
+// MIME outputs (plots) produced by that submission. A line carrying "event"
+// is never a response: it can repeat an in-flight request's id and must not
+// settle it (src/serve.js checks for "event" before the id lookup). Both are
+// specified in docs/display-frames.md and parsed by src/display.js; a
+// compiler that emits neither is unaffected.
 //
 // A compiler that predates notebook support answers "eval"/"resetSession"/
 // "checkCells" with the generic {"id", "error": "..."} shape (unknown cmd)

@@ -46,6 +46,7 @@
 const vscode = require("vscode");
 const cp = require("child_process");
 const proto = require("./serveProto");
+const display = require("./display");
 
 const PING_TIMEOUT_MS = 5000;
 const DEFAULT_TIMEOUT_MS = { fast: 10000, full: 30000 };
@@ -155,6 +156,14 @@ function createClient(dependencies, label) {
   function handleStdout(decoder, chunk) {
     const messages = decoder.push(chunk);
     for (const msg of messages) {
+      // Out-of-band events are NOT responses. A line carrying "event" never
+      // settles a pending request, even when it echoes that request's id —
+      // otherwise a mid-eval display frame would resolve the eval early with
+      // a payload that has no stdout/bindings (docs/display-frames.md).
+      if (display.isEvent(msg)) {
+        handleEvent(msg);
+        continue;
+      }
       const id = msg.id;
       if (id === undefined || id === null) {
         if (msg.error) log(`serve error (no id): ${msg.error}`);
@@ -175,6 +184,19 @@ function createClient(dependencies, label) {
         p.reject(err);
       } else p.resolve(msg);
     }
+  }
+
+  /** Streamed display frames (a long eval emitting plots as it goes). An
+   *  unknown event kind is logged and dropped — never an error, so a newer
+   *  compiler's events can't break an older extension. */
+  function handleEvent(msg) {
+    if (msg.event !== "display") {
+      log(`ignoring unknown event "${msg.event}"`);
+      return;
+    }
+    const res = display.frameFromEvent(msg);
+    if (res.ok) display.publish(res.frame, tag);
+    else log(res.reason);
   }
 
   function handleStderr(chunk) {
