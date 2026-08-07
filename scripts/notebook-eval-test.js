@@ -259,8 +259,8 @@ const EVAL_TIMEOUT_MS = 30000;
     JSON.stringify(cmpEcho).slice(0, 300)
   );
   check(
-    "reduce |> compute: echoes the reduced value (6), not an empty string",
-    !!cmpBinding && cmpBinding.value === "6" && cmpBinding.type === "Float64",
+    "reduce |> compute: echoes the reduced value (6.0), not an empty string",
+    !!cmpBinding && cmpBinding.value === "6.0" && cmpBinding.type === "Float64",
     cmpBinding
   );
 
