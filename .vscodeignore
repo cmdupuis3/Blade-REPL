@@ -1,0 +1,9 @@
+# Packaging exclusions for `vsce package`. Without this, vendor/ (~200 MB of
+# downloaded GR binaries) would land in the .vsix. media/ is deliberately NOT
+# excluded: the webview loads plotly.min.js from there at runtime, offline.
+vendor/**
+graft/**
+docs/**
+scripts/**
+.ignore
+*.vsix

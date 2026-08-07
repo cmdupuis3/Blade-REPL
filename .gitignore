@@ -1,2 +1,7 @@
 # graft's local graph cache — regenerable, not committed (run `graft build`).
 graft/
+
+# Downloaded upstream graphics packages (~200 MB: the GR tarball and its
+# extraction). Re-fetchable from the URLs in docs/plotting-and-units-plan.md.
+# Note media/plotly.min.js is NOT here — that one ships inside the extension.
+vendor/
