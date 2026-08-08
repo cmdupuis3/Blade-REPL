@@ -2,7 +2,11 @@
   "name": "blade-language",
   "displayName": "Blade Language",
   "description": "Live diagnostics, type hovers and lenses, go-to-definition/rename, deduction pinning, notebooks, and REPL-style evaluation for the Blade DSL (.blade / .edgi)",
-  "version": "0.3.0",
+  "version": "0.1.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/cmdupuis3/Blade-REPL.git"
+  },
   "publisher": "blade-local",
   "license": "UNLICENSED",
   "engines": {
