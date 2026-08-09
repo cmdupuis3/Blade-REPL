@@ -223,19 +223,55 @@ function jsonToDiagnostics(doc, payload) {
 }
 
 /**
+ * True when a payload carries NO bindings but DOES report a problem — the
+ * shape the compiler answers with when the file failed to PARSE (a file that
+ * parses but fails to type-check still reports every binding it recovered,
+ * so this is specific to the parse lane). Nothing semantic survives a parse
+ * failure: bindings, references, calls and kernels all come back empty
+ * together, which — applied verbatim — silently strips every hover, lens and
+ * completion from the file until the next character makes it parse again.
+ * Since mid-edit buffers are unparseable most of the time, that reads to the
+ * user as "tooltips randomly stop working".
+ *
+ * `_parseFailure` lets a caller assert the condition when its own view of the
+ * payload can't: src/notebook.js fans ONE assembled `checkCells` response out
+ * to N cell documents, and a cell whose window contains none of the
+ * diagnostics would otherwise look like an ordinary empty cell.
+ */
+function isParseFailurePayload(payload) {
+  if (payload._parseFailure) return true;
+  return (payload.bindings || []).length === 0 && (payload.diagnostics || []).length > 0;
+}
+
+/**
  * Apply a check response — serve or one-shot `ide check --json`, same
  * payload shape — to the per-document caches, the diagnostics collection,
  * and the telemetry line. The one place that does this, so the fast/slow
  * serve clocks and the one-shot fallback can never drift apart.
+ *
+ * Diagnostics are applied unconditionally — the squiggle is the whole point,
+ * and suppressing it would hide the very error that caused the blackout. The
+ * SEMANTIC caches are what a parse failure leaves untouched (see
+ * isParseFailurePayload): keeping the last-good ones means hovers/lenses go
+ * momentarily stale rather than vanishing, matching the "kept last-good
+ * hovers" policy checkDocument already applies to transient serve failures.
+ * Stale-by-a-few-lines is the accepted cost, and it is bounded: the next
+ * payload that parses replaces the caches wholesale.
  * @param {vscode.TextDocument} doc
  */
 function applyCheckPayload(doc, payload) {
   const key = doc.uri.toString();
-  bindingsByDoc.set(key, payload.bindings || []);
-  cacheProviders(doc, payload.providers || []);
-  callsByDoc.set(key, payload.calls || []);
-  kernelsByDoc.set(key, payload.kernels || []);
-  referencesByDoc.set(key, payload.references || []);
+  const parseFailure = isParseFailurePayload(payload);
+  if (!parseFailure) {
+    bindingsByDoc.set(key, payload.bindings || []);
+    // Skipped rather than called with [] on a parse failure: cacheProviders
+    // also PRUNES (any cached store whose `.load` line text moved is dropped),
+    // so passing an empty incoming list would still discard stores.
+    cacheProviders(doc, payload.providers || []);
+    callsByDoc.set(key, payload.calls || []);
+    kernelsByDoc.set(key, payload.kernels || []);
+    referencesByDoc.set(key, payload.references || []);
+  }
   diagnostics.set(doc.uri, jsonToDiagnostics(doc, payload));
   // Concise telemetry so a "no tooltips" report can be pinpointed: empty
   // bindings ⇒ the file didn't type-check; providers=0 on a provider file ⇒
@@ -244,7 +280,8 @@ function applyCheckPayload(doc, payload) {
   output.appendLine(
     `[blade] ${path.basename(doc.fileName)}: bindings=${(payload.bindings || []).length}` +
       ` providers=${(payload.providers || []).length} diagnostics=${(payload.diagnostics || []).length}` +
-      (payload.tier ? ` tier=${payload.tier}` : "")
+      (payload.tier ? ` tier=${payload.tier}` : "") +
+      (parseFailure ? " (parse failure — kept last-good hovers)" : "")
   );
   // Lenses (signature/array/deduction, workstream 4) are computed from the
   // same caches just updated above — tell VS Code to re-ask so they track
@@ -2779,6 +2816,9 @@ module.exports._test = {
   bindingsByDoc,
   kernelsByDoc,
   applyCheckPayload,
+  isParseFailurePayload,
+  callsByDoc,
+  providersByDoc,
   displayType,
   // Navigation (workstream 2).
   referencesByDoc,

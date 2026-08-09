@@ -193,6 +193,30 @@ async function testBareExpressionEcho() {
   check("bare expr: label omits 'name ='", textOf(execution._outputs[0].items[0]) === "2 : Int64", textOf(execution._outputs[0].items[0]));
 }
 
+// A function declaration binds a NAME with a signature but no value. The echo
+// must drop the ` = ` rather than render an empty one -- `covariance =  : (..)`
+// was what a `function` cell actually showed in the notebook.
+async function testFunctionDeclEcho() {
+  const execution = makeExecution();
+  const state = { keptSources: [] };
+  const resp = {
+    kept: true,
+    exitCode: 0,
+    lane: "interp",
+    elapsedMs: 1,
+    stdout: "",
+    stderr: "",
+    bindings: [{ name: "covariance", type: "(Array<Float64 like Idx<_>>) -> Float64", value: "" }],
+    diagnostics: [],
+  };
+  await _test.applyEvalResult(execution, resp, "function covariance(x: U^1) = 0.0", state);
+  check(
+    "function decl: label omits the empty ' = '",
+    textOf(execution._outputs[0].items[0]) === "covariance : (Array<Float64 like Idx<_>>) -> Float64",
+    textOf(execution._outputs[0].items[0])
+  );
+}
+
 async function testRejectedWithDiagnostics() {
   const execution = makeExecution();
   const state = { keptSources: [] };
@@ -537,6 +561,73 @@ function testRemapFanOut() {
   );
 }
 
+// --- 6b. A parse failure anywhere blanks the WHOLE assembled payload -------
+
+function testRemapCarriesParseFailureToEveryCell() {
+  // What the compiler answers when the assembled notebook doesn't parse: no
+  // bindings/references/calls/kernels at all, and ONE diagnostic wherever the
+  // parse stopped — here in cell 1's window. Cell 0's window is untouched by
+  // it and, judged on its own slice, is indistinguishable from an empty cell.
+  const windows = [
+    { startLine: 1, endLine: 2 },
+    { startLine: 3, endLine: 4 },
+  ];
+  const payload = {
+    tier: "fast",
+    diagnostics: [{ line: 4, col: 17, endLine: 4, endCol: 18, severity: "error", message: "Expected ')' but got '^'" }],
+    bindings: [],
+    references: [],
+    calls: [],
+    kernels: [],
+    providers: [],
+  };
+
+  const cell0 = _test.remapPayloadForCell(payload, windows, 0);
+  const cell1 = _test.remapPayloadForCell(payload, windows, 1);
+
+  check("the cell holding the parse error is flagged", cell1._parseFailure === true, cell1._parseFailure);
+  check(
+    "a cell with NO diagnostic of its own is flagged too — the failure is the notebook's",
+    cell0._parseFailure === true,
+    { diagnostics: cell0.diagnostics, flag: cell0._parseFailure }
+  );
+  check("the flagged cell still carries no diagnostic of its own", cell0.diagnostics.length === 0, cell0.diagnostics);
+
+  // End-to-end: cell 0's hovers survive a parse error introduced in cell 1.
+  const cellDoc0 = vscodeMock.makeDoc("let helper = 41", "pf_cell0.blade");
+  extTest.applyCheckPayload(cellDoc0, {
+    bindings: [{ name: "helper", kind: "value", line: 1, col: 5, type: "Int64" }],
+    references: [],
+    calls: [],
+    kernels: [],
+    providers: [],
+    diagnostics: [],
+  });
+  const hoverHelper = () => {
+    const h = extTest.hoverProvider.provideHover(cellDoc0, new mock.Position(0, 6));
+    return h && h.contents[0].value;
+  };
+  check("baseline: cell 0 hovers `helper`", !!hoverHelper() && hoverHelper().includes("Int64"), hoverHelper());
+
+  extTest.applyCheckPayload(cellDoc0, cell0);
+  check(
+    "cell 0 keeps its hover when cell 1 stops parsing",
+    !!hoverHelper() && hoverHelper().includes("Int64"),
+    hoverHelper()
+  );
+
+  // A payload with genuinely nothing to say (an empty notebook that parses)
+  // must NOT be flagged — that would freeze stale bindings forever.
+  const clean = _test.remapPayloadForCell(
+    { diagnostics: [], bindings: [], references: [], calls: [], kernels: [], providers: [] },
+    windows,
+    0
+  );
+  check("a clean empty payload is not flagged", clean._parseFailure === false, clean._parseFailure);
+  extTest.applyCheckPayload(cellDoc0, clean);
+  check("and it DOES clear the cell's bindings", !hoverHelper() || !hoverHelper().includes("Int64"), hoverHelper());
+}
+
 // --- Run -----------------------------------------------------------------------
 
 (async () => {
@@ -550,6 +641,7 @@ function testRemapFanOut() {
 
   await testKeptWithBindingAndStdout();
   await testBareExpressionEcho();
+  await testFunctionDeclEcho();
   await testRejectedWithDiagnostics();
   await testRejectedSingleDiagnosticNoTrailingOutput();
   await testGppLaneBadge();
@@ -558,6 +650,7 @@ function testRemapFanOut() {
 
   testRemapUnshiftsWrappedLineColumns();
   testRemapFanOut();
+  testRemapCarriesParseFailureToEveryCell();
 
   testInterruptMarksReplay();
   await testRestartClearsStateWithoutLiveClient();

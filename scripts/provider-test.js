@@ -605,6 +605,78 @@ function testHoverShadowing() {
   check("hover on g's use reflects the correct (Int64) binding, not Float64", !!md && md.includes("Int64") && !md.includes("Float64"), md);
 }
 
+// --- 8b. A parse failure keeps the last-good semantic caches -------------------
+
+function testParseFailureKeepsLastGoodHovers() {
+  const text = ["let x = 1", "function f(y: Int64) -> Int64 = y"].join("\n");
+  const lines = text.split("\n");
+  const doc = makeDoc(text, "parse_blackout.blade");
+
+  const xDef = spanOfWord(lines, 1, "x", 1);
+  const good = {
+    bindings: [
+      { name: "x", kind: "value", line: 1, col: xDef.col, type: "Int64" },
+      {
+        name: "f", kind: "function", line: 2, col: spanOfWord(lines, 2, "f", 1).col,
+        params: [{ name: "y", type: "Int64" }], ret: "Int64", where: [],
+      },
+    ],
+    references: [{ name: "x", kind: "value", def: xDef, uses: [] }],
+    calls: [{ name: "reduce", line: 2, col: 1, endLine: 2, endCol: 7 }],
+    kernels: [],
+    diagnostics: [],
+  };
+  _test.applyCheckPayload(doc, good);
+
+  const hoverX = () => {
+    const h = _test.hoverProvider.provideHover(doc, new mock.Position(0, xDef.col - 1));
+    return h && h.contents[0].value;
+  };
+  check("baseline: a clean payload gives `x` a typed hover", !!hoverX() && hoverX().includes("Int64"), hoverX());
+
+  // The compiler's parse-failure shape: every semantic array empty, one
+  // diagnostic. Applied verbatim this used to blank the caches.
+  _test.applyCheckPayload(doc, {
+    bindings: [],
+    references: [],
+    calls: [],
+    kernels: [],
+    diagnostics: [{ line: 2, col: 40, endLine: 2, endCol: 41, message: "Unexpected token: end of file", severity: "error" }],
+  });
+
+  check("parse failure is recognized", _test.isParseFailurePayload({ bindings: [], diagnostics: [{ message: "boom" }] }));
+  check(
+    "a clean payload with genuinely zero bindings is NOT a parse failure",
+    !_test.isParseFailurePayload({ bindings: [], diagnostics: [] })
+  );
+  check("hover on `x` survives the parse failure", !!hoverX() && hoverX().includes("Int64"), hoverX());
+  check("bindings cache kept", (_test.bindingsByDoc.get(doc.uri.toString()) || []).length === 2);
+  check("references cache kept", (_test.referencesByDoc.get(doc.uri.toString()) || []).length === 1);
+  check("calls cache kept", (_test.callsByDoc.get(doc.uri.toString()) || []).length === 1);
+  check(
+    "the diagnostic itself IS applied — the squiggle must still show",
+    (diagCollection.get(doc.uri) || []).length === 1,
+    diagCollection.get(doc.uri)
+  );
+
+  // A later payload that parses replaces the caches wholesale — the keep is
+  // a bridge across broken edits, not a cache that can never shrink.
+  _test.applyCheckPayload(doc, {
+    bindings: [{ name: "x", kind: "value", line: 1, col: xDef.col, type: "Float64" }],
+    references: [],
+    calls: [],
+    kernels: [],
+    diagnostics: [],
+  });
+  check("a parsing payload replaces the kept caches", !!hoverX() && hoverX().includes("Float64"), hoverX());
+  check("stale bindings are dropped, not merged", (_test.bindingsByDoc.get(doc.uri.toString()) || []).length === 1);
+
+  // The notebook fan-out's explicit flag: a cell whose own window holds no
+  // diagnostic still has to be told the NOTEBOOK failed to parse.
+  _test.applyCheckPayload(doc, { bindings: [], references: [], calls: [], kernels: [], diagnostics: [], _parseFailure: true });
+  check("_parseFailure keeps caches even with no diagnostic in this window", !!hoverX() && hoverX().includes("Float64"), hoverX());
+}
+
 // --- 9. Unit / Quantity declarations (scanDecls, hover, completions) -----------
 
 function testUnitQuantityDecls() {
@@ -689,6 +761,7 @@ function testActivationSmoke() {
   testSignatureLenses();
   testDiagnosticDocLinks();
   testHoverShadowing();
+  testParseFailureKeepsLastGoodHovers();
   testUnitQuantityDecls();
   testActivationSmoke();
 

@@ -190,9 +190,13 @@ const serializer = {
 // --- Output assembly (D4 in the plan) -----------------------------------------
 
 /** `name = value : type` for a named binding; bare-expression echoes (name
- *  === "") drop the `name = ` prefix. */
+ *  === "") drop the `name = ` prefix. A binding with NO value — a function
+ *  declaration, whose signature is the whole story — drops the ` = ` instead,
+ *  so `covariance` reads `covariance : (...) -> Float64` rather than the
+ *  dangling `covariance =  : (...) -> Float64`. */
 function formatBinding(b) {
-  return b.name ? `${b.name} = ${b.value} : ${b.type}` : `${b.value} : ${b.type}`;
+  const head = b.name && b.value ? `${b.name} = ${b.value}` : b.name || b.value;
+  return `${head} : ${b.type}`;
 }
 
 /** Cell-local `line:col message` — used for every diagnostic that ISN'T
@@ -678,6 +682,16 @@ function remapPayloadForCell(payload, windows, cellIndex) {
     calls,
     kernels,
     providers: payload.providers || [],
+    // A parse failure is a property of the ASSEMBLED source, not of any one
+    // cell: the compiler answers zero bindings for the whole notebook and a
+    // single diagnostic wherever the parse stopped. Every OTHER cell's
+    // window therefore holds no diagnostic and no bindings — indistinguishable
+    // from an empty cell — so the verdict has to be carried across the
+    // remap rather than re-derived from the slice. extension.js's
+    // applyCheckPayload reads this to keep that cell's last-good hovers
+    // instead of blanking every cell in the notebook over one bad line.
+    _parseFailure:
+      (payload.bindings || []).length === 0 && (payload.diagnostics || []).length > 0,
   });
 }
 
