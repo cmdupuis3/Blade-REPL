@@ -5,3 +5,6 @@ graft/
 # extraction). Re-fetchable from the URLs in docs/plotting-and-units-plan.md.
 # Note media/plotly.min.js is NOT here — that one ships inside the extension.
 vendor/
+
+# Built extension bundles from `vsce package` — reproducible from the tree.
+*.vsix
