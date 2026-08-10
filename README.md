@@ -86,3 +86,42 @@ npm test
 ```
 
 runs the hermetic suite (syntax gates, grammar/table consistency, provider tests against a vscode mock). Live suites need a built compiler (`BLADE_EXE` env var or the standard build locations): `npm run test:serve` (ide-serve protocol), `npm run test:repl` (REPL protocol), `npm run test:nav` (navigation providers against real compiler payloads), `npm run test:nb` (notebook eval session semantics).
+
+### Vendor dependencies (plotting)
+
+Two upstream graphics packages back the plots panel. Neither is an npm package —
+they are prebuilt artifacts pinned in [`deps.json`](deps.json) and fetched by a
+script, so "zero dependencies" above still holds.
+
+| Package | Version | Lands at | In git? |
+|---|---|---|---|
+| [plotly.js](https://plotly.com/javascript/) | 3.7.0 | `media/plotly.min.js` (4.85 MB) | **yes, committed** |
+| [GR](https://gr-framework.org/) | 0.73.26 | `vendor/gr/` (147 MB extracted) | no, gitignored |
+
+```bash
+npm run fetch-vendor            # fetch whatever is missing
+npm run fetch-vendor -- --check # verify presence + hashes, no network
+npm run fetch-vendor -- --force # re-fetch and re-extract regardless
+```
+
+plotly is the live backend and is **committed on purpose**: VS Code webviews have
+no network access, so the panel loads it from disk and it has to ship inside the
+.vsix. `fetch-vendor` normally just verifies its sha256 and does nothing.
+
+GR is the static-PNG backend for large grids, still stubbed in the UI. It is
+gitignored because it is 147 MB extracted and re-fetchable, so a fresh clone has
+to run `npm run fetch-vendor` before the GR path can work. The script picks the
+release asset matching `${process.platform}-${process.arch}`, reuses an
+already-downloaded tarball when its hash matches, and normalizes the archive's
+top-level directory away so the result always lands at exactly `vendor/gr/`.
+Only the Windows asset's hash is pinned today; the other platforms are recorded
+as `null`, and the script prints the hash it computed on first fetch so it can be
+pasted into `deps.json`.
+
+**GR runtime note:** `GRDIR` must point at `vendor/gr` and `$GRDIR/bin` must be on
+`PATH` — the Qt/GKS shared libraries live there. The extension's `serve` process
+will set both itself when the GR backend lands; nothing needs to be added to your
+shell profile.
+
+`npm test` only syntax-checks the fetcher. It deliberately does not run
+`--check`, which would fail on any clone that has not fetched GR.
