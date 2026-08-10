@@ -5,5 +5,9 @@ vendor/**
 graft/**
 docs/**
 scripts/**
+# Emitted C++ from `Blade.exe test` runs — regenerated build junk, ~4.5 MB
+# across ~74 files. Untracked, so it is invisible to `git status --porcelain`
+# checks but very much visible to vsce, which packages the working tree.
+generated_cpp_tests/**
 .ignore
 *.vsix
