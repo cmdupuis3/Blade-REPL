@@ -311,6 +311,70 @@ const EVAL_TIMEOUT_MS = 30000;
     JSON.stringify(isoB).slice(0, 300)
   );
 
+  // --- 6b. Mixed cells: declarations and bare expressions in ONE cell -------
+  //
+  // A prose-driven notebook cell routinely ends a run of declarations with the
+  // expression that shows what they did, and cells like
+  //
+  //     let t = b, c
+  //     t[0] + t[1]
+  //
+  // used to die whole with BL1999 ("Expected declaration but got identifier"):
+  // the engine classified the cell by its FIRST line and the file grammar
+  // rejected the rest. It now splits a cell into top-level statements and gives
+  // each the treatment it needs. Nothing about the response SHAPE changed —
+  // `bindings[]` simply carries one entry per statement, in cell order, with
+  // the expressions still reporting under the empty name.
+  const mix = "notebook-eval-test-session-mixed";
+  const mixedSrc = "let mp = 10\nlet mq = mp * 2\nmq + 1\nlet mr = mq + mp\nmr * 2";
+  const mixed = await evalReq(mix, mixedSrc, undefined, EVAL_TIMEOUT_MS);
+  check("mixed cell: kept (no BL1999 for the bare expressions)", mixed.kept === true, JSON.stringify(mixed).slice(0, 400));
+  check(
+    "mixed cell: one binding per statement, in cell order",
+    JSON.stringify((mixed.bindings || []).map((b) => [b.name, b.value])) ===
+      JSON.stringify([["mp", "10"], ["mq", "20"], ["", "21"], ["mr", "30"], ["", "60"]]),
+    JSON.stringify(mixed.bindings)
+  );
+  // The DECLARATIONS joined the session; the expressions stayed transient.
+  const mixedAfter = await evalReq(mix, "mr", undefined, EVAL_TIMEOUT_MS);
+  check(
+    "mixed cell: its declarations joined the session",
+    mixedAfter.kept === true && (mixedAfter.bindings || [])[0] && (mixedAfter.bindings || [])[0].value === "30",
+    JSON.stringify(mixedAfter).slice(0, 300)
+  );
+  // Re-running REPLACES the cell's earlier contribution rather than declaring
+  // its names a second time (which would not compile).
+  const mixedAgain = await evalReq(
+    mix,
+    "let mp = 100\nlet mq = mp * 2\nmq + 1\nlet mr = mq + mp\nmr * 2",
+    undefined,
+    EVAL_TIMEOUT_MS
+  );
+  check(
+    "mixed cell re-run: kept, with no duplicate-declaration diagnostics",
+    mixedAgain.kept === true && (mixedAgain.diagnostics || []).length === 0,
+    JSON.stringify(mixedAgain).slice(0, 400)
+  );
+  check(
+    "mixed cell re-run: every value recomputed from the new declaration",
+    JSON.stringify((mixedAgain.bindings || []).map((b) => b.value)) ===
+      JSON.stringify(["100", "200", "201", "300", "600"]),
+    JSON.stringify(mixedAgain.bindings)
+  );
+  // And a later cell rebinding ONE name of a mixed cell must not take the
+  // cell's other names down with it — the reason the split is per statement
+  // rather than a wrap-in-place of the whole cell.
+  const mixedRebind = await evalReq(mix, "let mp = 1", undefined, EVAL_TIMEOUT_MS);
+  const mixedSurvivor = await evalReq(mix, "mq", undefined, EVAL_TIMEOUT_MS);
+  check(
+    "rebinding one name of a mixed cell leaves its other names standing",
+    mixedRebind.kept === true &&
+      mixedSurvivor.kept === true &&
+      (mixedSurvivor.bindings || [])[0] &&
+      (mixedSurvivor.bindings || [])[0].value === "2",
+    JSON.stringify(mixedSurvivor).slice(0, 300)
+  );
+
   // --- 7. Two-cell notebook check through `checkCells` (N3) -----------------
   //
   // The exact request src/notebook.js's runNotebookCheck sends: the ordered
@@ -352,6 +416,34 @@ const EVAL_TIMEOUT_MS = 30000;
     "answer's reported line falls inside cell 1's window",
     !!answerBinding && !!cellWindows[1] && answerBinding.line >= cellWindows[1].startLine && answerBinding.line <= cellWindows[1].endLine,
     { answerBinding, window: cellWindows[1] }
+  );
+
+  // --- 7b. checkCells over a MIXED cell ---------------------------------------
+  //
+  // The check lane keeps a cell in one contiguous window (the wire carries one
+  // window per cell) and wraps each bare expression where it stands. Unwrapped,
+  // the assembled source does not parse — and one parse error is the answer for
+  // the WHOLE notebook, so a single mixed cell used to blank every other cell's
+  // hovers. The wrappers are `__cellK` (one expression) or `__cellK_j`
+  // (several), both filtered by SYNTHETIC_NAME_RE in src/notebook.js.
+  const mixedCells = ["let mx: Int64 = 2\nlet my: Int64 = 3\nmx + my", "let mz: Int64 = mx * my"];
+  const mixedCheck = (await checkCellsReq("fast", checkFile, mixedCells, EVAL_TIMEOUT_MS)) || {};
+  check(
+    "checkCells: a mixed declaration/expression cell parses with no diagnostics",
+    (mixedCheck.diagnostics || []).length === 0,
+    JSON.stringify(mixedCheck.diagnostics)
+  );
+  const mixedWindows = mixedCheck.windows || [];
+  check(
+    "checkCells: the mixed cell reports a wrapper on its expression line",
+    !!mixedWindows[0] && mixedWindows[0].wrapLine === mixedWindows[0].startLine + 2 && mixedWindows[0].wrapCol > 0,
+    JSON.stringify(mixedWindows)
+  );
+  const mzBinding = (mixedCheck.bindings || []).find((b) => b.name === "mz");
+  check(
+    "checkCells: the cell AFTER a mixed cell still typechecks against its bindings",
+    !!mzBinding,
+    JSON.stringify(mixedCheck.bindings)
   );
 
   // Clean shutdown.

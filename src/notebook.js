@@ -558,7 +558,11 @@ async function resetNotebookSession(notebookDoc) {
 // source that cell's text landed in. `{wrapLine, wrapCol}` appear only when
 // the compiler wrapped that cell in a synthetic binding (absolute line /
 // prefix length, so shiftSpan can pull the wrapped line's columns back to
-// cell-local); a cell whose definition a later cell superseded gets a
+// cell-local). A cell mixing declarations with SEVERAL bare expressions takes
+// one wrapper per expression but the pair names only the FIRST, so columns on
+// a later wrapped line in that cell read un-shifted — a cosmetic offset, and
+// the alternative it replaced was that cell not parsing at all, which made one
+// BL1999 the whole notebook's payload. A cell whose definition a later cell superseded gets a
 // one-line BLANK range — its own text is not in the assembly at all, so no
 // span can land inside it and nothing fans out, while it still occupies a
 // distinct line so no two cells' windows ever overlap. Everything below consumes
@@ -567,8 +571,13 @@ async function resetNotebookSession(notebookDoc) {
 
 /** The compiler's synthetic wrapper binding for a bare-expression cell
  *  (`let __cellK = `, k = the 0-based cell index) — an implementation detail
- *  of the assembly, never a hover/completion/lens candidate. */
-const SYNTHETIC_NAME_RE = /^__cell\d+$/;
+ *  of the assembly, never a hover/completion/lens candidate.
+ *
+ *  A cell that MIXES declarations with bare expressions takes one wrapper per
+ *  expression, numbered `__cellK_j`; only the single-expression cell keeps the
+ *  bare `__cellK` spelling. Both shapes are equally synthetic and both have to
+ *  be filtered, or a mixed cell grows phantom hovers and completions. */
+const SYNTHETIC_NAME_RE = /^__cell\d+(_\d+)?$/;
 
 /** Shift a span's `line`/`endLine` (whichever are present) into `win`'s
  *  cell-local coordinate system — `win.startLine` (1-based, inclusive)

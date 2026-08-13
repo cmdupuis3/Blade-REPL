@@ -454,6 +454,41 @@ function testRemapUnshiftsWrappedLineColumns() {
   );
 }
 
+function testRemapFiltersMixedCellWrappers() {
+  // A cell mixing declarations with SEVERAL bare expressions takes one wrapper
+  // per expression, numbered `__cellK_j`. The window still names only the
+  // first wrap (one pair on the wire), but every wrapper is synthetic and has
+  // to be filtered — `/^__cell\d+$/` matched none of them, so each one showed
+  // up as a hover/completion candidate in the cell that owns it AND, via the
+  // foreign-binding clamp, in every cell after it.
+  const windows = [{ startLine: 1, endLine: 4, wrapLine: 2, wrapCol: "let __cell0_0 = ".length }];
+  const payload = {
+    diagnostics: [],
+    bindings: [
+      { name: "ma", line: 1, col: 5 },
+      { name: "__cell0_0", line: 2, col: 5 },
+      { name: "mb", line: 3, col: 5 },
+      { name: "__cell0_1", line: 4, col: 5 },
+    ],
+    references: [{ name: "__cell0_1", kind: "value", def: { line: 4, col: 5, endLine: 4, endCol: 14 }, uses: [] }],
+    calls: [],
+    kernels: [],
+    providers: [],
+  };
+  const cell0 = _test.remapPayloadForCell(payload, windows, 0);
+  check(
+    "every __cellK_j wrapper of a mixed cell is filtered out",
+    !cell0.bindings.some((b) => /^__cell\d+(_\d+)?$/.test(b.name)),
+    cell0.bindings
+  );
+  check(
+    "the user's own bindings in a mixed cell survive the filter",
+    JSON.stringify(cell0.bindings.map((b) => b.name)) === JSON.stringify(["ma", "mb"]),
+    cell0.bindings
+  );
+  check("a __cellK_j reference entry is filtered too", cell0.references.length === 0, cell0.references);
+}
+
 // --- 6. Remap fan-out: canned checkCells payload, two cells ----------------
 
 function testRemapFanOut() {
@@ -649,6 +684,7 @@ function testRemapCarriesParseFailureToEveryCell() {
   await testStderrOutput();
 
   testRemapUnshiftsWrappedLineColumns();
+  testRemapFiltersMixedCellWrappers();
   testRemapFanOut();
   testRemapCarriesParseFailureToEveryCell();
 
