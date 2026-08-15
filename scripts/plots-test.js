@@ -10,7 +10,7 @@
 
 const vscodeMock = require("./vscode-mock");
 const mock = vscodeMock.install();
-const display = require("../src/display");
+const display = require("@blade-lang/ide-protocol").display;
 const plots = require("../src/plots");
 const nb = require("../src/notebook");
 const _p = plots._test;
