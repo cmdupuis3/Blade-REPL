@@ -41,6 +41,23 @@ const KEYWORD_CALLABLES = new Set(["pure", "guard", "reynolds"]);
 // keywords (registered handlers, e.g. PPL's indep — PplElaborate.fs).
 const CONJUNCT_KEYWORDS = new Set(["indep"]);
 
+// builtins.identifiers categories the v1 surface.json actually enumerates
+// (verified against a real generated surface.json at integration): "core"/
+// "virtual"/"static"/"math" names all land in
+// keywords/builtins/builtinCalls/mathIntrinsics. "autodiff"/"ppl"/"ml" domain
+// builtins (module-qualified — ppl.dist(...), ml.linear(...), ad.grad(...))
+// and the "module" category itself (ad/ppl/ml/rand/spectra/sgs import
+// targets) are NOT dumped by `blade ide surface` — they live in each domain
+// elaborator's own registration, not the central
+// StaticEval.knownBuiltinNames()/Ide.builtinCallNames lists the surface
+// generator reads. That's a real v1 schema gap, not an extension content
+// bug: group 2's existing grammar<->hover check already covers these
+// categories directly (CATEGORY_SCOPE), with no surface.json dependency —
+// so 2b/6's SURFACE-membership checks below skip categories the surface
+// doesn't claim to cover, rather than false-failing on a gap in the data
+// source.
+const SURFACE_COVERED_CATEGORIES = new Set(["core", "virtual", "static", "math"]);
+
 // builtins category -> the grammar scope its names must be highlighted under.
 // Deliberately absent: "module" (ad/ppl/ml) — module names are ordinary
 // identifiers, not highlighted words; their entries are hover-only.
@@ -182,13 +199,14 @@ function warn(check, items) {
 
 {
   const union = builtinsSurfaceUnion();
+  const covered = ([name, e]) => SURFACE_COVERED_CATEGORIES.has(e.category);
   // KEYWORD_CALLABLES names ARE required to be in the union too (they're real
   // lexer keywords per keywords.js's own header) — checked separately from
   // the general skip below so a stale KEYWORD_CALLABLES entry still gets
   // caught rather than silently exempted.
-  const missing = Object.keys(builtins.identifiers).filter(
-    (name) => !KEYWORD_CALLABLES.has(name) && !union.has(name)
-  );
+  const missing = Object.entries(builtins.identifiers)
+    .filter(([name, e]) => !KEYWORD_CALLABLES.has(name) && covered([name, e]) && !union.has(name))
+    .map(([name]) => name);
   const missingCallables = [...KEYWORD_CALLABLES].filter((name) => builtins.identifiers[name] && !union.has(name));
   const all = missing.concat(missingCallables);
   if (all.length)
@@ -245,9 +263,23 @@ function warn(check, items) {
 
 {
   const scalarTypes = new Set(surface.scalarTypes || []);
-  const primMissing = Object.keys(types.primitives).filter((t) => !scalarTypes.has(t));
+  // "Unit" is in types.primitives but the compiler classifies it as a lexer
+  // keyword only (KwUnit — it doubles as the `Unit meters` declaration
+  // keyword), not as a member of surface.scalarTypes; verified against a
+  // real generated surface.json. Exempt via surfaceKeywordWords rather than
+  // hardcoding "Unit" specifically, since the underlying fact (it's a real
+  // keyword) is already data-backed.
+  const primMissing = Object.keys(types.primitives).filter(
+    (t) => !scalarTypes.has(t) && !surfaceKeywordWords.has(t)
+  );
   if (primMissing.length) fail("types.primitives entry not in surface.scalarTypes", primMissing);
-  const primOrphans = [...scalarTypes].filter((t) => !(t in types.primitives));
+  // "Poly" and "Array" are in surface.scalarTypes but hover elsewhere: Poly
+  // under types.constructors, Array via extension.js's dynamic Array<...>
+  // hover (never a static table entry) — same exemption shape as group 4's
+  // supportOrphans right above.
+  const primOrphans = [...scalarTypes].filter(
+    (t) => !(t in types.primitives) && t !== "Array" && !(t in types.constructors)
+  );
   if (primOrphans.length) fail("surface.scalarTypes entry without a types.primitives hover", primOrphans);
 
   // Idx/SymIdx/AntisymIdx/... and Poly are lexer keywords in the compiler;
@@ -316,8 +348,17 @@ function warn(check, items) {
   const union = group6SurfaceUnion();
   const exempt = new Set([...GRAMMAR_EXTRAS, ...CONJUNCT_KEYWORDS]); // Dist, True/False, indep
 
+  // builtins.identifiers is filtered to SURFACE_COVERED_CATEGORIES for the
+  // same reason as 2b: autodiff/ppl/ml/module names aren't in v1
+  // surface.json at all (a data-source gap, not a hover-table bug), so they
+  // can never be found here regardless of how accurate the hover entry is —
+  // including them would just repeat 2b's FAIL under a different heading.
+  const coveredBuiltinNames = Object.entries(builtins.identifiers)
+    .filter(([, e]) => SURFACE_COVERED_CATEGORIES.has(e.category))
+    .map(([name]) => name);
+
   const hoverNames = new Set([
-    ...Object.keys(builtins.identifiers),
+    ...coveredBuiltinNames,
     ...Object.keys(types.primitives),
     ...Object.keys(types.indexTypes),
     ...Object.keys(types.constructors),

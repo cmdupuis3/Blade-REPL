@@ -119,7 +119,7 @@
           "name": "keyword.control.import.blade"
         },
         {
-          "match": "\\b(let|rec|const|function|lambda|type|struct|interface|impl|module)\\b",
+          "match": "\\b(let|rec|function|lambda|type|struct|interface|impl|module)\\b",
           "name": "storage.type.blade"
         },
         {
