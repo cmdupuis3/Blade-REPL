@@ -143,6 +143,15 @@ const identifiers = {
     ],
     ret: "CompoundIdx<mask> -> IdxTail... -> T",
   },
+  sparse: {
+    category: "core",
+    doc: "Bundles rank-1 values with a key set into a SparseIdx-backed array — the inverse direction of iterating a SparseIdx key set (the in-language analog of a provider's load_sparse). Sibling of compound, for the hashed/keyed index family instead of the masked one.",
+    params: [
+      { name: "values", type: "Idx<N> -> T", doc: "rank-1 values, one per key, in key order" },
+      { name: "keys", type: "(Nat, ...)^N", doc: "the key set (tuples); SparseIdx<keys> becomes the result's index type" },
+    ],
+    ret: "SparseIdx<keys> -> T",
+  },
   zip: {
     category: "core",
     doc: "Co-iterates arrays over a shared index space.",
@@ -158,6 +167,15 @@ const identifiers = {
       { name: "a, ...", type: "(Idx... -> T)...", doc: "same-shaped arrays to stack" },
     ],
     ret: "Idx<N> -> Idx... -> T",
+  },
+  join: {
+    category: "core",
+    doc: "Concatenates arrays along dimension d (formalism §2.6). Variadic (join(a, b, a, 0) is legal); every operand's rank must match and every non-d extent must agree — a mismatch rejects. Sibling of subset/split; split then join round-trips.",
+    params: [
+      { name: "a, ...", type: "(Idx... -> T)...", doc: "same-rank arrays agreeing on every extent except d" },
+      { name: "d", type: "Int (static)", doc: "dimension to concatenate along" },
+    ],
+    ret: "Idx... -> T  (extent along d is the sum of the operands')",
   },
   sort: {
     category: "core",
@@ -379,6 +397,11 @@ const identifiers = {
     category: "virtual",
     sig: "reverse<I> : virtual Array<Int64 like I>",
     doc: "Reversed index positions of I — same virtual-array kind as range<>. Planned: parses today, but of the virtual-array family only range<> (and the anonymous lo..hi) is fully implemented; reverse<> and blocked<I, K> are still landing.",
+  },
+  halo: {
+    category: "virtual",
+    sig: "halo<I, [o1, ..., ok]>\nrange<halo<I, [o1, ..., ok]>, J, ...>  (composes per-axis)",
+    doc: "Stencil / rolling-window index former, same virtual-array kind as range<>: each position of I gets a WINDOW w carrying the given offsets, read with w(o) — an offset relative to the current position, e.g. `method_for(halo<K, [-1, 0, 1]>) <@> lambda(w) -> A(w(1)) - A(w(-1))`. Composes per-axis inside range: `range<halo<Lat, [-1, 0, 1]>, Lon>`. Offsets that would run outside I's extent are guarded — BL3016 at typecheck when statically detectable, BL8009 at runtime otherwise. Over a CompoundIdx, offsets walk the PRESENT cells only, so \"next\" skips masked-out positions.",
   },
 
   // --- Autodiff (Grad.fs) -------------------------------------------------------

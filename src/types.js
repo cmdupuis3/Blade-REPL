@@ -91,6 +91,10 @@ const indexTypes = {
     sig: "IrrepsIdx<l: Nat, parity: bool, mult: Nat>",
     desc: "Irreps-structured index: block layout from a static `(l, parity, mult)` spec (equivariant-ML arrays). Navigate blocks with the static builtins `ml.irreps_offset` / `ml.irreps_dim` / `ml.irreps_len` / ...",
   },
+  PgIrrepsIdx: {
+    sig: "PgIrrepsIdx<GROUP, l: Nat, parity: bool, mult: Nat>",
+    desc: "Point-group irreps-structured index: the finite point-group analog of IrrepsIdx — a static `(l, parity, mult)` spec block-laid out under a specific finite point group GROUP rather than group-less O(3) (equivariant-ML arrays). Navigate blocks with the static builtins `ml.pg_irreps_offset` / `ml.pg_irreps_dim` / `ml.pg_irreps_len` / ...",
+  },
 };
 
 // Other built-in type constructors that aren't primitives, index types, or
