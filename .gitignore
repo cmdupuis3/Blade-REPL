@@ -5,3 +5,8 @@ graft/
 # extraction). Re-fetchable from the URLs in docs/plotting-and-units-plan.md.
 # Note media/plotly.min.js is NOT here — that one ships inside the extension.
 vendor/
+# ...except the vendored @blade-lang/ide-protocol tarball itself (npm pack
+# output of ../Blade/protocol, refreshed by `npm run vendor:protocol`) — that
+# one IS committed, since it's this extension's only runtime dependency and
+# there is no npm registry involved.
+!vendor/blade-lang-ide-protocol-*.tgz
