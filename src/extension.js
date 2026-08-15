@@ -13,8 +13,8 @@
 
 const vscode = require("vscode");
 const cp = require("child_process");
-const fs = require("fs");
 const path = require("path");
+const pkg = require("@blade-lang/ide-protocol");
 const builtins = require("./builtins");
 const types = require("./types");
 const keywords = require("./keywords");
@@ -62,31 +62,15 @@ const referencesByDoc = new Map();
 // Warn about a missing compiler only once per session.
 let warnedNoCompiler = false;
 
-const CANDIDATE_COMPILERS = [
-  "Blade", // PATH
-  // Canonical compiler repo (standard .NET layout). findCompiler() picks the
-  // most-recently-built of these, so Release/Debug both work.
-  "C:\\Users\\cdupu\\Documents\\GitHub\\Blade\\bin\\Release\\net7.0\\Blade.exe",
-  "C:\\Users\\cdupu\\Documents\\GitHub\\Blade\\bin\\Debug\\net7.0\\Blade.exe",
-];
-
+/** Resolution precedence (delegated to the package, shared with every other
+ *  Blade tool that needs to find a compiler): the `blade.compilerPath`
+ *  setting, then the `BLADE_EXE` environment variable (NEW — previously only
+ *  the standalone test scripts honored this; see the README), then the
+ *  newest-built of the package's default candidate locations, then `Blade`
+ *  on PATH. */
 function findCompiler() {
   const configured = vscode.workspace.getConfiguration("blade").get("compilerPath", "");
-  if (configured) return configured;
-  // Prefer the most recently built binary — a stale Release build next to a
-  // fresh Debug build would otherwise report errors the compiler no longer
-  // produces (e.g. ML statics before their elaboration pass landed).
-  let best;
-  for (const c of CANDIDATE_COMPILERS) {
-    if (c === "Blade") continue; // tried last, via spawn failure
-    try {
-      const mtime = fs.statSync(c).mtimeMs;
-      if (!best || mtime > best.mtime) best = { path: c, mtime };
-    } catch {
-      // candidate doesn't exist
-    }
-  }
-  return best ? best.path : "Blade";
+  return pkg.resolveCompiler({ explicitPath: configured || undefined, env: process.env }).exe;
 }
 
 function run(exe, args, timeoutMs, cwd) {
@@ -125,14 +109,34 @@ const ARROW_RE = /^-->\s*(?:(.+?):)?(\d+):(\d+)\s*$/;
 // code stays a plain string so a future BL-code can't silently claim a
 // broken link. Deduction/pin codes only today (BL4010 comm, BL4011
 // anticomm, BL4014 rank) — the codes the new code actions/lenses act on.
-const DIAG_DOC_TARGET = vscode.Uri.file("C:\\Users\\cdupu\\Documents\\GitHub\\Blade\\docs\\features.md");
 const DIAG_DOC_CODES = new Set(["BL4010", "BL4011", "BL4014"]);
 
+// Resolved lazily and cached: repo discovery needs findCompiler()'s result,
+// which is only meaningful once the extension has activated. `undefined` =
+// not yet resolved; `null` = resolved, no repo found (cached so a missing
+// repo isn't re-walked on every diagnostic) — the blade.compilerPath change
+// handler in activate() resets this to `undefined` since a new compiler may
+// live in a different checkout.
+let diagDocTargetCache;
+
+function diagDocTarget() {
+  if (diagDocTargetCache === undefined) {
+    const root = pkg.resolveRepoRoot({ exe: findCompiler(), env: process.env });
+    diagDocTargetCache = root ? vscode.Uri.file(path.join(root, "docs", "features.md")) : null;
+  }
+  return diagDocTargetCache;
+}
+
 /** A diagnostic `code` value: `{value, target}` (VS Code renders this as a
- *  clickable link) for the known deduction/pin codes, the plain string
- *  otherwise. */
+ *  clickable link) for the known deduction/pin codes WHEN a Blade checkout
+ *  resolves (see diagDocTarget) — the plain string otherwise, so a compiler
+ *  with no discoverable repo root (standalone install, or `Blade` on PATH
+ *  with no checkout nearby) degrades to an inert code instead of a broken
+ *  link. */
 function diagnosticCode(code) {
-  return code && DIAG_DOC_CODES.has(code) ? { value: code, target: DIAG_DOC_TARGET } : code;
+  if (!code || !DIAG_DOC_CODES.has(code)) return code;
+  const target = diagDocTarget();
+  return target ? { value: code, target } : code;
 }
 
 /** The plain string form of a diagnostic's `code`, whether it's still a bare
@@ -2787,6 +2791,7 @@ function activate(context) {
       if (e.affectsConfiguration("blade.compilerPath")) {
         warnedNoCompiler = false;
         ideMode = "unknown"; // a new compiler may support serve or JSON mode
+        diagDocTargetCache = undefined; // a new compiler may live in a different checkout
         serve.dispose(); // kill the old process; the next check() re-probes fresh
       }
     })

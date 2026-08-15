@@ -28,7 +28,7 @@
 
 const vscode = require("vscode");
 const path = require("path");
-const display = require("./display");
+const display = require("@blade-lang/ide-protocol").display;
 
 // Injected by init(): { output } from extension.js.
 let deps;

@@ -23,8 +23,9 @@
 const vscode = require("vscode");
 const cp = require("child_process");
 const path = require("path");
-const proto = require("./replProto");
-const display = require("./display");
+const pkg = require("@blade-lang/ide-protocol");
+const proto = pkg.replProto;
+const display = pkg.display;
 
 // Injected by init(): { findCompiler, reportNoCompiler } from extension.js.
 let deps;
