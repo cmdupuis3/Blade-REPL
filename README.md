@@ -108,7 +108,7 @@ script, so "zero dependencies" above still holds.
 | Package | Version | Lands at | In git? |
 |---|---|---|---|
 | [plotly.js](https://plotly.com/javascript/) | 3.7.0 | `media/plotly.min.js` (4.85 MB) | **yes, committed** |
-| [GR](https://gr-framework.org/) | 0.73.26 | `vendor/gr/` (147 MB extracted) | no, gitignored |
+| [GR](https://gr-framework.org/) | 0.73.26 | `vendor/gr/` (~30 MB headless subset) | no, gitignored |
 
 ```bash
 npm run fetch-vendor            # fetch whatever is missing
@@ -121,11 +121,16 @@ no network access, so the panel loads it from disk and it has to ship inside the
 .vsix. `fetch-vendor` normally just verifies its sha256 and does nothing.
 
 GR is the static-PNG backend for large grids, still stubbed in the UI. It is
-gitignored because it is 147 MB extracted and re-fetchable, so a fresh clone has
+gitignored because it is large and re-fetchable, so a fresh clone has
 to run `npm run fetch-vendor` before the GR path can work. The script picks the
 release asset matching `${process.platform}-${process.arch}`, reuses an
 already-downloaded tarball when its hash matches, and normalizes the archive's
 top-level directory away so the result always lands at exactly `vendor/gr/`.
+Extraction is pruned to the headless render subset pinned in `deps.json`
+(`keep`): ~30 MB instead of the 147 MB full tree, verified to render
+byte-identical PNGs (see `docs/gr-graphics-plan.md` §7). Pass `--full` (with
+`--force` to re-extract an existing tree) when you want the whole thing —
+`gksqt.exe` for interactive debugging, `videoplugin.dll` for animation work.
 Only the Windows asset's hash is pinned today; the other platforms are recorded
 as `null`, and the script prints the hash it computed on first fetch so it can be
 pasted into `deps.json`.
