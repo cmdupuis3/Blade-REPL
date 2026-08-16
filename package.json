@@ -27,7 +27,7 @@
     "fetch-vendor": "node scripts/fetch-vendor.js"
   },
   "dependencies": {
-    "@blade-lang/ide-protocol": "file:vendor/blade-lang-ide-protocol-0.19.2.tgz"
+    "@blade-lang/ide-protocol": "file:vendor/blade-lang-ide-protocol-0.20.0.tgz"
   },
   "contributes": {
     "languages": [

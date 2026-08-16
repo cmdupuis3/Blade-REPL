@@ -17,6 +17,7 @@ const fs = require("fs");
 const path = require("path");
 const pkg = require("@blade-lang/ide-protocol");
 const proto = pkg.serveProto;
+const gr = require("../src/gr");
 
 function findExe() {
   // env BLADE_EXE -> newest-mtime DEFAULT_CANDIDATES -> "Blade" on PATH, now
@@ -34,7 +35,21 @@ function findExe() {
 
 const exe = findExe();
 console.log(`compiler: ${exe}`);
-const proc = cp.spawn(exe, ["ide", "serve"], { windowsHide: true });
+// Spawn with the composed GR environment when a GR install resolves (this
+// repo's vendor/gr after `npm run fetch-vendor`) — the same thing
+// extension.js's grSpawnEnv does — so the renderPlot section below can drive
+// a real render. Without GR the child inherits untouched and that section
+// skips on the serve process's own error.
+const grState = gr.resolveGr({
+  configuredPath: process.env.BLADE_GR_PATH || "",
+  workspaceRoot: path.join(__dirname, ".."),
+  extensionRoot: path.join(__dirname, ".."),
+});
+console.log(grState.ok ? `gr: ${grState.grdir}` : `gr: unavailable — ${grState.reason}`);
+const proc = cp.spawn(exe, ["ide", "serve"], {
+  windowsHide: true,
+  env: grState.ok ? gr.grEnv(grState.grdir) : undefined,
+});
 proc.stdout.setEncoding("utf8");
 proc.stderr.setEncoding("utf8");
 
@@ -202,6 +217,39 @@ const badSource = 'let x: Int64 = "not a number"\n';
     Array.isArray(resB.diagnostics) && resB.diagnostics.length > 0,
     JSON.stringify(resB).slice(0, 300)
   );
+
+  // renderPlot: the GR round-trip. Probe-and-skip on compilers predating the
+  // verb (the unknown-cmd contract) and on machines where the serve process
+  // reports GR unavailable — assert the frame everywhere else.
+  if (typeof proto.encodeRenderPlot !== "function") {
+    console.log("SKIP renderPlot — vendored protocol package predates the verb");
+  } else {
+    const spec = { data: [{ type: "scatter", mode: "lines", x: [0, 1, 2, 3], y: [0, 1, 0, 1] }], layout: {} };
+    const rpId = nextId++;
+    const rp = await send(rpId, (i) => proto.encodeRenderPlot(i, { spec, plotId: "live-1", width: 320, height: 240 }), 60000);
+    if (rp.error && /unknown cmd/.test(rp.error)) {
+      console.log("SKIP renderPlot — compiler predates the verb");
+    } else if (rp.error && /(GR unavailable|helper not found)/.test(rp.error)) {
+      console.log(`SKIP renderPlot — ${rp.error}`);
+    } else {
+      check(
+        "renderPlot answers a base64 image/png frame",
+        rp.frame && rp.frame.mime === "image/png" && rp.frame.encoding === "base64",
+        JSON.stringify(rp).slice(0, 200)
+      );
+      check(
+        "renderPlot frame carries the plot id and the gr backend",
+        rp.frame && rp.frame.meta && rp.frame.meta.id === "live-1" && rp.frame.meta.backend === "gr",
+        rp.frame && JSON.stringify(rp.frame.meta)
+      );
+      check("renderPlot frame infers backend gr", rp.frame && pkg.display.backendFor(rp.frame) === "gr");
+      const bytes = Buffer.from((rp.frame && rp.frame.data) || "", "base64");
+      check("renderPlot payload is a PNG", bytes.slice(1, 4).toString() === "PNG", bytes.slice(0, 8).toString("hex"));
+      const w = bytes.length > 24 ? bytes.readUInt32BE(16) : 0;
+      const h = bytes.length > 24 ? bytes.readUInt32BE(20) : 0;
+      check("renderPlot honors the requested size", w === 320 && h === 240, `${w}x${h}`);
+    }
+  }
 
   // Clean shutdown.
   proc.stdin.write(proto.encodeShutdown());
