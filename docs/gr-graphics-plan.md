@@ -252,6 +252,17 @@ excluded from the default vendor subset until then.*
 ~80 MB of JSON — over the 32 MB frame cap. The already-planned stdlib server-side
 decimation + `bdata` typed arrays is the enabler; GR work here is nil beyond §4.1's
 contour decimation.
+*Status: **decimation done** 2026-08-16 (Blade `02b3035`, after merging master at
+`132443b` — which brought the plot.blade valid-JSON fix and the group_keys interp fix).
+The three grid factories gain a `maxdim` slot (default 512): 2000² measured 74.4 MB →
+4.9 MB. Language reality shaped the semantics: extents are static types, so the cap
+resolves through a power-of-two budget ladder (16…512), sample k reading index (k·n)/B;
+under-cap grids are byte-pinned unchanged; a lopsided over-cap grid resamples BOTH axes
+(bounded at B², documented wart). Verified end-to-end: a 1600² in-language grid evaluated
+through serve arrived as a 512² / 4.65 MiB frame and GR-rendered correctly. Suites
+4897/0 and --interp 6464/0. **`bdata` typed arrays remain open** — they need new
+byte-parity serializer builtins in both lane writers plus panel/helper acceptance, and
+only pay once grids ≫512² must reach the panel undecimated.*
 
 **Later / opportunistic:** prebuilt `blade-gr-render` per platform; Blade-MCP calling
 `renderPlot` directly so agent clients get raster plots (today plotly frames degrade to
