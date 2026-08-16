@@ -444,6 +444,51 @@ async function testGrRoundTrip() {
   plots.dispose();
 }
 
+// --- 4c. SVG/PDF export through the GR worker ----------------------------------
+
+async function testGrExport() {
+  const calls = [];
+  _p.setDeps({
+    output: { appendLine: () => {} },
+    findGr: () => ({ ok: true, grdir: "C:/fake/gr", source: "test" }),
+    renderPlot: (args) => {
+      calls.push(args);
+      const mime = args.format === "pdf" ? "application/pdf" : "image/svg+xml";
+      return Promise.resolve({
+        frame: { v: 1, mime, encoding: "base64", data: Buffer.from("<svg/>").toString("base64"), meta: { id: args.plotId, backend: "gr" } },
+      });
+    },
+  });
+
+  display.ingestReplText(display.encodeReplLine(plotlyFrame({ meta: { id: "ex1", title: "waves & spume" } })), "repl");
+  const panels = mock.window._webviewPanels;
+  const panel = panels[panels.length - 1];
+  panel.webview._send({ type: "ready" });
+
+  const entriesBefore = _p.history.entries.length;
+  panel.webview._send({ type: "export", format: "svg", width: 900, height: 700 });
+  await new Promise((r) => setImmediate(r));
+  const exported = panel._posted.filter((m) => m.type === "exportData").pop();
+  check("gr export: bytes posted back", !!exported && exported.mime === "image/svg+xml", exported && exported.mime);
+  check("gr export: filename from a sanitized title", !!exported && exported.filename === "waves_spume.svg", exported && exported.filename);
+  check("gr export: format forwarded to renderPlot", calls.length === 1 && calls[0].format === "svg", calls[0] && calls[0].format);
+  check("gr export: not cached in history", _p.history.entries.length === entriesBefore, _p.history.entries.length - entriesBefore);
+
+  panel.webview._send({ type: "export", format: "pdf", width: 900, height: 700 });
+  await new Promise((r) => setImmediate(r));
+  const pdf = panel._posted.filter((m) => m.type === "exportData").pop();
+  check("gr export: pdf round-trip", !!pdf && pdf.mime === "application/pdf" && /\.pdf$/.test(pdf.filename), pdf && pdf.filename);
+
+  // A spec-less entry (image-only, no plotly sibling) cannot export.
+  display.ingestReplText(display.encodeReplLine(pngFrame({ meta: { title: "raster only" } })), "repl");
+  panel.webview._send({ type: "export", format: "svg", width: 900, height: 700 });
+  await new Promise((r) => setImmediate(r));
+  const noteMsg = panel._posted.filter((m) => m.type === "note" && m.message).pop();
+  check("gr export: spec-less entry surfaces a note", !!noteMsg && /no spec retained/.test(noteMsg.message), noteMsg);
+
+  plots.dispose();
+}
+
 // --- 5. Notebook cell outputs -------------------------------------------------
 
 function testNotebookDisplayOutputs() {
@@ -602,6 +647,7 @@ function testReplayedFrameStillRoutesToPanel() {
 
   await testDemoEndToEnd();
   await testGrRoundTrip();
+  await testGrExport();
 
   if (failures) {
     console.error(`\n${failures} plot check(s) failed.`);

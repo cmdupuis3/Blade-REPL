@@ -282,6 +282,7 @@ function panelHtml(opts) {
     <span class="sep"></span>
     <button id="exportPng" title="Export PNG" disabled>PNG</button>
     <button id="exportSvg" title="Export SVG" disabled>SVG</button>
+    <button id="exportPdf" title="Export PDF (GR renders)" disabled>PDF</button>
     <span id="title"></span>
   </div>
   <div id="stage">
@@ -316,6 +317,7 @@ function webviewScript() {
     "  var elFallback = document.getElementById('fallback');",
     "  var elPng = document.getElementById('exportPng');",
     "  var elSvg = document.getElementById('exportSvg');",
+    "  var elPdf = document.getElementById('exportPdf');",
     "  var elNote = document.getElementById('note');",
     "  var elStage = document.getElementById('stage');",
     "  var current = null;   // {frame, title, index, total}",
@@ -425,6 +427,12 @@ function webviewScript() {
     "      download('data:' + current.frame.mime + ';base64,' + String(current.frame.data).replace(/\\s+/g, ''), fileBase() + '.png');",
     "      return;",
     "    }",
+    // SVG/PDF of a GR render: the host re-renders the retained spec in the
+    // requested format through the serve worker and posts the bytes back.
+    "    if ((format === 'svg' || format === 'pdf') && /^image\\//.test(current.frame.mime)) {",
+    "      api.postMessage({ type: 'export', format: format, width: elStage.clientWidth, height: elStage.clientHeight });",
+    "      return;",
+    "    }",
     "    api.postMessage({ type: 'error', message: 'this plot cannot be exported as ' + format });",
     "  }",
     "",
@@ -432,6 +440,7 @@ function webviewScript() {
     "  elNext.addEventListener('click', function () { api.postMessage({ type: 'nav', delta: 1 }); });",
     "  elPng.addEventListener('click', function () { exportAs('png'); });",
     "  elSvg.addEventListener('click', function () { exportAs('svg'); });",
+    "  elPdf.addEventListener('click', function () { exportAs('pdf'); });",
     "  Array.prototype.forEach.call(document.querySelectorAll('.backend'), function (b) {",
     "    b.addEventListener('click', function () {",
     "      if (b.disabled) return;",
@@ -451,7 +460,9 @@ function webviewScript() {
     "      elPrev.disabled = msg.index <= 0;",
     "      elNext.disabled = msg.index >= msg.total - 1;",
     "      elPng.disabled = false;",
-    "      elSvg.disabled = !(msg.frame.mime === '" + display.PLOTLY_MIME + "');",
+    "      var isImg = /^image\\//.test(msg.frame.mime);",
+    "      elSvg.disabled = !(msg.frame.mime === '" + display.PLOTLY_MIME + "' || isImg);",
+    "      elPdf.disabled = !isImg;",
     "      Array.prototype.forEach.call(document.querySelectorAll('.backend'), function (b) {",
     "        b.classList.toggle('active', b.getAttribute('data-backend') === msg.backend);",
     "      });",
@@ -461,9 +472,11 @@ function webviewScript() {
     "      setNote(msg.message || 'rendering\\u2026');",
     "    } else if (msg.type === 'note') {",
     "      setNote(msg.message || '');",
+    "    } else if (msg.type === 'exportData') {",
+    "      download('data:' + msg.mime + ';base64,' + msg.data, msg.filename);",
     "    } else if (msg.type === 'empty') {",
     "      current = null; elPos.textContent = '0 / 0'; elTitle.textContent = '';",
-    "      elPrev.disabled = true; elNext.disabled = true; elPng.disabled = true; elSvg.disabled = true;",
+    "      elPrev.disabled = true; elNext.disabled = true; elPng.disabled = true; elSvg.disabled = true; elPdf.disabled = true;",
     "      setNote(null);",
     "      showOnly(elEmpty);",
     "    }",
@@ -562,6 +575,41 @@ function requestGrRender(entry, width, height) {
     });
 }
 
+/** Publication export via the GR worker: re-render the current entry's spec
+ *  in the requested format and hand the bytes to the webview to save. Not
+ *  cached in history — an export is a file, not an alternate render. */
+function requestGrExport(format, width, height) {
+  const entry = currentEntry(history);
+  const spec = specFor(entry);
+  if (!entry || !spec) {
+    note("export: no spec retained for this plot");
+    return;
+  }
+  if (!deps || typeof deps.renderPlot !== "function") {
+    note("export: GR round-trip not wired");
+    return;
+  }
+  note(`exporting as ${format.toUpperCase()}…`);
+  deps
+    .renderPlot({
+      spec,
+      plotId: entry.id,
+      width: renderDim(width, 800),
+      height: renderDim(height, 600),
+      format,
+    })
+    .then((resp) => {
+      const frame = resp && resp.frame;
+      if (!frame || typeof frame.data !== "string") throw new Error("serve returned no frame");
+      const safe = entry.title.replace(/[^A-Za-z0-9._-]+/g, "_").slice(0, 60) || "plot";
+      if (panel && webviewReady) {
+        panel.webview.postMessage({ type: "exportData", mime: frame.mime, data: frame.data, filename: `${safe}.${format}` });
+        panel.webview.postMessage({ type: "note", message: "" });
+      }
+    })
+    .catch((e) => note(`export failed: ${(e && e.message) || e}`));
+}
+
 function onWebviewMessage(msg) {
   if (!msg || typeof msg !== "object") return;
   if (msg.type === "ready") {
@@ -589,6 +637,10 @@ function onWebviewMessage(msg) {
     if (b.id === "gr" && entry && !entry.renders.gr) {
       requestGrRender(entry, msg.width, msg.height);
     }
+    return;
+  }
+  if (msg.type === "export") {
+    requestGrExport(msg.format === "pdf" ? "pdf" : "svg", msg.width, msg.height);
     return;
   }
   if (msg.type === "error") {
