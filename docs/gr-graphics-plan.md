@@ -264,11 +264,33 @@ through serve arrived as a 512² / 4.65 MiB frame and GR-rendered correctly. Sui
 byte-parity serializer builtins in both lane writers plus panel/helper acceptance, and
 only pay once grids ≫512² must reach the panel undecimated.*
 
-**Later / opportunistic:** prebuilt `blade-gr-render` per platform; Blade-MCP calling
-`renderPlot` directly so agent clients get raster plots (today plotly frames degrade to
-JSON text in MCP, while `image/png` becomes a real image block — GR quietly upgrades both
-MCP and notebook surfaces); optional `Unit backend: 1` option marker in `plot.blade` for a
-program-chosen default backend (stdlib-only change, precedent at `plot.blade:39-48`).
+**Later / opportunistic** — all three taken on 2026-08-16:
+
+- **Prebuilt helper per platform** — *done* (Blade `dd64148`, branch `claude/gr-render-pkg`).
+  `package.ps1` stamps `dist/gr-render-<platform>-<arch>[.exe]`; resolution prefers a
+  stamped artifact over a plain one at each existing search location, with
+  `BLADE_GR_RENDER` still winning outright and a closer plain binary still beating a
+  farther stamped one. A 4-leg CI workflow builds and uploads them. **The workflow has
+  never executed** — no runner access — and everything non-Windows in it (compiler and
+  flag choice, tarball layout, MSYS2 path) is a marked guess. Its first real run is the
+  test. Locally verified: stamped artifact renders, and resolves through a real
+  `Blade.exe test gr-render` when copied beside the exe.
+- **Blade-MCP raster plots** — *done* (Blade-MCP branch `claude/gr-render-plots`,
+  `3302060`; separate repo, so its own PR). Plotly frames become real MCP image blocks
+  plus a `[plot: <title> …]` label (image blocks carry no caption). Every failure path —
+  GR absent, pre-`renderPlot` compiler, render error, >1 MB, >8 plots per eval — falls
+  back to today's text and never fails the eval; the first failure disables rendering for
+  the rest of that eval since every cause is per-process. No new tool: `plotWidth`/
+  `plotHeight` on `blade_eval` cover re-rendering, and after the upgrade the agent no
+  longer holds a spec to hand a standalone tool. `blade_doctor` reports GR availability.
+  129 unit + 7 integration tests green against the real compiler.
+- **Program-chosen backend** — *done* (stdlib slot in the Blade branch; panel half here in
+  `ef678b8`). The marker emits `meta.preferredBackend`, **not** `meta.backend`: the latter
+  states which backend produced the payload and keys the panel's render cache, so a plotly
+  frame claiming `"gr"` would be filed as the GR render and suppress the real one. The
+  panel switches and renders eagerly on the hint, ignores it when that backend is
+  unavailable, and stops honoring it once the user works the toggle by hand. Wire spec:
+  `docs/display-frames.md` §meta.
 
 ## 6. Test strategy
 
