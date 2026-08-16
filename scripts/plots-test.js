@@ -489,6 +489,77 @@ async function testGrExport() {
   plots.dispose();
 }
 
+// --- 4d. Program-stated backend preference ------------------------------------
+
+/** stdlib's `backend` option slot puts `meta.preferredBackend` on the frame.
+ *  The panel switches to it and renders eagerly — but never files the plotly
+ *  payload as the GR render, never overrides a user's manual toggle, and
+ *  ignores the hint entirely when that backend is unavailable. */
+async function testPreferredBackend() {
+  const calls = [];
+  const grDeps = {
+    output: { appendLine: () => {} },
+    findGr: () => ({ ok: true, grdir: "C:/fake/gr", source: "test" }),
+    renderPlot: (args) => {
+      calls.push(args);
+      return Promise.resolve({
+        frame: { v: 1, mime: "image/png", encoding: "base64", data: PNG_B64, meta: { id: args.plotId, backend: "gr" } },
+      });
+    },
+  };
+  _p.setDeps(grDeps);
+
+  // A frame that asks for GR: backend "plotly" (it IS plotly json) + the hint.
+  const preferring = (id) =>
+    plotlyFrame({ meta: { id, backend: "plotly", preferredBackend: "gr" } });
+
+  display.ingestReplText(display.encodeReplLine(preferring("pref1")), "repl");
+  const panels = mock.window._webviewPanels;
+  const panel = panels[panels.length - 1];
+  panel.webview._send({ type: "ready" });
+
+  const entry = _p.history.entries.find((e) => e.id === "pref1");
+  check("prefer: the hint is retained on the entry", entry && entry.prefer === "gr", entry && entry.prefer);
+  check(
+    "prefer: the plotly payload is NOT filed as the gr render",
+    entry && entry.renders.plotly && !entry.renders.gr,
+    entry && Object.keys(entry.renders)
+  );
+  check("prefer: a render was requested eagerly", calls.length === 1 && calls[0].plotId === "pref1", calls.length);
+
+  await new Promise((r) => setImmediate(r));
+  const shown = panel._posted.filter((m) => m.type === "show").pop();
+  check(
+    "prefer: the panel switched to GR and shows the render",
+    shown && shown.backend === "gr" && shown.frame.mime === display.PNG_MIME,
+    shown && `${shown.backend}/${shown.frame && shown.frame.mime}`
+  );
+
+  // A manual toggle takes control: later preferring frames no longer switch.
+  panel.webview._send({ type: "backend", backend: "plotly" });
+  display.ingestReplText(display.encodeReplLine(preferring("pref2")), "repl");
+  const afterPin = panel._posted.filter((m) => m.type === "show").pop();
+  check("prefer: a user's manual toggle wins over later hints", afterPin.backend === "plotly", afterPin.backend);
+
+  plots.dispose();
+
+  // GR unavailable: the hint is ignored, nothing is requested, plotly shows.
+  const before = calls.length;
+  _p.setDeps({
+    output: { appendLine: () => {} },
+    findGr: () => ({ ok: false, reason: "no GR installation found" }),
+    renderPlot: grDeps.renderPlot,
+  });
+  display.ingestReplText(display.encodeReplLine(preferring("pref3")), "repl");
+  const panel2 = mock.window._webviewPanels[mock.window._webviewPanels.length - 1];
+  panel2.webview._send({ type: "ready" });
+  const shown3 = panel2._posted.filter((m) => m.type === "show").pop();
+  check("prefer: ignored when GR is unavailable", shown3.backend === "plotly", shown3.backend);
+  check("prefer: and nothing was requested", calls.length === before, calls.length - before);
+
+  plots.dispose();
+}
+
 // --- 5. Notebook cell outputs -------------------------------------------------
 
 function testNotebookDisplayOutputs() {
@@ -648,6 +719,7 @@ function testReplayedFrameStillRoutesToPanel() {
   await testDemoEndToEnd();
   await testGrRoundTrip();
   await testGrExport();
+  await testPreferredBackend();
 
   if (failures) {
     console.error(`\n${failures} plot check(s) failed.`);

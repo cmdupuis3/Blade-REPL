@@ -97,6 +97,11 @@ function appendFrame(hist, frame) {
   const backend = display.backendFor(frame);
   const meta = frame.meta || {};
   const id = typeof meta.id === "string" && meta.id ? meta.id : null;
+  // `meta.backend` says which backend PRODUCED this frame; `preferredBackend`
+  // is the program asking for a different one to be shown (stdlib's `backend`
+  // option slot). Deliberately separate keys: stamping backend:"gr" on a
+  // plotly payload would file it as the GR render and suppress the real one.
+  const prefer = BACKENDS.some((b) => b.id === meta.preferredBackend) ? meta.preferredBackend : null;
 
   if (id) {
     const idx = hist.entries.findIndex((e) => e.id === id);
@@ -104,6 +109,8 @@ function appendFrame(hist, frame) {
       const entry = hist.entries[idx];
       entry.renders[backend] = frame;
       if (meta.spec !== undefined) entry.spec = meta.spec;
+      // A re-render never revokes the original request, only restates it.
+      if (prefer) entry.prefer = prefer;
       hist.cursor = idx;
       return { entry, index: idx, merged: true };
     }
@@ -116,6 +123,7 @@ function appendFrame(hist, frame) {
     title: titleFor(frame, seq),
     receivedAt: Date.now(),
     primary: backend,
+    prefer,
     renders: { [backend]: frame },
     spec: meta.spec === undefined ? null : meta.spec,
   };
@@ -164,6 +172,11 @@ function specFor(entry) {
 
 const history = newHistory();
 let backend = "plotly";
+/** Set once the user clicks a backend button. A program's `preferredBackend`
+ *  hint auto-switches the panel only until then: the program's request is
+ *  worth honoring, but silently overriding a human's explicit choice on every
+ *  subsequent plot is not. */
+let userPinnedBackend = false;
 /** @type {vscode.WebviewPanel | undefined} */
 let panel;
 let webviewReady = false;
@@ -629,6 +642,7 @@ function onWebviewMessage(msg) {
     const b = backendState().find((x) => x.id === msg.backend);
     if (!b || !b.enabled) return; // disabled here even if un-greyed in a stale webview
     backend = b.id;
+    userPinnedBackend = true;
     // Show the fallback render for the new backend FIRST, then flag the
     // pending round-trip — 'show' clears the webview's note, so the order
     // keeps "rendering with GR…" visible over the plotly fallback.
@@ -689,7 +703,26 @@ function onFrame(frame, origin) {
   log(`${res.merged ? "merged" : "added"} ${frame.mime} from ${origin} — ${res.entry.title} (${history.entries.length} in history)`);
   ensurePanel();
   panel.reveal(vscode.ViewColumn.Beside, true);
+
+  // Honor a program-stated backend preference: switch the panel to it and
+  // render eagerly. Silently ignored when that backend is unavailable (a
+  // viewer without GR just keeps showing plotly — the hint is not a demand)
+  // or once the user has taken manual control of the toggle.
+  const entry = res.entry;
+  const wants = entry.prefer;
+  if (wants && !userPinnedBackend && wants !== backend) {
+    const target = backendState().find((b) => b.id === wants);
+    if (target && target.enabled) {
+      backend = wants;
+      log(`honoring preferredBackend=${wants} for ${entry.title}`);
+    }
+  }
   postCurrent();
+  if (backend === "gr" && entry.prefer === "gr" && !entry.renders.gr) {
+    // Eager render at the default size — no webview measurement is available
+    // on this path (the frame arrived on its own, not from a toggle click).
+    requestGrRender(entry);
+  }
 }
 
 /** blade.plotDemo: build a contour frame, encode it on the REPL wire, and
@@ -754,6 +787,11 @@ function dispose() {
     panel = undefined;
   }
   webviewReady = false;
+  // Closing the panel ends the session the toggle belonged to: the next one
+  // opens on the default backend and is free to honor a program preference
+  // again.
+  backend = "plotly";
+  userPinnedBackend = false;
 }
 
 module.exports = { init, dispose };
