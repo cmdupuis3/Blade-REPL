@@ -90,6 +90,18 @@ function findGr() {
 // Set in activate(); module-level so findGr stays callable from anywhere.
 let extensionRootPath;
 
+/** Spawn-env provider for serve clients: the composed GR environment (GRDIR,
+ *  bin on PATH, GKS_WSTYPE=100, no GR_DISPLAY) when a GR install resolves,
+ *  else undefined so the child inherits untouched. Re-evaluated by the
+ *  protocol client on every spawn — same lifecycle as findCompiler — so a
+ *  fetch-vendor run or a blade.grPath change takes effect on the next
+ *  (re)spawn without a client rebuild. Ignored by protocol packages
+ *  predating the `env` dependency. */
+function grSpawnEnv() {
+  const g = findGr();
+  return g.ok ? gr.grEnv(g.grdir) : undefined;
+}
+
 function run(exe, args, timeoutMs, cwd) {
   return new Promise((resolve) => {
     cp.execFile(
@@ -2729,16 +2741,17 @@ function activate(context) {
       : `gr: unavailable — ${grState.reason}`
   );
   repl.init(context, { findCompiler, reportNoCompiler });
-  serve.init(context, { findCompiler, output });
+  serve.init(context, { findCompiler, output, env: grSpawnEnv });
   // applyCheckPayload is passed through so notebook.js's own per-notebook
   // `checkCells` fast check (N3) can fan its remapped response out to each
   // cell's caches without notebook.js requiring this module back (that would
   // be a require cycle — extension.js already requires notebook.js).
-  notebook.init(context, { findCompiler, output, applyCheckPayload });
-  // Plots panel: subscribes to the display-frame hub (src/display.js) and
-  // registers blade.plotDemo. No wiring beyond this — every frame reaches it
-  // through the hub, never through this module.
-  plots.init(context, { output });
+  notebook.init(context, { findCompiler, output, applyCheckPayload, env: grSpawnEnv });
+  // Plots panel: subscribes to the display-frame hub and registers
+  // blade.plotDemo. Frames reach it through the hub, never through this
+  // module; the extra deps are the GR round-trip — findGr gates the toolbar
+  // toggle, renderPlot is the serve request behind it.
+  plots.init(context, { output, findGr, renderPlot: (args, opts) => serve.renderPlot(args, opts) });
 
   const cfg = () => vscode.workspace.getConfiguration("blade");
 

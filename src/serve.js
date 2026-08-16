@@ -77,4 +77,19 @@ function checkCells(fileName, cells, tier, timeoutMs) {
   return defaultClient.checkCells(fileName, cells, tier, timeoutMs);
 }
 
-module.exports = { init, available, check, checkCells, dispose, createClient };
+/** The GR round-trip (plot panel → warm serve → gr-render worker). Stateless
+ *  like check(), so it rides the default client. Guarded rather than assumed:
+ *  a vendored protocol package predating renderPlot must reject cleanly (the
+ *  panel shows the message as a note), not throw inside the panel's message
+ *  handler. */
+function renderPlot(args, opts) {
+  if (!defaultClient) return Promise.reject(new Error("blade ide serve: init() not called"));
+  if (typeof defaultClient.renderPlot !== "function") {
+    return Promise.reject(
+      new Error("the vendored ide-protocol package predates renderPlot — run `npm run vendor:protocol`")
+    );
+  }
+  return defaultClient.renderPlot(args, opts);
+}
+
+module.exports = { init, available, check, checkCells, renderPlot, dispose, createClient };
