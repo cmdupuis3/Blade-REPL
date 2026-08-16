@@ -28,7 +28,7 @@
 const vscode = require("vscode");
 const path = require("path");
 const serve = require("./serve");
-const display = require("./display");
+const display = require("@blade-lang/ide-protocol").display;
 
 const NOTEBOOK_TYPE = "blade-notebook";
 

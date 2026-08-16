@@ -35,6 +35,7 @@ All navigation features land on VS Code's standard keys — no custom chords to 
 
 A built [Blade compiler](https://github.com/cmdupuis3/Blade). The extension auto-detects the most recently built of `bin/Release` / `bin/Debug` in the standard repo location, or `Blade` on PATH; override with `blade.compilerPath`.
 
+- Compiler discovery order: the `blade.compilerPath` setting, then the `BLADE_EXE` environment variable, then the newest-built of `bin/Release` / `bin/Debug` in the standard repo location, then `Blade` on PATH. `BLADE_EXE` is new to the extension itself as of this release — previously only the standalone test scripts (`npm run test:serve` etc.) honored it; `blade.compilerPath` still wins when set, but leaving it empty and setting `BLADE_EXE` now works too.
 - Compilers with the `ide serve` subcommand get as-you-type checking through a persistent process (two tiers: a fast parse+typecheck+deduce pass while you type, and a full pass through monomorphization on save/idle that upgrades polymorphic value types to their concrete instantiations).
 - Older compilers fall back automatically for `.blade` files: `ide check --json` on save/open, or plain-text diagnostics for compilers without the JSON subcommand.
 - Notebooks are the exception — there is no fallback. Running cells needs `ide serve`'s `eval`/`resetSession`, and in-cell checking (diagnostics, hovers, completions, lenses) needs its `checkCells` command, which assembles the cells into one session source compiler-side. On a compiler without them, cells report the missing support when run and simply go unchecked while you type; `.blade` files in the same window are unaffected.
@@ -79,10 +80,21 @@ let _ = plot.line(t, v, "drift": title, d.unit_label(t): xlabel, d.unit_label(v)
 
 ## Development
 
-Zero dependencies, no build step — plain CommonJS executed by VS Code's Node runtime.
+One runtime dependency: [`@blade-lang/ide-protocol`](../Blade/protocol) (the shared NDJSON client, wire-protocol codecs, and generated language-surface data the Blade compiler repo publishes) — vendored as a committed tarball under `vendor/`, no npm registry involved. No build step for this extension's own code; everything under `src/` is still plain CommonJS executed directly by VS Code's Node runtime.
 
 ```bash
+npm install    # extracts vendor/blade-lang-ide-protocol-<version>.tgz into node_modules
 npm test
 ```
 
-runs the hermetic suite (syntax gates, grammar/table consistency, provider tests against a vscode mock). Live suites need a built compiler (`BLADE_EXE` env var or the standard build locations): `npm run test:serve` (ide-serve protocol), `npm run test:repl` (REPL protocol), `npm run test:nav` (navigation providers against real compiler payloads), `npm run test:nb` (notebook eval session semantics).
+runs the hermetic suite (syntax gates, grammar/table/surface consistency, provider tests against a vscode mock). Live suites need a built compiler (`BLADE_EXE` env var or the standard build locations): `npm run test:serve` (ide-serve protocol), `npm run test:repl` (REPL protocol), `npm run test:nav` (navigation providers against real compiler payloads), `npm run test:nb` (notebook eval session semantics).
+
+### Refreshing the vendored protocol package
+
+After a change lands in `../Blade/protocol` (new compiler surface, a client bugfix), re-vendor it from a sibling `Blade` checkout:
+
+```bash
+npm run vendor:protocol
+```
+
+This re-packs `../Blade/protocol` into `vendor/blade-lang-ide-protocol-<version>.tgz` and reinstalls. Commit the refreshed tarball together with the matching version bump in `package.json`'s `dependencies` entry (kept lockstep with the compiler's `compilerVersion`).

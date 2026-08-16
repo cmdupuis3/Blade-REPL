@@ -91,7 +91,7 @@
       "comment": "The index-type family plus Array/like — the signature syntax Array<Elem like Idx1, Idx2>",
       "patterns": [
         {
-          "match": "\\b(Idx|SymIdx|AntisymIdx|OrbIdx|HermitianIdx|CompoundIdx|SparseIdx|EnumIdx|DepIdx|RaggedIdx|IrrepsIdx)\\b",
+          "match": "\\b(Idx|SymIdx|AntisymIdx|OrbIdx|HermitianIdx|CompoundIdx|SparseIdx|EnumIdx|DepIdx|RaggedIdx|IrrepsIdx|PgIrrepsIdx)\\b",
           "name": "support.type.index.blade"
         },
         {
@@ -119,7 +119,7 @@
           "name": "keyword.control.import.blade"
         },
         {
-          "match": "\\b(let|rec|const|function|lambda|type|struct|interface|impl|module)\\b",
+          "match": "\\b(let|rec|function|lambda|type|struct|interface|impl|module)\\b",
           "name": "storage.type.blade"
         },
         {
@@ -136,12 +136,12 @@
       "comment": "One pattern per hover category (src/builtins.js); scripts/check-consistency.js keeps these word lists and the hover tables in sync",
       "patterns": [
         {
-          "match": "\\b(method_for|object_for|transpose|hermitian|gram|decompact|compute|read|sequence|replicate|zip|stack|arity|nth|zero|rank|mask|compound|intersect|union|unique|contains|group_by|group_keys|sort|reduce|conj|extents|prodsum|fill_random|grad|min|max|length|complex)\\b",
+          "match": "\\b(method_for|object_for|transpose|hermitian|gram|decompact|compute|read|sequence|replicate|zip|stack|join|arity|nth|zero|rank|mask|compound|sparse|intersect|union|unique|contains|group_by|group_keys|sort|reduce|conj|extents|prodsum|fill_random|grad|min|max|length|complex)\\b",
           "name": "support.function.builtin.blade"
         },
         {
-          "comment": "Virtual-array constructors (generic-bracket forms: range<I>, reverse<I>)",
-          "match": "\\b(range|reverse)\\b",
+          "comment": "Virtual-array constructors (generic-bracket forms: range<I>, reverse<I>, halo<I, [offsets]>)",
+          "match": "\\b(range|reverse|halo)\\b",
           "name": "support.function.virtual.blade"
         },
         {

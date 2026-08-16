@@ -9,30 +9,21 @@
 "use strict";
 
 const cp = require("child_process");
-const fs = require("fs");
-const proto = require("../src/replProto");
+const pkg = require("@blade-lang/ide-protocol");
+const proto = pkg.replProto;
 
 function findExe() {
-  if (process.env.BLADE_EXE) return process.env.BLADE_EXE;
-  // Same candidates (and freshness rule) as findCompiler in src/extension.js.
-  const candidates = [
-    "C:\\Users\\cdupu\\Documents\\GitHub\\Blade\\bin\\Release\\net7.0\\Blade.exe",
-    "C:\\Users\\cdupu\\Documents\\GitHub\\Blade\\bin\\Debug\\net7.0\\Blade.exe",
-  ];
-  let best;
-  for (const c of candidates) {
-    try {
-      const mtime = fs.statSync(c).mtimeMs;
-      if (!best || mtime > best.mtime) best = { path: c, mtime };
-    } catch {
-      /* candidate doesn't exist */
-    }
-  }
-  if (!best) {
+  // env BLADE_EXE -> newest-mtime DEFAULT_CANDIDATES -> "Blade" on PATH, now
+  // shared with src/extension.js and every other script via the package.
+  // origin "path" means nothing better was found — still fatal here: these
+  // live suites want a known, freshly-built binary, not whatever "Blade"
+  // resolves to on $PATH.
+  const { exe, origin } = pkg.resolveCompiler({ env: process.env });
+  if (origin === "path") {
     console.error("no compiler binary found — set BLADE_EXE");
     process.exit(1);
   }
-  return best.path;
+  return exe;
 }
 
 const exe = findExe();
