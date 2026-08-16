@@ -13,6 +13,7 @@
 
 const vscode = require("vscode");
 const cp = require("child_process");
+const fs = require("fs");
 const path = require("path");
 const pkg = require("@blade-lang/ide-protocol");
 const builtins = require("./builtins");
@@ -72,6 +73,83 @@ let warnedNoCompiler = false;
 function findCompiler() {
   const configured = vscode.workspace.getConfiguration("blade").get("compilerPath", "");
   return pkg.resolveCompiler({ explicitPath: configured || undefined, env: process.env }).exe;
+}
+
+/** Directories that hold BUILD OUTPUT, not sources. Skipping them is required
+ *  for correctness, not just speed: the Blade tree's oracle projects each carry
+ *  `src/<name>/obj/**` containing generated .fs (AssemblyInfo and friends) that
+ *  are rewritten by the build itself. Counting those would make "newest source"
+ *  track the last build rather than the last edit — which is precisely the
+ *  comparison this preflight exists to make, inverted. */
+const BUILD_DIRS = new Set(["obj", "bin", ".git", "node_modules"]);
+
+/** Newest mtime among files under `dir` whose name ends in one of `exts`, or 0.
+ *  Recursive, synchronous, and errors are swallowed per-entry: a directory we
+ *  can't read contributes nothing rather than failing the preflight. */
+function newestMtimeUnder(dir, exts) {
+  let newest = 0;
+  let entries;
+  try {
+    entries = fs.readdirSync(dir, { withFileTypes: true });
+  } catch (_) {
+    return 0;
+  }
+  for (const e of entries) {
+    const p = path.join(dir, e.name);
+    if (e.isDirectory()) {
+      if (BUILD_DIRS.has(e.name)) continue;
+      newest = Math.max(newest, newestMtimeUnder(p, exts));
+    } else if (exts.some((x) => e.name.endsWith(x))) {
+      try {
+        newest = Math.max(newest, fs.statSync(p).mtimeMs);
+      } catch (_) {
+        /* vanished between readdir and stat */
+      }
+    }
+  }
+  return newest;
+}
+
+/**
+ * Is the compiler we're about to run older than the checkout it came from?
+ *
+ * The IDE is the surface where a stale binary is least visible and most
+ * expensive. Nothing here surfaces the compiler's build time, so a binary that
+ * predates its own sources reports diagnostics the compiler no longer produces
+ * — or, when the stdlib has moved on and the binary hasn't, an error inside a
+ * stdlib module about an intrinsic that exists in the source tree but not in
+ * this build. Either way the message blames the user's program, or a file the
+ * user never wrote, and says nothing about the skew that actually caused it.
+ *
+ * `blade.compilerPath` makes this likelier, not less likely, and cannot simply
+ * be dropped: DEFAULT_CANDIDATES resolves relative to the package's own
+ * directory, so an INSTALLED extension (node_modules/@blade-lang/ide-protocol)
+ * can never hit them, and unpinning falls through to `Blade` on PATH. Pinning
+ * is the right call here; noticing when the pin has gone stale is the fix.
+ *
+ * Returns null when there is nothing to say — no checkout beside the binary
+ * (an installed compiler is not "stale", it just has no sources to compare
+ * against), or the mtimes can't be read.
+ */
+function compilerFreshness(exe) {
+  const repo = pkg.resolveRepoRoot({ exe, env: process.env });
+  if (!repo) return null;
+  let exeMs;
+  try {
+    exeMs = fs.statSync(exe).mtimeMs;
+  } catch (_) {
+    return null;
+  }
+  // Compiler sources AND the Blade-source stdlib: the stdlib is read at run
+  // time, so a stdlib edit needs no rebuild to take effect — but it can start
+  // depending on a compiler feature this binary predates, which is exactly the
+  // case that produces an error inside a stdlib module.
+  const newestSrc = Math.max(
+    newestMtimeUnder(path.join(repo, "src"), [".fs"]),
+    newestMtimeUnder(path.join(repo, "stdlib"), [".blade"])
+  );
+  if (!newestSrc) return null;
+  return { repo, exeMs, newestSrc, stale: newestSrc > exeMs };
 }
 
 /** Resolve the GR installation for the plot panel's static backend:
@@ -2740,6 +2818,24 @@ function activate(context) {
       ? `gr: ${grState.grdir} (via ${grState.source})`
       : `gr: unavailable — ${grState.reason}`
   );
+  // Which compiler answered, and whether it still matches the checkout it came
+  // from. Log-only by design: a stale binary still works, and interrupting
+  // activation with a modal over a build the user may be about to run would be
+  // worse than the problem. The line exists so that "the compiler is reporting
+  // something impossible" has somewhere to be checked.
+  const preflightExe = findCompiler();
+  const freshness = compilerFreshness(preflightExe);
+  if (!freshness) {
+    output.appendLine(`compiler: ${preflightExe}`);
+  } else {
+    const age = Math.round((freshness.newestSrc - freshness.exeMs) / 60000);
+    output.appendLine(
+      freshness.stale
+        ? `compiler: ${preflightExe} — STALE: ${freshness.repo} has sources ${age} min newer. ` +
+            `Diagnostics may not match your tree; rebuild with \`dotnet build Blade.fsproj -c Release\`.`
+        : `compiler: ${preflightExe} (up to date with ${freshness.repo})`
+    );
+  }
   repl.init(context, { findCompiler, reportNoCompiler });
   serve.init(context, { findCompiler, output, env: grSpawnEnv });
   // applyCheckPayload is passed through so notebook.js's own per-notebook
