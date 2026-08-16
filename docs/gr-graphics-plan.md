@@ -220,16 +220,32 @@ no-gksqt-child assertion, gated on GR availability (skip cleanly like the g++-ga
 suites). *Exit:* `blade-gr-render < fig.json > out.png` reproduces the panel's demo contour
 byte-stably; goldens green. **This phase is the whole risk surface and lands with zero
 changes to either program lane.**
+*Status: **done** 2026-08-16 (`tools/gr-render/` on Blade branch `claude/gr-render`,
+`b54eeee`). 67 self-test checks green, built against the pruned subset. Notable
+as-builts: viewport sizing works only AFTER `gr_beginprint` (exact W×H, odd→even);
+colorbar hand-drawn (`gr_colorbar()` phases labels on zmin and overruns); serve mode
+rewires fd 1 so GR diagnostics can't corrupt NDJSON.*
 
 **G2 — Wire it up (both repos).** Persistent worker mode; `renderPlot` in `IdeServe.fs`;
 protocol env + method + version bump; re-vendor; enable the toggle + round-trip + spinner;
 flip the two tests, add the fake-serve fixture. *Exit:* click GR on a live plot → PNG
 appears in-place; toggle back instant; kill the worker mid-session → next toggle recovers.
+*Status: **done** 2026-08-16 (Blade `169d4bd`: verb + `GrRender.fs` worker + protocol
+0.20.0, suite 4827/0; here `91270a1` + `cea34cd`: toggle, round-trip, notes, re-vendor).
+Verified live: `test:serve` 19/19 including a real 320×240 render, plus the full journey —
+eval `import plot` source → plotly frame → `renderPlot` its spec → 900×640 GR PNG under
+the same `meta.id`, checked by eye. Worker-death/timeout/respawn covered by the F# fake-
+helper matrix.*
 
 **G3 — Animation & export (separable).** Video via the worker (`GKS_VIDEO_OPTS` `WxH@fps`;
 `gr_updatews` per frame; mind `GKS_DISABLE_PAGE_SUFFIX`); publication PDF/SVG export
 (explicitly *not* golden-tested — SVG has a `srand(time)` path-id counter, PDF a
 CreationDate). Decide panel UX: discrete frames vs muxed mp4/webm.
+*Status: **export done** 2026-08-16 (`81acb3a` — SVG/PDF of GR renders via the worker's
+`format` param, saved through the webview; helper supports png/svg/pdf in both modes).
+**Animation deliberately deferred**: the transport decision (discrete PNG frames into the
+panel vs muxed video, open question #6) gates it, and `videoplugin.dll` (36 MB) is
+excluded from the default vendor subset until then.*
 
 **G4 — Big-grid story (needs the pre-existing decimation work).** GR's headroom beyond
 1000² only matters if the spec reaches the panel: at ~20 bytes/sample a raw 2000² grid is
