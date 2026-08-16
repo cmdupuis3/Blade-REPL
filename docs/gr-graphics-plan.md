@@ -211,6 +211,8 @@ disabled when the probe fails).
 **G0 — Packaging & env (this repo).** Land the vendor-packaging work (rebased), subset
 extraction, `blade.grPath` + resolution helper + preflight. *Exit:* fresh clone →
 `npm run fetch-vendor` → a validated ~28 MB GR tree; extension resolves it.
+*Status: **done** 2026-08-15 (cherry-picks + `d036cc1` + `aa637e3`). Measured subset:
+29.7 MB; a render off the pruned tree is byte-identical to the full-tree baseline.*
 
 **G1 — The translator, headless (Blade repo).** `blade-gr-render` one-shot mode covering
 all five plot types; build script with the static-link flags; golden PNG tests + a
