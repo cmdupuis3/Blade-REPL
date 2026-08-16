@@ -22,6 +22,7 @@ const repl = require("./repl");
 const serve = require("./serve");
 const notebook = require("./notebook");
 const plots = require("./plots");
+const gr = require("./gr");
 
 /** @type {vscode.DiagnosticCollection} */
 let diagnostics;
@@ -72,6 +73,22 @@ function findCompiler() {
   const configured = vscode.workspace.getConfiguration("blade").get("compilerPath", "");
   return pkg.resolveCompiler({ explicitPath: configured || undefined, env: process.env }).exe;
 }
+
+/** Resolve the GR installation for the plot panel's static backend:
+ *  `blade.grPath`, then vendor/gr beside the workspace, then vendor/gr beside
+ *  the extension (populated by `npm run fetch-vendor`). Validation up front is
+ *  deliberate — a bad GR environment fails silently at spawn time (src/gr.js),
+ *  so the answer must be known before anything GR-shaped is launched. */
+function findGr() {
+  const folders = vscode.workspace.workspaceFolders;
+  return gr.resolveGr({
+    configuredPath: vscode.workspace.getConfiguration("blade").get("grPath", ""),
+    workspaceRoot: folders && folders.length > 0 ? folders[0].uri.fsPath : undefined,
+    extensionRoot: extensionRootPath,
+  });
+}
+// Set in activate(); module-level so findGr stays callable from anywhere.
+let extensionRootPath;
 
 function run(exe, args, timeoutMs, cwd) {
   return new Promise((resolve) => {
@@ -2700,6 +2717,17 @@ function activate(context) {
   diagnostics = vscode.languages.createDiagnosticCollection("blade");
   output = vscode.window.createOutputChannel("Blade");
   context.subscriptions.push(diagnostics, output);
+  // Absent from the test mock's context; resolveGr treats it as optional.
+  extensionRootPath = context.extensionUri ? context.extensionUri.fsPath : undefined;
+  // Preflight, log-only for now: the GR toggle (docs/gr-graphics-plan.md G2)
+  // consumes findGr() when it lands; until then this line is the one place
+  // that says why the static backend will or won't be available.
+  const grState = findGr();
+  output.appendLine(
+    grState.ok
+      ? `gr: ${grState.grdir} (via ${grState.source})`
+      : `gr: unavailable — ${grState.reason}`
+  );
   repl.init(context, { findCompiler, reportNoCompiler });
   serve.init(context, { findCompiler, output });
   // applyCheckPayload is passed through so notebook.js's own per-notebook
