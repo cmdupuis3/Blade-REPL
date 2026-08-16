@@ -4,6 +4,7 @@
 //   node scripts/fetch-vendor.js            (fetch whatever is missing)
 //   node scripts/fetch-vendor.js --check    (verify only, no network, exit 1 on drift)
 //   node scripts/fetch-vendor.js --force    (re-fetch and re-extract regardless)
+//   node scripts/fetch-vendor.js --full     (skip the post-extract prune; see below)
 //
 // or `npm run fetch-vendor`. Zero dependencies: node builtins plus the system
 // `tar`, which ships on Windows 10+ (bsdtar in System32), Linux and macOS.
@@ -16,6 +17,14 @@
 //   tarball - a per-platform archive extracted into a gitignored directory
 //             (GR). The archive is kept next to the extraction so a re-extract
 //             costs no network.
+//
+// A tarball asset may carry a "keep" list: paths (relative to dest) that
+// survive extraction, everything else being pruned in the staging directory
+// before the swap into place. For GR that turns the 147 MB tree into the
+// ~28 MB headless render subset. --force --full re-extracts the whole tree
+// (gksqt for interactive debugging, videoplugin for animation work). Pruning
+// happens only at extraction time -- an already-present full tree is a valid
+// superset and is left alone.
 
 "use strict";
 
@@ -176,9 +185,43 @@ function singleTopLevel(entries) {
   return isDir ? only : null;
 }
 
-// Extracts into a staging directory beside dest, then swaps it into place, so
-// an interrupted or failing extraction never leaves a half-populated dest.
-function extractTo(tarball, destAbs, stripTopLevel) {
+function dirSize(abs) {
+  const st = fs.statSync(abs);
+  if (!st.isDirectory()) return st.size;
+  let total = 0;
+  for (const name of fs.readdirSync(abs)) total += dirSize(path.join(abs, name));
+  return total;
+}
+
+// Deletes everything under rootAbs that is not on a keep path. A keep entry
+// names either a file or a directory (kept wholesale); parent directories of
+// keep entries survive so the tree keeps its shape (GRDIR-relative plugin and
+// font resolution depends on that). Returns the bytes removed.
+function pruneTo(rootAbs, keepList) {
+  const keep = keepList.map((k) => k.replace(/\\/g, "/").replace(/\/+$/, ""));
+  const keptWhole = new Set(keep);
+  let removed = 0;
+  const walk = (rel) => {
+    for (const name of fs.readdirSync(path.join(rootAbs, rel))) {
+      const childRel = rel ? `${rel}/${name}` : name;
+      if (keptWhole.has(childRel)) continue;
+      if (keep.some((k) => k.startsWith(`${childRel}/`))) {
+        walk(childRel); // an ancestor of something kept -- descend, keep the dir
+        continue;
+      }
+      const childAbs = path.join(rootAbs, childRel);
+      removed += dirSize(childAbs);
+      fs.rmSync(childAbs, { recursive: true, force: true });
+    }
+  };
+  walk("");
+  return removed;
+}
+
+// Extracts into a staging directory beside dest, prunes it down to `keep` (if
+// given), then swaps it into place, so an interrupted or failing extraction --
+// or an interrupted prune -- never leaves a half-populated dest.
+function extractTo(tarball, destAbs, stripTopLevel, keep) {
   const parent = path.dirname(destAbs);
   fs.mkdirSync(parent, { recursive: true });
 
@@ -199,6 +242,11 @@ function extractTo(tarball, destAbs, stripTopLevel) {
       if (candidate && exists(candidate) && fs.statSync(candidate).isDirectory()) {
         src = candidate;
       }
+    }
+
+    if (keep && keep.length > 0) {
+      const removed = pruneTo(src, keep);
+      console.log(`  - pruned to the ${keep.length}-entry keep list (dropped ${mb(removed)} MB)`);
     }
 
     if (exists(destAbs)) fs.renameSync(destAbs, backup);
@@ -259,7 +307,7 @@ async function handleFile(dep, mode) {
   return "fetched";
 }
 
-async function handleTarball(dep, mode) {
+async function handleTarball(dep, mode, full) {
   const destAbs = path.join(root, dep.dest);
   const asset = (dep.assets || {})[PLATFORM_KEY];
 
@@ -271,6 +319,11 @@ async function handleTarball(dep, mode) {
 
   const expectDirs = dep.expect || [];
   const missingDirs = expectDirs.filter((d) => !exists(path.join(destAbs, d)));
+  // The keep list doubles as the runtime preflight: these are exactly the
+  // files the headless render path loads, so their absence is drift whether
+  // the tree was pruned or extracted in full (a full tree is a superset).
+  const keep = asset.keep || [];
+  const missingKeep = () => keep.filter((k) => !exists(path.join(destAbs, k)));
 
   if (mode === "check") {
     if (!exists(destAbs)) {
@@ -279,6 +332,11 @@ async function handleTarball(dep, mode) {
     }
     if (missingDirs.length > 0) {
       console.log(`  x ${dep.dest} is incomplete, missing: ${missingDirs.join(", ")}`);
+      return "MISMATCH";
+    }
+    const gone = missingKeep();
+    if (gone.length > 0) {
+      console.log(`  x ${dep.dest} is missing runtime files: ${gone.join(", ")}`);
       return "MISMATCH";
     }
     console.log(`  - ${dep.dest} present (${expectDirs.join("/ ")}/ all found)`);
@@ -299,7 +357,7 @@ async function handleTarball(dep, mode) {
     return "ok";
   }
 
-  if (exists(destAbs) && missingDirs.length === 0 && mode !== "force") {
+  if (exists(destAbs) && missingDirs.length === 0 && missingKeep().length === 0 && mode !== "force") {
     console.log(`  - ${dep.dest} present (${expectDirs.join("/ ")}/ all found)`);
     return "skipped";
   }
@@ -339,14 +397,17 @@ async function handleTarball(dep, mode) {
   }
 
   console.log(`  > extracting into ${dep.dest}/`);
-  extractTo(tarball, destAbs, dep.stripTopLevel !== false);
+  extractTo(tarball, destAbs, dep.stripTopLevel !== false, full ? null : keep);
 
-  const stillMissing = expectDirs.filter((d) => !exists(path.join(destAbs, d)));
+  const stillMissing = expectDirs
+    .filter((d) => !exists(path.join(destAbs, d)))
+    .concat(missingKeep());
   if (stillMissing.length > 0) {
     console.log(`  x ${dep.dest} is missing after extraction: ${stillMissing.join(", ")}`);
     return "MISMATCH";
   }
-  console.log(`  + ${dep.dest}/ (${expectDirs.join("/ ")}/ all present)`);
+  const label = keep.length > 0 && !full ? "headless subset" : "full tree";
+  console.log(`  + ${dep.dest}/ (${label}, ${mb(dirSize(destAbs))} MB; ${expectDirs.join("/ ")}/ all present)`);
   if (dep.runtime) console.log(`    runtime: ${dep.runtime}`);
   return "fetched";
 }
@@ -357,12 +418,13 @@ async function main(argv) {
   const args = argv.slice(2);
   for (const a of args) {
     if (a === "-h" || a === "--help") {
-      console.log("usage: node scripts/fetch-vendor.js [--check | --force]");
+      console.log("usage: node scripts/fetch-vendor.js [--check | --force] [--full]");
       return 0;
     }
-    if (a !== "--check" && a !== "--force") fail(`unknown argument ${a}`);
+    if (a !== "--check" && a !== "--force" && a !== "--full") fail(`unknown argument ${a}`);
   }
   const mode = args.includes("--check") ? "check" : args.includes("--force") ? "force" : "fetch";
+  const full = args.includes("--full");
 
   if (!exists(DEPS_FILE)) fail(`deps.json not found at ${DEPS_FILE}`);
   let deps;
@@ -380,7 +442,7 @@ async function main(argv) {
     console.log(`\n${dep.name} ${dep.version}`);
     let status;
     try {
-      if (dep.kind === "tarball") status = await handleTarball(dep, mode);
+      if (dep.kind === "tarball") status = await handleTarball(dep, mode, full);
       else status = await handleFile(dep, mode);
     } catch (err) {
       console.log(`  x ${dep.name}: ${err.message}`);
@@ -411,4 +473,4 @@ if (require.main === module) {
   );
 }
 
-module.exports = { singleTopLevel };
+module.exports = { singleTopLevel, pruneTo };

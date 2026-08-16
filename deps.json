@@ -27,15 +27,39 @@
       "committed": false,
       "stripTopLevel": true,
       "expect": ["bin", "include", "lib", "fonts"],
-      "why": "Static-PNG plotting backend for large grids, staged for a later release. 147 MB extracted, so it is gitignored and re-fetched on demand.",
-      "runtime": "GRDIR must point at dest and $GRDIR/bin must be on PATH (the Qt/GKS shared libraries live there).",
+      "why": "Static-PNG plotting backend for large grids, staged for a later release. Gitignored and re-fetched on demand; extraction is pruned to the headless render subset (~28 MB) unless --full is passed.",
+      "runtime": "GRDIR must point at dest and $GRDIR/bin must be on PATH. Load-time DLLs (libGR/libGKS) resolve via PATH; the GKS plugin DLLs and fonts resolve via GRDIR, so the pruned tree must keep GR's directory shape.",
       "assets": {
         "win32-x64": {
           "asset": "gr-0.73.26-Windows-x86_64.tar.gz",
           "url": "https://github.com/sciapp/gr/releases/download/v0.73.26/gr-0.73.26-Windows-x86_64.tar.gz",
           "sha256": "8aa6fba98712f0824530e5ead7acb59e5c6fac3f10ea05a4df4be465f3f3bc68",
           "size": 52594053,
-          "note": "MinGW build, matching the g++ toolchain the compiler shells out to. The MSVC variant (gr-0.73.26-Windows-x86_64-msvc.tar.gz) is deliberately not used."
+          "note": "MinGW build, matching the g++ toolchain the compiler shells out to. The MSVC variant (gr-0.73.26-Windows-x86_64-msvc.tar.gz) is deliberately not used.",
+          "keepComment": [
+            "Headless PNG render subset, verified byte-identical to the full tree",
+            "(docs/gr-graphics-plan.md §7): libGR + libGKS + cairoplugin do the",
+            "rendering, the three runtime DLLs back the MinGW build, fonts feed",
+            "FreeType. include/ + the libGR import/static libs stay so the",
+            "blade-gr-render helper can compile against the tree. Dropped: Qt +",
+            "gksqt/grplot (38.7 MB, never loaded headless), videoplugin (36 MB,",
+            "returns when animation lands), lib/gr.js (12.8 MB wasm), share/,",
+            "the remaining GKS plugins. --full extracts everything."
+          ],
+          "keep": [
+            "bin/libGR.dll",
+            "bin/libGKS.dll",
+            "bin/cairoplugin.dll",
+            "bin/libwinpthread-1.dll",
+            "bin/libgcc_s_seh-1.dll",
+            "bin/libstdc++-6.dll",
+            "fonts",
+            "include",
+            "lib/libGR.a",
+            "lib/libGR.dll.a",
+            "lib/libGKS.a",
+            "lib/libGKS.dll.a"
+          ]
         },
         "linux-x64": {
           "asset": "gr-0.73.26-Debian-x86_64.tar.gz",

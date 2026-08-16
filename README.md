@@ -46,7 +46,9 @@ A built [Blade compiler](https://github.com/cmdupuis3/Blade). The extension auto
 
 ## Plots
 
-Evaluated code that produces a plot ships it to the extension as a **display frame** — a `{mime, data}` payload carried alongside stdout on the REPL and `ide serve` channels ([wire format](docs/display-frames.md)). Frames render in a "Blade Plots" webview docked beside the editor: plot history with prev/next, PNG/SVG export, and a backend toggle (plotly is live; GR is stubbed for a later release). plotly.js is bundled in the extension, so the panel works offline. `Blade: Plot Demo` pushes a sample contour through the same path without needing compiler support.
+Evaluated code that produces a plot ships it to the extension as a **display frame** — a `{mime, data}` payload carried alongside stdout on the REPL and `ide serve` channels ([wire format](docs/display-frames.md)). Frames render in a "Blade Plots" webview docked beside the editor: plot history with prev/next, export, and a **plotly/GR backend toggle**. plotly.js is bundled in the extension, so the panel works offline. `Blade: Plot Demo` pushes a sample contour through the same path without needing compiler support.
+
+**Backends.** plotly is the interactive default (hover, zoom, pan), rendered in the webview. GR is a static renderer for large grids and publication output: clicking **GR** sends the plot's spec to the warm `ide serve` process, which renders a PNG through the `gr-render` helper and sends it back attached to the same plot — so toggling is instant in both directions once each render is cached. GR renders export as PNG, SVG, or PDF; plotly renders export as PNG or SVG. The GR button stays disabled, with the reason in its tooltip, until a GR installation resolves — `npm run fetch-vendor` provides one, or point `blade.grPath` at your own (see [Vendor dependencies](#vendor-dependencies-plotting)).
 
 Plots come from the compiler's `plot` stdlib module. Options are **tagged by quantity** rather than by position, so they can be given in any order — and axis labels can be read straight off the data's units:
 
@@ -61,7 +63,9 @@ let v: Array<Float64<meter> like Idx<4>> = [0.0, 2.5, 6.0, 9.5]
 let _ = plot.line(t, v, "drift": title, d.unit_label(t): xlabel, d.unit_label(v): ylabel)
 ```
 
-`plot` provides `contourf`, `contour`, `heatmap`, `line`, and `scatter`; option slots are `levels`, `cmap`, `title`, `xlabel`, and `ylabel`, each with a default, so `plot.contourf(x, y, z)` alone is valid.
+`plot` provides `contourf`, `contour`, `heatmap`, `line`, and `scatter`; option slots are `levels`, `cmap`, `title`, `xlabel`, `ylabel`, and `backend`, plus `maxdim` on the three grid factories — each with a default, so `plot.contourf(x, y, z)` alone is valid.
+
+Two slots exist for the backends. `maxdim` (default 512) caps how many samples per axis a grid serializes: a raw 2000² grid would be ~74 MB of figure JSON, past the frame size limit and far past display resolution, so bigger grids are resampled before they go on the wire. `backend` asks the panel to *show* this plot with a particular backend — the frame is still plotly JSON either way, so a viewer without GR simply ignores the request, and your own toggling always wins.
 
 ## Settings
 
@@ -108,7 +112,7 @@ script, so "zero dependencies" above still holds.
 | Package | Version | Lands at | In git? |
 |---|---|---|---|
 | [plotly.js](https://plotly.com/javascript/) | 3.7.0 | `media/plotly.min.js` (4.85 MB) | **yes, committed** |
-| [GR](https://gr-framework.org/) | 0.73.26 | `vendor/gr/` (147 MB extracted) | no, gitignored |
+| [GR](https://gr-framework.org/) | 0.73.26 | `vendor/gr/` (~30 MB headless subset) | no, gitignored |
 
 ```bash
 npm run fetch-vendor            # fetch whatever is missing
@@ -121,11 +125,16 @@ no network access, so the panel loads it from disk and it has to ship inside the
 .vsix. `fetch-vendor` normally just verifies its sha256 and does nothing.
 
 GR is the static-PNG backend for large grids, still stubbed in the UI. It is
-gitignored because it is 147 MB extracted and re-fetchable, so a fresh clone has
+gitignored because it is large and re-fetchable, so a fresh clone has
 to run `npm run fetch-vendor` before the GR path can work. The script picks the
 release asset matching `${process.platform}-${process.arch}`, reuses an
 already-downloaded tarball when its hash matches, and normalizes the archive's
 top-level directory away so the result always lands at exactly `vendor/gr/`.
+Extraction is pruned to the headless render subset pinned in `deps.json`
+(`keep`): ~30 MB instead of the 147 MB full tree, verified to render
+byte-identical PNGs (see `docs/gr-graphics-plan.md` §7). Pass `--full` (with
+`--force` to re-extract an existing tree) when you want the whole thing —
+`gksqt.exe` for interactive debugging, `videoplugin.dll` for animation work.
 Only the Windows asset's hash is pinned today; the other platforms are recorded
 as `null`, and the script prints the hash it computed on first fetch so it can be
 pasted into `deps.json`.

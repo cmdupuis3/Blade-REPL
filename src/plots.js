@@ -17,12 +17,15 @@
 //     show, so the navigation and merge rules are plain functions
 //     scripts/plots-test.js can drive without a browser.
 //
-// Backends: plotly is the only live renderer. The GR toggle is contributed
-// disabled ("coming soon") — but every history entry is a per-backend map of
-// renders keyed by display.backendFor(), so a later GR image frame carrying
-// the same meta.id attaches to the existing entry as an alternate render
-// rather than appending a duplicate plot. `entry.spec` retains the
-// backend-neutral spec for the eventual re-render round-trip.
+// Backends: plotly renders in-webview; GR renders via one round-trip to the
+// warm serve process (deps.renderPlot, wired by extension.js) and lands as an
+// image/png frame carrying the same meta.id, so it attaches to the existing
+// entry as an alternate render rather than appending a duplicate plot. The GR
+// button's enablement is computed per panel build (backendState): it needs
+// both the round-trip wiring and a resolvable GR install (deps.findGr).
+// `entry.spec` retains a frame's meta.spec when one is present; today no
+// frame carries one, so the retained plotly figure itself is the
+// backend-neutral spec the round-trip sends (specFor).
 
 "use strict";
 
@@ -30,18 +33,38 @@ const vscode = require("vscode");
 const path = require("path");
 const display = require("@blade-lang/ide-protocol").display;
 
-// Injected by init(): { output } from extension.js.
+// Injected by init(): { output, findGr, renderPlot } from extension.js.
 let deps;
 
 const VIEW_TYPE = "bladePlots";
 const PANEL_TITLE = "Blade Plots";
 
-/** Backends the toolbar offers. `enabled: false` renders the button greyed
- *  with the tooltip; nothing else in this file special-cases GR. */
+/** Backends the toolbar offers. This is the static fallback shape (what
+ *  headless tests see with no deps wired); GR's EFFECTIVE enablement comes
+ *  from backendState() below, evaluated when the panel HTML is built and on
+ *  every toggle message. */
 const BACKENDS = [
   { id: "plotly", label: "plotly", enabled: true, tooltip: "plotly — interactive (active)" },
-  { id: "gr", label: "GR", enabled: false, tooltip: "GR — coming soon" },
+  { id: "gr", label: "GR", enabled: false, tooltip: "GR — unavailable" },
 ];
+
+/** The toolbar's effective backend entries. GR is enabled only when the serve
+ *  round-trip is wired (deps.renderPlot) AND the resolver finds a usable GR
+ *  install right now (deps.findGr — re-evaluated so a fetch-vendor run or a
+ *  blade.grPath change is picked up on the next panel build). The tooltip
+ *  carries the reason when disabled — the button explains itself. */
+function backendState() {
+  return BACKENDS.map((b) => {
+    if (b.id !== "gr") return b;
+    if (!deps || typeof deps.renderPlot !== "function" || typeof deps.findGr !== "function") {
+      return { id: "gr", label: "GR", enabled: false, tooltip: "GR — unavailable: render round-trip not wired" };
+    }
+    const g = deps.findGr();
+    return g && g.ok
+      ? { id: "gr", label: "GR", enabled: true, tooltip: "GR — static render (rendered by the serve process)" }
+      : { id: "gr", label: "GR", enabled: false, tooltip: `GR — unavailable: ${(g && g.reason) || "no GR install found"}` };
+  });
+}
 
 // --- History model (pure) ------------------------------------------------------
 
@@ -74,6 +97,11 @@ function appendFrame(hist, frame) {
   const backend = display.backendFor(frame);
   const meta = frame.meta || {};
   const id = typeof meta.id === "string" && meta.id ? meta.id : null;
+  // `meta.backend` says which backend PRODUCED this frame; `preferredBackend`
+  // is the program asking for a different one to be shown (stdlib's `backend`
+  // option slot). Deliberately separate keys: stamping backend:"gr" on a
+  // plotly payload would file it as the GR render and suppress the real one.
+  const prefer = BACKENDS.some((b) => b.id === meta.preferredBackend) ? meta.preferredBackend : null;
 
   if (id) {
     const idx = hist.entries.findIndex((e) => e.id === id);
@@ -81,6 +109,8 @@ function appendFrame(hist, frame) {
       const entry = hist.entries[idx];
       entry.renders[backend] = frame;
       if (meta.spec !== undefined) entry.spec = meta.spec;
+      // A re-render never revokes the original request, only restates it.
+      if (prefer) entry.prefer = prefer;
       hist.cursor = idx;
       return { entry, index: idx, merged: true };
     }
@@ -93,6 +123,7 @@ function appendFrame(hist, frame) {
     title: titleFor(frame, seq),
     receivedAt: Date.now(),
     primary: backend,
+    prefer,
     renders: { [backend]: frame },
     spec: meta.spec === undefined ? null : meta.spec,
   };
@@ -126,10 +157,26 @@ function renderFor(entry, backend) {
   return entry.renders[backend] || entry.renders[entry.primary] || Object.values(entry.renders)[0];
 }
 
+/** The backend-neutral spec for a re-render round-trip: a frame-carried
+ *  meta.spec when one exists (reserved in the wire spec, unused today), else
+ *  the retained plotly figure object itself. Null when the entry has neither
+ *  (e.g. a GR-only image with no plotly sibling — nothing to re-render from). */
+function specFor(entry) {
+  if (!entry) return null;
+  if (entry.spec !== null && entry.spec !== undefined) return entry.spec;
+  const p = entry.renders.plotly;
+  return p && p.mime === display.PLOTLY_MIME && p.encoding === "json" ? p.data : null;
+}
+
 // --- Panel state ---------------------------------------------------------------
 
 const history = newHistory();
 let backend = "plotly";
+/** Set once the user clicks a backend button. A program's `preferredBackend`
+ *  hint auto-switches the panel only until then: the program's request is
+ *  worth honoring, but silently overriding a human's explicit choice on every
+ *  subsequent plot is not. */
+let userPinnedBackend = false;
 /** @type {vscode.WebviewPanel | undefined} */
 let panel;
 let webviewReady = false;
@@ -177,10 +224,12 @@ function panelHtml(opts) {
     "connect-src 'none'",
   ].join("; ");
 
-  const backendButtons = BACKENDS.map(
+  const attr = (s) =>
+    String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+  const backendButtons = (opts.backends || BACKENDS).map(
     (b) =>
       `<button class="backend${b.id === backend ? " active" : ""}" data-backend="${b.id}"` +
-      `${b.enabled ? "" : " disabled"} title="${b.tooltip}">${b.label}</button>`
+      `${b.enabled ? "" : " disabled"} title="${attr(b.tooltip)}">${b.label}</button>`
   ).join("");
 
   return `<!DOCTYPE html>
@@ -223,6 +272,12 @@ function panelHtml(opts) {
   #pos { opacity: 0.8; min-width: 5em; text-align: center; font-variant-numeric: tabular-nums; }
   #title { margin-left: auto; opacity: 0.7; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   #stage { flex: 1 1 auto; position: relative; overflow: auto; min-height: 0; }
+  #note {
+    position: absolute; top: 8px; right: 12px; z-index: 5;
+    padding: 2px 10px; border-radius: 3px; opacity: 0.9;
+    background: var(--vscode-editorWidget-background, var(--vscode-editor-background));
+    border: 1px solid var(--vscode-panel-border, transparent);
+  }
   #plot { width: 100%; height: 100%; }
   #img { display: block; max-width: 100%; margin: 0 auto; }
   #fallback { padding: 12px; white-space: pre-wrap; word-break: break-word; font-family: var(--vscode-editor-font-family, monospace); }
@@ -240,9 +295,11 @@ function panelHtml(opts) {
     <span class="sep"></span>
     <button id="exportPng" title="Export PNG" disabled>PNG</button>
     <button id="exportSvg" title="Export SVG" disabled>SVG</button>
+    <button id="exportPdf" title="Export PDF (GR renders)" disabled>PDF</button>
     <span id="title"></span>
   </div>
   <div id="stage">
+    <div id="note" hidden></div>
     <div id="empty">No plots yet. Evaluate something that plots, or run <b>Blade: Plot Demo</b>.</div>
     <div id="plot" hidden></div>
     <img id="img" hidden alt="plot">
@@ -273,8 +330,16 @@ function webviewScript() {
     "  var elFallback = document.getElementById('fallback');",
     "  var elPng = document.getElementById('exportPng');",
     "  var elSvg = document.getElementById('exportSvg');",
+    "  var elPdf = document.getElementById('exportPdf');",
+    "  var elNote = document.getElementById('note');",
+    "  var elStage = document.getElementById('stage');",
     "  var current = null;   // {frame, title, index, total}",
     "  var plotted = false;  // is elPlot holding a live plotly graph?",
+    "",
+    "  function setNote(text) {",
+    "    elNote.hidden = !text;",
+    "    elNote.textContent = text || '';",
+    "  }",
     "",
     // Theme: plotly gets its colors from the same CSS variables the panel
     // chrome uses, so a dark theme never gets a white plot rectangle.
@@ -375,6 +440,12 @@ function webviewScript() {
     "      download('data:' + current.frame.mime + ';base64,' + String(current.frame.data).replace(/\\s+/g, ''), fileBase() + '.png');",
     "      return;",
     "    }",
+    // SVG/PDF of a GR render: the host re-renders the retained spec in the
+    // requested format through the serve worker and posts the bytes back.
+    "    if ((format === 'svg' || format === 'pdf') && /^image\\//.test(current.frame.mime)) {",
+    "      api.postMessage({ type: 'export', format: format, width: elStage.clientWidth, height: elStage.clientHeight });",
+    "      return;",
+    "    }",
     "    api.postMessage({ type: 'error', message: 'this plot cannot be exported as ' + format });",
     "  }",
     "",
@@ -382,10 +453,14 @@ function webviewScript() {
     "  elNext.addEventListener('click', function () { api.postMessage({ type: 'nav', delta: 1 }); });",
     "  elPng.addEventListener('click', function () { exportAs('png'); });",
     "  elSvg.addEventListener('click', function () { exportAs('svg'); });",
+    "  elPdf.addEventListener('click', function () { exportAs('pdf'); });",
     "  Array.prototype.forEach.call(document.querySelectorAll('.backend'), function (b) {",
     "    b.addEventListener('click', function () {",
     "      if (b.disabled) return;",
-    "      api.postMessage({ type: 'backend', backend: b.getAttribute('data-backend') });",
+    // The stage size rides along so a GR render comes back at the pixels
+    // this panel will actually display.
+    "      api.postMessage({ type: 'backend', backend: b.getAttribute('data-backend'),",
+    "                        width: elStage.clientWidth, height: elStage.clientHeight });",
     "    });",
     "  });",
     "",
@@ -398,14 +473,24 @@ function webviewScript() {
     "      elPrev.disabled = msg.index <= 0;",
     "      elNext.disabled = msg.index >= msg.total - 1;",
     "      elPng.disabled = false;",
-    "      elSvg.disabled = !(msg.frame.mime === '" + display.PLOTLY_MIME + "');",
+    "      var isImg = /^image\\//.test(msg.frame.mime);",
+    "      elSvg.disabled = !(msg.frame.mime === '" + display.PLOTLY_MIME + "' || isImg);",
+    "      elPdf.disabled = !isImg;",
     "      Array.prototype.forEach.call(document.querySelectorAll('.backend'), function (b) {",
     "        b.classList.toggle('active', b.getAttribute('data-backend') === msg.backend);",
     "      });",
+    "      setNote(null);",
     "      render();",
+    "    } else if (msg.type === 'pending') {",
+    "      setNote(msg.message || 'rendering\\u2026');",
+    "    } else if (msg.type === 'note') {",
+    "      setNote(msg.message || '');",
+    "    } else if (msg.type === 'exportData') {",
+    "      download('data:' + msg.mime + ';base64,' + msg.data, msg.filename);",
     "    } else if (msg.type === 'empty') {",
     "      current = null; elPos.textContent = '0 / 0'; elTitle.textContent = '';",
-    "      elPrev.disabled = true; elNext.disabled = true; elPng.disabled = true; elSvg.disabled = true;",
+    "      elPrev.disabled = true; elNext.disabled = true; elPng.disabled = true; elSvg.disabled = true; elPdf.disabled = true;",
+    "      setNote(null);",
     "      showOnly(elEmpty);",
     "    }",
     "  });",
@@ -446,6 +531,98 @@ function postCurrent() {
   });
 }
 
+// --- The GR round-trip ---------------------------------------------------------
+
+/** Entry ids with a render request in the air — a second toggle while one is
+ *  pending must not queue a duplicate. */
+const grInflight = new Set();
+
+/** Clamp a webview-reported dimension to a sane render size and force it
+ *  even: GR's cairo raster cannot produce odd widths, so an odd request
+ *  would come back one pixel off. */
+function renderDim(v, fallback) {
+  const n = Number(v);
+  if (!isFinite(n) || n <= 0) return fallback;
+  return Math.max(320, Math.min(2400, 2 * Math.floor(n / 2)));
+}
+
+/** A transient status line the webview shows without giving up the current
+ *  render (unlike fail(), which replaces the plot with text). */
+function note(message) {
+  log(message);
+  if (panel && webviewReady) panel.webview.postMessage({ type: "note", message });
+}
+
+/** Ask the warm serve process to render `entry`'s spec with GR. The response
+ *  frame re-enters through display.publish, so the ordinary onFrame →
+ *  appendFrame path merges it into this entry by meta.id and re-posts — no
+ *  bespoke delivery. On failure the current (plotly) render stays up and the
+ *  webview gets a note. */
+function requestGrRender(entry, width, height) {
+  const spec = specFor(entry);
+  if (!spec) {
+    note(`GR: nothing to render — no spec retained for "${entry.title}"`);
+    return;
+  }
+  if (grInflight.has(entry.id)) return;
+  grInflight.add(entry.id);
+  if (panel && webviewReady) {
+    panel.webview.postMessage({ type: "pending", backend: "gr", message: "rendering with GR…" });
+  }
+  deps
+    .renderPlot({
+      spec,
+      plotId: entry.id,
+      width: renderDim(width, 800),
+      height: renderDim(height, 600),
+    })
+    .then((resp) => {
+      grInflight.delete(entry.id);
+      const frame = resp && resp.frame;
+      if (!frame || typeof frame.data !== "string") throw new Error("serve returned no frame");
+      display.publish(frame, "gr-render");
+    })
+    .catch((e) => {
+      grInflight.delete(entry.id);
+      note(`GR render failed: ${(e && e.message) || e}`);
+    });
+}
+
+/** Publication export via the GR worker: re-render the current entry's spec
+ *  in the requested format and hand the bytes to the webview to save. Not
+ *  cached in history — an export is a file, not an alternate render. */
+function requestGrExport(format, width, height) {
+  const entry = currentEntry(history);
+  const spec = specFor(entry);
+  if (!entry || !spec) {
+    note("export: no spec retained for this plot");
+    return;
+  }
+  if (!deps || typeof deps.renderPlot !== "function") {
+    note("export: GR round-trip not wired");
+    return;
+  }
+  note(`exporting as ${format.toUpperCase()}…`);
+  deps
+    .renderPlot({
+      spec,
+      plotId: entry.id,
+      width: renderDim(width, 800),
+      height: renderDim(height, 600),
+      format,
+    })
+    .then((resp) => {
+      const frame = resp && resp.frame;
+      if (!frame || typeof frame.data !== "string") throw new Error("serve returned no frame");
+      const safe = entry.title.replace(/[^A-Za-z0-9._-]+/g, "_").slice(0, 60) || "plot";
+      if (panel && webviewReady) {
+        panel.webview.postMessage({ type: "exportData", mime: frame.mime, data: frame.data, filename: `${safe}.${format}` });
+        panel.webview.postMessage({ type: "note", message: "" });
+      }
+    })
+    .catch((e) => note(`export failed: ${(e && e.message) || e}`));
+}
+
 function onWebviewMessage(msg) {
   if (!msg || typeof msg !== "object") return;
   if (msg.type === "ready") {
@@ -462,10 +639,22 @@ function onWebviewMessage(msg) {
     return;
   }
   if (msg.type === "backend") {
-    const b = BACKENDS.find((x) => x.id === msg.backend);
-    if (!b || !b.enabled) return; // GR is contributed disabled — ignore forgeries
+    const b = backendState().find((x) => x.id === msg.backend);
+    if (!b || !b.enabled) return; // disabled here even if un-greyed in a stale webview
     backend = b.id;
+    userPinnedBackend = true;
+    // Show the fallback render for the new backend FIRST, then flag the
+    // pending round-trip — 'show' clears the webview's note, so the order
+    // keeps "rendering with GR…" visible over the plotly fallback.
     postCurrent();
+    const entry = currentEntry(history);
+    if (b.id === "gr" && entry && !entry.renders.gr) {
+      requestGrRender(entry, msg.width, msg.height);
+    }
+    return;
+  }
+  if (msg.type === "export") {
+    requestGrExport(msg.format === "pdf" ? "pdf" : "svg", msg.width, msg.height);
     return;
   }
   if (msg.type === "error") {
@@ -498,6 +687,7 @@ function ensurePanel() {
     cspSource: panel.webview.cspSource,
     plotlyUri: String(plotlyUri),
     nonce: nonceString(),
+    backends: backendState(),
   });
   panel.webview.onDidReceiveMessage(onWebviewMessage);
   panel.onDidDispose(() => {
@@ -513,7 +703,26 @@ function onFrame(frame, origin) {
   log(`${res.merged ? "merged" : "added"} ${frame.mime} from ${origin} — ${res.entry.title} (${history.entries.length} in history)`);
   ensurePanel();
   panel.reveal(vscode.ViewColumn.Beside, true);
+
+  // Honor a program-stated backend preference: switch the panel to it and
+  // render eagerly. Silently ignored when that backend is unavailable (a
+  // viewer without GR just keeps showing plotly — the hint is not a demand)
+  // or once the user has taken manual control of the toggle.
+  const entry = res.entry;
+  const wants = entry.prefer;
+  if (wants && !userPinnedBackend && wants !== backend) {
+    const target = backendState().find((b) => b.id === wants);
+    if (target && target.enabled) {
+      backend = wants;
+      log(`honoring preferredBackend=${wants} for ${entry.title}`);
+    }
+  }
   postCurrent();
+  if (backend === "gr" && entry.prefer === "gr" && !entry.renders.gr) {
+    // Eager render at the default size — no webview measurement is available
+    // on this path (the frame arrived on its own, not from a toggle click).
+    requestGrRender(entry);
+  }
 }
 
 /** blade.plotDemo: build a contour frame, encode it on the REPL wire, and
@@ -578,6 +787,11 @@ function dispose() {
     panel = undefined;
   }
   webviewReady = false;
+  // Closing the panel ends the session the toggle belonged to: the next one
+  // opens on the default backend and is free to honor a program preference
+  // again.
+  backend = "plotly";
+  userPinnedBackend = false;
 }
 
 module.exports = { init, dispose };
@@ -585,11 +799,13 @@ module.exports = { init, dispose };
 // Headless test surface (scripts/, not used by VS Code).
 module.exports._test = {
   BACKENDS,
+  backendState,
   newHistory,
   appendFrame,
   navigate,
   currentEntry,
   renderFor,
+  specFor,
   titleFor,
   panelHtml,
   webviewScript,

@@ -22,6 +22,7 @@ const repl = require("./repl");
 const serve = require("./serve");
 const notebook = require("./notebook");
 const plots = require("./plots");
+const gr = require("./gr");
 
 /** @type {vscode.DiagnosticCollection} */
 let diagnostics;
@@ -71,6 +72,34 @@ let warnedNoCompiler = false;
 function findCompiler() {
   const configured = vscode.workspace.getConfiguration("blade").get("compilerPath", "");
   return pkg.resolveCompiler({ explicitPath: configured || undefined, env: process.env }).exe;
+}
+
+/** Resolve the GR installation for the plot panel's static backend:
+ *  `blade.grPath`, then vendor/gr beside the workspace, then vendor/gr beside
+ *  the extension (populated by `npm run fetch-vendor`). Validation up front is
+ *  deliberate — a bad GR environment fails silently at spawn time (src/gr.js),
+ *  so the answer must be known before anything GR-shaped is launched. */
+function findGr() {
+  const folders = vscode.workspace.workspaceFolders;
+  return gr.resolveGr({
+    configuredPath: vscode.workspace.getConfiguration("blade").get("grPath", ""),
+    workspaceRoot: folders && folders.length > 0 ? folders[0].uri.fsPath : undefined,
+    extensionRoot: extensionRootPath,
+  });
+}
+// Set in activate(); module-level so findGr stays callable from anywhere.
+let extensionRootPath;
+
+/** Spawn-env provider for serve clients: the composed GR environment (GRDIR,
+ *  bin on PATH, GKS_WSTYPE=100, no GR_DISPLAY) when a GR install resolves,
+ *  else undefined so the child inherits untouched. Re-evaluated by the
+ *  protocol client on every spawn — same lifecycle as findCompiler — so a
+ *  fetch-vendor run or a blade.grPath change takes effect on the next
+ *  (re)spawn without a client rebuild. Ignored by protocol packages
+ *  predating the `env` dependency. */
+function grSpawnEnv() {
+  const g = findGr();
+  return g.ok ? gr.grEnv(g.grdir) : undefined;
 }
 
 function run(exe, args, timeoutMs, cwd) {
@@ -2700,17 +2729,29 @@ function activate(context) {
   diagnostics = vscode.languages.createDiagnosticCollection("blade");
   output = vscode.window.createOutputChannel("Blade");
   context.subscriptions.push(diagnostics, output);
+  // Absent from the test mock's context; resolveGr treats it as optional.
+  extensionRootPath = context.extensionUri ? context.extensionUri.fsPath : undefined;
+  // Preflight, log-only for now: the GR toggle (docs/gr-graphics-plan.md G2)
+  // consumes findGr() when it lands; until then this line is the one place
+  // that says why the static backend will or won't be available.
+  const grState = findGr();
+  output.appendLine(
+    grState.ok
+      ? `gr: ${grState.grdir} (via ${grState.source})`
+      : `gr: unavailable — ${grState.reason}`
+  );
   repl.init(context, { findCompiler, reportNoCompiler });
-  serve.init(context, { findCompiler, output });
+  serve.init(context, { findCompiler, output, env: grSpawnEnv });
   // applyCheckPayload is passed through so notebook.js's own per-notebook
   // `checkCells` fast check (N3) can fan its remapped response out to each
   // cell's caches without notebook.js requiring this module back (that would
   // be a require cycle — extension.js already requires notebook.js).
-  notebook.init(context, { findCompiler, output, applyCheckPayload });
-  // Plots panel: subscribes to the display-frame hub (src/display.js) and
-  // registers blade.plotDemo. No wiring beyond this — every frame reaches it
-  // through the hub, never through this module.
-  plots.init(context, { output });
+  notebook.init(context, { findCompiler, output, applyCheckPayload, env: grSpawnEnv });
+  // Plots panel: subscribes to the display-frame hub and registers
+  // blade.plotDemo. Frames reach it through the hub, never through this
+  // module; the extra deps are the GR round-trip — findGr gates the toolbar
+  // toggle, renderPlot is the serve request behind it.
+  plots.init(context, { output, findGr, renderPlot: (args, opts) => serve.renderPlot(args, opts) });
 
   const cfg = () => vscode.workspace.getConfiguration("blade");
 

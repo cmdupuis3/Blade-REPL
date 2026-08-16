@@ -263,10 +263,59 @@ function testPanelHtml() {
   check("html: prev/next/position toolbar", /id="prev"/.test(html) && /id="next"/.test(html) && /id="pos"/.test(html));
   check("html: export buttons", /id="exportPng"/.test(html) && /id="exportSvg"/.test(html));
   check("html: plotly backend button enabled", /data-backend="plotly"(?![^>]*disabled)/.test(html));
-  check("html: GR backend button disabled with a tooltip", /data-backend="gr" disabled title="GR — coming soon"/.test(html));
+  check("html: GR backend button disabled by default with a tooltip", /data-backend="gr" disabled title="GR — unavailable"/.test(html));
   check("html: theme variables drive the chrome", html.indexOf("var(--vscode-editor-background)") !== -1);
   check("html: webview script resizes plotly", html.indexOf("Plotly.Plots.resize") !== -1);
   check("html: webview script exports via plotly", html.indexOf("Plotly.downloadImage") !== -1);
+
+  // backendState()'s entries flow into the HTML — an enabled GR renders as a
+  // live button, and tooltips (which carry findGr's reasons, quotes included)
+  // are attribute-escaped.
+  const enabledHtml = _p.panelHtml({
+    cspSource: "vscode-webview://abc",
+    plotlyUri: "u",
+    nonce: "N",
+    backends: [
+      { id: "plotly", label: "plotly", enabled: true, tooltip: "plotly — interactive (active)" },
+      { id: "gr", label: "GR", enabled: true, tooltip: 'GR — static render "quoted"' },
+    ],
+  });
+  check("html: GR button enabled when backendState says so", /data-backend="gr"(?![^>]*disabled)/.test(enabledHtml));
+  check("html: tooltips are attribute-escaped", enabledHtml.indexOf("&quot;quoted&quot;") !== -1);
+}
+
+// --- 3b. Backend availability + spec fallback ---------------------------------
+
+function testBackendState() {
+  _p.setDeps({});
+  let s = _p.backendState().find((b) => b.id === "gr");
+  check("backendState: unwired deps → disabled with reason", !s.enabled && /not wired/.test(s.tooltip), s);
+
+  _p.setDeps({
+    renderPlot: () => Promise.resolve(),
+    findGr: () => ({ ok: false, reason: "no GR installation found — run `npm run fetch-vendor`" }),
+  });
+  s = _p.backendState().find((b) => b.id === "gr");
+  check("backendState: resolver says no → disabled, reason surfaced", !s.enabled && /fetch-vendor/.test(s.tooltip), s);
+
+  _p.setDeps({ renderPlot: () => Promise.resolve(), findGr: () => ({ ok: true, grdir: "C:/gr" }) });
+  s = _p.backendState().find((b) => b.id === "gr");
+  check("backendState: wired + resolved → enabled", s.enabled === true, s);
+  check("backendState: plotly is never touched", _p.backendState()[0].enabled === true);
+}
+
+function testSpecFor() {
+  const hist = _p.newHistory();
+  const pf = Object.assign(plotlyFrame(), { encoding: "json" });
+  const r = _p.appendFrame(hist, pf);
+  check("specFor: falls back to the retained plotly figure", _p.specFor(r.entry) === pf.data, typeof _p.specFor(r.entry));
+
+  const withSpec = Object.assign(plotlyFrame({ meta: { id: "s1", spec: { neutral: true } } }), { encoding: "json" });
+  const r2 = _p.appendFrame(hist, withSpec);
+  check("specFor: a frame-carried meta.spec wins", _p.specFor(r2.entry) && _p.specFor(r2.entry).neutral === true);
+
+  const imgOnly = _p.appendFrame(hist, Object.assign(pngFrame(), { encoding: "base64" }));
+  check("specFor: image-only entry has no spec", _p.specFor(imgOnly.entry) === null);
 }
 
 // --- 4. End-to-end through the real panel -------------------------------------
@@ -322,6 +371,193 @@ function testDemoEndToEnd() {
     plots.dispose();
     check("demo: dispose closes the panel", panel._disposed === true);
   });
+}
+
+// --- 4b. The GR round-trip through the real panel ------------------------------
+
+/** Drives the whole toggle path with a fake serve: plotly frame arrives → GR
+ *  toggle → pending note over the plotly fallback → fake renderPlot resolves
+ *  an image/png frame with the same meta.id → it merges into the entry and is
+ *  shown → toggling is instant both ways afterwards. Then the failure path:
+ *  the plotly render stays up and the error arrives as a note. */
+async function testGrRoundTrip() {
+  const calls = [];
+  const grDeps = {
+    output: { appendLine: () => {} },
+    findGr: () => ({ ok: true, grdir: "C:/fake/gr", source: "test" }),
+    renderPlot: (args) => {
+      calls.push(args);
+      return Promise.resolve({
+        frame: { v: 1, mime: "image/png", encoding: "base64", data: PNG_B64, meta: { id: args.plotId, backend: "gr" } },
+      });
+    },
+  };
+  _p.setDeps(grDeps);
+
+  const entriesBefore = _p.history.entries.length;
+  display.ingestReplText(display.encodeReplLine(plotlyFrame({ meta: { id: "rt1" } })), "repl");
+  const panels = mock.window._webviewPanels;
+  const panel = panels[panels.length - 1];
+  check("gr rt: a fresh panel exists after the earlier dispose", !!panel && panel._disposed !== true);
+  check("gr rt: GR button enabled in this panel's HTML", /data-backend="gr"(?![^>]*disabled)/.test(panel.webview.html));
+
+  panel.webview._send({ type: "ready" });
+  panel.webview._send({ type: "backend", backend: "gr", width: 1001, height: 601 });
+  const types = panel._posted.map((m) => m.type);
+  check("gr rt: fallback show first, then the pending note", types.indexOf("pending") > types.indexOf("show"), types);
+  check("gr rt: renderPlot got the plotly figure as the spec", calls.length === 1 && calls[0].spec.data[0].type === "contour", calls[0] && Object.keys(calls[0]));
+  check("gr rt: plotId is the entry id", calls[0].plotId === "rt1", calls[0].plotId);
+  check("gr rt: dimensions clamped to even", calls[0].width === 1000 && calls[0].height === 600, [calls[0].width, calls[0].height]);
+
+  await new Promise((r) => setImmediate(r));
+  const shownGr = panel._posted[panel._posted.length - 1];
+  check(
+    "gr rt: the GR render is shown on arrival",
+    shownGr.type === "show" && shownGr.frame.mime === display.PNG_MIME && shownGr.backend === "gr",
+    shownGr.type + "/" + (shownGr.frame && shownGr.frame.mime)
+  );
+  check("gr rt: merged — the history did not grow", _p.history.entries.length === entriesBefore + 1, _p.history.entries.length - entriesBefore);
+  const entry = _p.history.entries.find((e) => e.id === "rt1");
+  check("gr rt: both renders cached on the one entry", !!(entry && entry.renders.plotly && entry.renders.gr), entry && Object.keys(entry.renders));
+
+  panel.webview._send({ type: "backend", backend: "plotly" });
+  const back = panel._posted[panel._posted.length - 1];
+  check("gr rt: toggle back shows the cached plotly render", back.type === "show" && back.frame.mime === display.PLOTLY_MIME, back.frame && back.frame.mime);
+
+  panel.webview._send({ type: "backend", backend: "gr" });
+  check("gr rt: second GR toggle uses the cache — no new request", calls.length === 1, calls.length);
+  const again = panel._posted[panel._posted.length - 1];
+  check("gr rt: cached GR render shown instantly", again.type === "show" && again.frame.mime === display.PNG_MIME, again.frame && again.frame.mime);
+
+  // Failure path — a fresh plot whose render request rejects.
+  _p.setDeps(
+    Object.assign({}, grDeps, { renderPlot: () => Promise.reject(new Error("GR unavailable: GRDIR not set")) })
+  );
+  display.ingestReplText(display.encodeReplLine(plotlyFrame({ meta: { id: "rt2" } })), "repl");
+  panel.webview._send({ type: "backend", backend: "gr", width: 800, height: 600 });
+  await new Promise((r) => setImmediate(r));
+  const lastNote = panel._posted.filter((m) => m.type === "note").pop();
+  check("gr rt: failure surfaces as a note", !!lastNote && /GR render failed: GR unavailable/.test(lastNote.message), lastNote);
+  const entry2 = _p.history.entries.find((e) => e.id === "rt2");
+  check("gr rt: a failed render caches nothing", !!entry2 && !entry2.renders.gr, entry2 && Object.keys(entry2.renders));
+
+  plots.dispose();
+}
+
+// --- 4c. SVG/PDF export through the GR worker ----------------------------------
+
+async function testGrExport() {
+  const calls = [];
+  _p.setDeps({
+    output: { appendLine: () => {} },
+    findGr: () => ({ ok: true, grdir: "C:/fake/gr", source: "test" }),
+    renderPlot: (args) => {
+      calls.push(args);
+      const mime = args.format === "pdf" ? "application/pdf" : "image/svg+xml";
+      return Promise.resolve({
+        frame: { v: 1, mime, encoding: "base64", data: Buffer.from("<svg/>").toString("base64"), meta: { id: args.plotId, backend: "gr" } },
+      });
+    },
+  });
+
+  display.ingestReplText(display.encodeReplLine(plotlyFrame({ meta: { id: "ex1", title: "waves & spume" } })), "repl");
+  const panels = mock.window._webviewPanels;
+  const panel = panels[panels.length - 1];
+  panel.webview._send({ type: "ready" });
+
+  const entriesBefore = _p.history.entries.length;
+  panel.webview._send({ type: "export", format: "svg", width: 900, height: 700 });
+  await new Promise((r) => setImmediate(r));
+  const exported = panel._posted.filter((m) => m.type === "exportData").pop();
+  check("gr export: bytes posted back", !!exported && exported.mime === "image/svg+xml", exported && exported.mime);
+  check("gr export: filename from a sanitized title", !!exported && exported.filename === "waves_spume.svg", exported && exported.filename);
+  check("gr export: format forwarded to renderPlot", calls.length === 1 && calls[0].format === "svg", calls[0] && calls[0].format);
+  check("gr export: not cached in history", _p.history.entries.length === entriesBefore, _p.history.entries.length - entriesBefore);
+
+  panel.webview._send({ type: "export", format: "pdf", width: 900, height: 700 });
+  await new Promise((r) => setImmediate(r));
+  const pdf = panel._posted.filter((m) => m.type === "exportData").pop();
+  check("gr export: pdf round-trip", !!pdf && pdf.mime === "application/pdf" && /\.pdf$/.test(pdf.filename), pdf && pdf.filename);
+
+  // A spec-less entry (image-only, no plotly sibling) cannot export.
+  display.ingestReplText(display.encodeReplLine(pngFrame({ meta: { title: "raster only" } })), "repl");
+  panel.webview._send({ type: "export", format: "svg", width: 900, height: 700 });
+  await new Promise((r) => setImmediate(r));
+  const noteMsg = panel._posted.filter((m) => m.type === "note" && m.message).pop();
+  check("gr export: spec-less entry surfaces a note", !!noteMsg && /no spec retained/.test(noteMsg.message), noteMsg);
+
+  plots.dispose();
+}
+
+// --- 4d. Program-stated backend preference ------------------------------------
+
+/** stdlib's `backend` option slot puts `meta.preferredBackend` on the frame.
+ *  The panel switches to it and renders eagerly — but never files the plotly
+ *  payload as the GR render, never overrides a user's manual toggle, and
+ *  ignores the hint entirely when that backend is unavailable. */
+async function testPreferredBackend() {
+  const calls = [];
+  const grDeps = {
+    output: { appendLine: () => {} },
+    findGr: () => ({ ok: true, grdir: "C:/fake/gr", source: "test" }),
+    renderPlot: (args) => {
+      calls.push(args);
+      return Promise.resolve({
+        frame: { v: 1, mime: "image/png", encoding: "base64", data: PNG_B64, meta: { id: args.plotId, backend: "gr" } },
+      });
+    },
+  };
+  _p.setDeps(grDeps);
+
+  // A frame that asks for GR: backend "plotly" (it IS plotly json) + the hint.
+  const preferring = (id) =>
+    plotlyFrame({ meta: { id, backend: "plotly", preferredBackend: "gr" } });
+
+  display.ingestReplText(display.encodeReplLine(preferring("pref1")), "repl");
+  const panels = mock.window._webviewPanels;
+  const panel = panels[panels.length - 1];
+  panel.webview._send({ type: "ready" });
+
+  const entry = _p.history.entries.find((e) => e.id === "pref1");
+  check("prefer: the hint is retained on the entry", entry && entry.prefer === "gr", entry && entry.prefer);
+  check(
+    "prefer: the plotly payload is NOT filed as the gr render",
+    entry && entry.renders.plotly && !entry.renders.gr,
+    entry && Object.keys(entry.renders)
+  );
+  check("prefer: a render was requested eagerly", calls.length === 1 && calls[0].plotId === "pref1", calls.length);
+
+  await new Promise((r) => setImmediate(r));
+  const shown = panel._posted.filter((m) => m.type === "show").pop();
+  check(
+    "prefer: the panel switched to GR and shows the render",
+    shown && shown.backend === "gr" && shown.frame.mime === display.PNG_MIME,
+    shown && `${shown.backend}/${shown.frame && shown.frame.mime}`
+  );
+
+  // A manual toggle takes control: later preferring frames no longer switch.
+  panel.webview._send({ type: "backend", backend: "plotly" });
+  display.ingestReplText(display.encodeReplLine(preferring("pref2")), "repl");
+  const afterPin = panel._posted.filter((m) => m.type === "show").pop();
+  check("prefer: a user's manual toggle wins over later hints", afterPin.backend === "plotly", afterPin.backend);
+
+  plots.dispose();
+
+  // GR unavailable: the hint is ignored, nothing is requested, plotly shows.
+  const before = calls.length;
+  _p.setDeps({
+    output: { appendLine: () => {} },
+    findGr: () => ({ ok: false, reason: "no GR installation found" }),
+    renderPlot: grDeps.renderPlot,
+  });
+  display.ingestReplText(display.encodeReplLine(preferring("pref3")), "repl");
+  const panel2 = mock.window._webviewPanels[mock.window._webviewPanels.length - 1];
+  panel2.webview._send({ type: "ready" });
+  const shown3 = panel2._posted.filter((m) => m.type === "show").pop();
+  check("prefer: ignored when GR is unavailable", shown3.backend === "plotly", shown3.backend);
+  check("prefer: and nothing was requested", calls.length === before, calls.length - before);
+
+  plots.dispose();
 }
 
 // --- 5. Notebook cell outputs -------------------------------------------------
@@ -474,11 +710,16 @@ function testReplayedFrameStillRoutesToPanel() {
   testHistoryAlternateRender();
 
   testPanelHtml();
+  testBackendState();
+  testSpecFor();
   testNotebookDisplayOutputs();
   testAssembleOutputsSuppressesReplayedIds();
   await testReplayedFrameStillRoutesToPanel();
 
   await testDemoEndToEnd();
+  await testGrRoundTrip();
+  await testGrExport();
+  await testPreferredBackend();
 
   if (failures) {
     console.error(`\n${failures} plot check(s) failed.`);
