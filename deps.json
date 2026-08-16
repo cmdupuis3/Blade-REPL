@@ -1,0 +1,64 @@
+{
+  "$comment": [
+    "Single source of truth for the vendored graphics packages. Consumed by",
+    "scripts/fetch-vendor.js (`npm run fetch-vendor`). Nothing else reads it.",
+    "",
+    "sha256 values are lowercase hex of the exact bytes at `url`. A null hash",
+    "means nobody has pinned that asset yet: the fetcher warns, prints the hash",
+    "it computed, and continues -- paste that value back in here to pin it."
+  ],
+  "dependencies": [
+    {
+      "name": "plotly.js",
+      "version": "3.7.0",
+      "url": "https://cdn.plot.ly/plotly-3.7.0.min.js",
+      "sha256": "8ef4c6ab1369f0019611cbcd2d5b8aafef23e5d19ef58c39d4b4249831fe2180",
+      "size": 4851164,
+      "dest": "media/plotly.min.js",
+      "kind": "file",
+      "committed": true,
+      "why": "Rendering backend for the Blade Plots webview. Webviews are offline, so this file ships inside the .vsix and is tracked in git; the fetcher only verifies it."
+    },
+    {
+      "name": "gr",
+      "version": "0.73.26",
+      "kind": "tarball",
+      "dest": "vendor/gr",
+      "committed": false,
+      "stripTopLevel": true,
+      "expect": ["bin", "include", "lib", "fonts"],
+      "why": "Static-PNG plotting backend for large grids, staged for a later release. 147 MB extracted, so it is gitignored and re-fetched on demand.",
+      "runtime": "GRDIR must point at dest and $GRDIR/bin must be on PATH (the Qt/GKS shared libraries live there).",
+      "assets": {
+        "win32-x64": {
+          "asset": "gr-0.73.26-Windows-x86_64.tar.gz",
+          "url": "https://github.com/sciapp/gr/releases/download/v0.73.26/gr-0.73.26-Windows-x86_64.tar.gz",
+          "sha256": "8aa6fba98712f0824530e5ead7acb59e5c6fac3f10ea05a4df4be465f3f3bc68",
+          "size": 52594053,
+          "note": "MinGW build, matching the g++ toolchain the compiler shells out to. The MSVC variant (gr-0.73.26-Windows-x86_64-msvc.tar.gz) is deliberately not used."
+        },
+        "linux-x64": {
+          "asset": "gr-0.73.26-Debian-x86_64.tar.gz",
+          "url": "https://github.com/sciapp/gr/releases/download/v0.73.26/gr-0.73.26-Debian-x86_64.tar.gz",
+          "sha256": null,
+          "size": 48406379,
+          "note": "Chosen over gr-0.73.26-Ubuntu-x86_64.tar.gz (90 MB, bundles a full Qt) and over the Linux/CentOS/Redhat x86_64 builds, which are byte-identical to each other at 48094182 and target an older glibc."
+        },
+        "darwin-x64": {
+          "asset": "gr-0.73.26-Darwin-x86_64.tar.gz",
+          "url": "https://github.com/sciapp/gr/releases/download/v0.73.26/gr-0.73.26-Darwin-x86_64.tar.gz",
+          "sha256": null,
+          "size": 61171308,
+          "note": "Per-arch build. gr-0.73.26-Darwin-universal.tar.gz (90 MB) would cover both Macs in one asset if that is ever preferable."
+        },
+        "darwin-arm64": {
+          "asset": "gr-0.73.26-Darwin-aarch64.tar.gz",
+          "url": "https://github.com/sciapp/gr/releases/download/v0.73.26/gr-0.73.26-Darwin-aarch64.tar.gz",
+          "sha256": null,
+          "size": 60718906,
+          "note": "Apple silicon."
+        }
+      }
+    }
+  ]
+}

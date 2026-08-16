@@ -1,0 +1,14 @@
+# media/plotly.min.js is a verbatim upstream artifact whose sha256 is pinned in
+# deps.json. Git sees minified JS as text, so under core.autocrlf=true (the
+# Windows default) checkout rewrote its 3881 LFs to CRLF -- a 4855045-byte file
+# where upstream shipped 4851164, with a different hash. The stored blob was
+# always correct; only the working copy was mangled, which meant every fresh
+# clone on Windows failed `npm run fetch-vendor -- --check` and packaged a
+# byte-modified plotly into the .vsix. Marking it binary stops all conversion.
+media/plotly.min.js binary
+
+# Same reasoning for anything else that must survive byte-exact.
+*.vsix binary
+*.tar.gz binary
+*.ttf binary
+*.pfb binary

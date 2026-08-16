@@ -18,3 +18,6 @@ vendor/*
 # one IS committed, since it's this extension's only runtime dependency and
 # there is no npm registry involved.
 !vendor/blade-lang-ide-protocol-*.tgz
+
+# Built extension bundles from `vsce package` — reproducible from the tree.
+*.vsix
