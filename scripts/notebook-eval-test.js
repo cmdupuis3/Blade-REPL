@@ -179,15 +179,18 @@ const EVAL_TIMEOUT_MS = 30000;
     JSON.stringify(probe).slice(0, 300)
   );
 
-  // --- 1. Let-binding eval with a typed value ---------------------------------
-
+  // --- 1. Let-binding eval: silent, and read back by a bare identifier --------
+  //
+  // A cell displays only its "return value" (a trailing bare expression);
+  // declarations bind silently, exactly like Jupyter's assignment statements.
   const sess = "notebook-eval-test-session";
   const r1 = await evalReq(sess, "let x: Int64 = 41", undefined, EVAL_TIMEOUT_MS);
   check("let-binding: kept", r1.kept === true, JSON.stringify(r1).slice(0, 300));
-  const xBinding = (r1.bindings || []).find((b) => b.name === "x");
-  check("let-binding: bindings[] carries x", !!xBinding, JSON.stringify(r1.bindings));
-  check("let-binding: x's type is Int64", xBinding && xBinding.type === "Int64", xBinding);
-  check("let-binding: x's value is 41", xBinding && xBinding.value === "41", xBinding);
+  check("let-binding: declarations display nothing", (r1.bindings || []).length === 0, JSON.stringify(r1.bindings));
+  const r1b = await evalReq(sess, "x", undefined, EVAL_TIMEOUT_MS);
+  const xEcho = (r1b.bindings || [])[0];
+  check("let-binding: a bare identifier reads it back typed", !!xEcho && xEcho.type === "Int64", xEcho);
+  check("let-binding: x's value is 41", !!xEcho && xEcho.value === "41", xEcho);
 
   // --- 2. Bare expression echo (name:"") --------------------------------------
 
@@ -312,17 +315,17 @@ const EVAL_TIMEOUT_MS = 30000;
   // used to die whole with BL1999 ("Expected declaration but got identifier"):
   // the engine classified the cell by its FIRST line and the file grammar
   // rejected the rest. It now splits a cell into top-level statements and gives
-  // each the treatment it needs. Nothing about the response SHAPE changed —
-  // `bindings[]` simply carries one entry per statement, in cell order, with
-  // the expressions still reporting under the empty name.
+  // each the treatment it needs — and the cell displays exactly ONE value, its
+  // final expression's, under the empty name. Declarations and mid-cell
+  // expressions run where they stand but display nothing.
   const mix = "notebook-eval-test-session-mixed";
   const mixedSrc = "let mp = 10\nlet mq = mp * 2\nmq + 1\nlet mr = mq + mp\nmr * 2";
   const mixed = await evalReq(mix, mixedSrc, undefined, EVAL_TIMEOUT_MS);
   check("mixed cell: kept (no BL1999 for the bare expressions)", mixed.kept === true, JSON.stringify(mixed).slice(0, 400));
   check(
-    "mixed cell: one binding per statement, in cell order",
+    "mixed cell: only the final expression displays",
     JSON.stringify((mixed.bindings || []).map((b) => [b.name, b.value])) ===
-      JSON.stringify([["mp", "10"], ["mq", "20"], ["", "21"], ["mr", "30"], ["", "60"]]),
+      JSON.stringify([["", "60"]]),
     JSON.stringify(mixed.bindings)
   );
   // The DECLARATIONS joined the session; the expressions stayed transient.
@@ -346,9 +349,8 @@ const EVAL_TIMEOUT_MS = 30000;
     JSON.stringify(mixedAgain).slice(0, 400)
   );
   check(
-    "mixed cell re-run: every value recomputed from the new declaration",
-    JSON.stringify((mixedAgain.bindings || []).map((b) => b.value)) ===
-      JSON.stringify(["100", "200", "201", "300", "600"]),
+    "mixed cell re-run: the final value recomputed from the new declaration",
+    JSON.stringify((mixedAgain.bindings || []).map((b) => b.value)) === JSON.stringify(["600"]),
     JSON.stringify(mixedAgain.bindings)
   );
   // And a later cell rebinding ONE name of a mixed cell must not take the
