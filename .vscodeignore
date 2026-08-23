@@ -9,5 +9,8 @@ scripts/**
 # across ~74 files. Untracked, so it is invisible to `git status --porcelain`
 # checks but very much visible to vsce, which packages the working tree.
 generated_cpp_tests/**
+# Agent session state, including git worktrees that each hold a full checkout
+# (~90 MB). Untracked, so `git status --porcelain` never shows it.
+.claude/**
 .ignore
 *.vsix
