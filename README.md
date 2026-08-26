@@ -100,6 +100,32 @@ npm test
 
 runs the hermetic suite (syntax gates, grammar/table/surface consistency, provider tests against a vscode mock). Live suites need a built compiler (`BLADE_EXE` env var or the standard build locations): `npm run test:serve` (ide-serve protocol), `npm run test:repl` (REPL protocol), `npm run test:nav` (navigation providers against real compiler payloads), `npm run test:nb` (notebook eval session semantics).
 
+### Verifying the renderer live
+
+`scripts/renderer-test.js` drives `renderer/plotly-renderer.js` against a stub DOM: the contribution manifest, both mime paths, both plotly load paths (classic `<script>` and the `import()` fallback), the repaint/dispose lifecycle, and every visible fallback. What it cannot see is the real webview — whether VS Code picks this renderer for the cell at all, and whether the notebook output webview will actually serve `media/plotly.min.js`. That needs one two-minute session:
+
+1. **Launch the extension.** F5 (Extension Development Host) from this repo, or install the `.vsix` and reload the window. Open the **Blade** repo as the workspace folder so notebook data paths (`examples/data/aspirin.zarr`) resolve.
+2. **A figure in a cell.** `Blade: New Notebook`, one cell:
+
+   ```blade
+   import plot
+   let t = [0.0, 1.0, 2.0, 3.0]
+   let v = [0.0, 2.5, 6.0, 9.5]
+   let p = plot.line(t, v, "renderer smoke test": title)
+   ```
+
+   Run it. Expect an **interactive chart drawn in the cell** — hover gives a tooltip, drag zooms — not the one-line `[application/vnd.plotly.v1+json — renderer smoke test]` text summary.
+3. **Live streams.** Open `examples/aspirin_moment_jet.bladenb`, run the first code cell (imports + `z.load`), then the three training cells. Expect the Blade Plots panel to open on the first chunk and each of the three channels (`jet_pos`, `jet_k2`, `jet_k24`) to **extend its trace while its arm trains**, with the executing cell's own chart repainting alongside at ~2 Hz. Each cell's stream output is replaced by that arm's persistent `plot.line` figure when the run ends.
+4. **Check the console.** *Developer: Toggle Developer Tools* with the notebook focused — the output webview logs there. Expect nothing from the renderer.
+
+Three symptoms, and what each implicates:
+
+| Symptom | Implicates |
+|---|---|
+| The cell shows the `[application/vnd.plotly.v1+json — …]` **text summary** | The renderer was never picked. `contributes.notebookRenderers` did not load (check the Extension Host log), or `renderer/` did not make it into the `.vsix`. Both mime types must be listed — a stream that summarises while finished figures draw means only one of the two is contributed. |
+| The cell shows **pretty-printed JSON or a `could not render` block**, with a console error naming the plotly URL | The renderer ran; the plotly asset was not served. If the URL ends in `/media/plotly.min.js` and 404s, the webview's resource root does not reach `media/`. If it is not a `vscode-resource`/`vscode-cdn` URL at all (a `blob:` prefix, say), then `import.meta.url` is not the served module URL and the `../media/…` base is wrong — a different fix. Either way the failure is remembered for the life of the webview, so reload the window before retesting. |
+| The figure draws, but the stream **never animates** (the chart appears only when the cell finishes) | Not the renderer — the sink/event path. Chunks are not reaching the display bus: confirm the cell ran through `ide serve` rather than the g++ fallback, and check whether the Blade Plots panel is static too. If the panel animates and the cell does not, the per-execution `display.subscribe` in `src/notebook.js` is the suspect. |
+
 ### Refreshing the vendored protocol package
 
 After a change lands in `../Blade/protocol` (new compiler surface, a client bugfix), re-vendor it from a sibling `Blade` checkout:
