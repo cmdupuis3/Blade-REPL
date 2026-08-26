@@ -238,6 +238,14 @@ const identifiers = {
     ],
     ret: "GroupKeys<Idx2, Idx1>  (group axis Idx2, source axis Idx1)",
   },
+  group_bucket: {
+    category: "core",
+    doc: "The grouping's row -> bucket map, exposed as ordinary data over the source axis; rows the grouping dropped read -1. Takes a group_keys binding by name (an inline group_keys(...) argument rejects — bind the keys first).",
+    params: [
+      { name: "grouping", type: "GroupKeys<Idx2, Idx1>", doc: "grouping structure, passed by binding name" },
+    ],
+    ret: "Idx1 -> Int64  (bucket index per source row, -1 for dropped rows)",
+  },
   transpose: {
     category: "core",
     doc: "Hard-transposes two dimensions (a physical data move between plain axes). Within one symmetry group it resolves storage-preservingly instead: symmetric — identity, antisymmetric — negation, hermitian — conjugation.",
