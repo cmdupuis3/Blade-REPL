@@ -1,0 +1,5 @@
+{
+  "private": true,
+  "type": "module",
+  "description": "Marks renderer/*.js as ES modules for NODE's loader (node --check and the hermetic renderer test), without flipping the root package — src/ stays CommonJS, which is what VS Code's extension host loads. VS Code itself loads a notebook renderer entrypoint as an ES module regardless of this file; it never reads it."
+}

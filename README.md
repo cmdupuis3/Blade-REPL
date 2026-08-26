@@ -28,6 +28,8 @@ A VS Code extension for the [Blade language](https://github.com/cmdupuis3/Blade)
 | Show generated C++ | side-by-side editor | command palette |
 | Start / Reset REPL session | REPL terminal | command palette |
 | Plots (contours, images) from REPL/notebook output | "Blade Plots" panel beside the editor | automatic when evaluated code emits a display frame; `Blade: Plot Demo` renders a sample |
+| Charts drawn in the notebook cell (not a text summary) | cell output, via the bundled plotly notebook renderer | automatic for any plotly or plot-stream output |
+| Live plot streaming (`plot.stream`) | cell output animates while the cell runs; panel chart extends in place | automatic while a long cell emits stream frames |
 
 All navigation features land on VS Code's standard keys — no custom chords to learn beyond the three REPL/check bindings.
 
@@ -65,6 +67,10 @@ let _ = plot.line(t, v, "drift": title, d.unit_label(t): xlabel, d.unit_label(v)
 
 `plot` provides `contourf`, `contour`, `heatmap`, `line`, and `scatter`; option slots are `levels`, `cmap`, `title`, `xlabel`, `ylabel`, and `backend`, plus `maxdim` on the three grid factories — each with a default, so `plot.contourf(x, y, z)` alone is valid.
 
+**Live streams.** `plot.stream(name, x, y, e: epoch, …)` ships a *chunk* of a named series instead of a finished figure — mime `application/vnd.blade.plotstream.v1+json`, `meta.id` = the channel name. A cell that runs for minutes (a training loop) can therefore draw as it goes: during an `ide serve` eval each chunk arrives as an out-of-band display event, the extension merges it into that channel's accumulated series, and both surfaces repaint — the executing cell's own output at ~2 Hz, and the Blade Plots panel through one coalesced update per 100 ms, extending the live trace rather than re-plotting it. `epoch` marks show up as dotted vertical rules with `e<n>` labels, so one x-axis can span a whole run; past ~20 000 points the *drawn* trace is strided (the accumulated data is kept whole). Stream output is deliberately transient — it animates while the cell runs and is replaced by the cell's real outputs when the run ends, so the chart that **persists** is the ordinary figure the program emits at the end (`plot.line(…)`). Replays are handled by the merge itself: a Blade session re-runs every accumulated snippet, so an earlier cell's stream re-arrives under the same stable id on every later eval, and a chunk that restarts a channel from its first x (or an epoch that goes backwards) resets that channel's accumulator instead of appending a second copy of the run.
+
+**In-cell rendering.** The extension contributes a notebook renderer (`renderer/plotly-renderer.js`) for both the plotly mime and the stream mime, so charts draw inside the cell instead of degrading to the `[application/vnd.plotly.v1+json — title]` text summary. It loads the same bundled `media/plotly.min.js` the panel uses, addressed relative to the renderer module itself — no CDN, no second copy of plotly, and nothing that the notebook webview's offline CSP does not already allow.
+
 Two slots exist for the backends. `maxdim` (default 512) caps how many samples per axis a grid serializes: a raw 2000² grid would be ~74 MB of figure JSON, past the frame size limit and far past display resolution, so bigger grids are resampled before they go on the wire. `backend` asks the panel to *show* this plot with a particular backend — the frame is still plotly JSON either way, so a viewer without GR simply ignores the request, and your own toggling always wins.
 
 ## Settings
@@ -77,6 +83,7 @@ Two slots exist for the backends. `maxdim` (default 512) caps how many samples p
 | `blade.fullCheckIdleMs` | `2000` | Idle time before a full-tier check |
 | `blade.checkOnSave` / `blade.checkOnOpen` | `true` | Full check on save / open |
 | `blade.runTimeoutSeconds` | `180` | Timeout for `Blade run` (first runs invoke g++) |
+| `blade.notebookEvalTimeoutSeconds` | `1800` | Timeout per notebook cell eval (cells can run for minutes, e.g. training) |
 | `blade.inlineReplResults` | `true` | Inline green/red REPL results at the evaluated line |
 | `blade.signatureLens.functions` | `true` | Abstract signature lens above functions |
 | `blade.signatureLens.arrays` | `true` | Index-arrow lens above array bindings (`Idx<N> -> Float64`) |

@@ -17,6 +17,13 @@
 //     show, so the navigation and merge rules are plain functions
 //     scripts/plots-test.js can drive without a browser.
 //
+// Live plot streams (plan-equivariant-nn-notebooks.md §4) ride the same hub:
+// a `application/vnd.blade.plotstream.v1+json` frame is ONE CHUNK of a named
+// channel's series, merged extension-side into an accumulator on the channel's
+// history entry (`entry.stream`) and handed to the webview as an ordinary
+// plotly figure. The webview extends the live trace instead of re-plotting it,
+// and bursts are coalesced into one postMessage per ~100 ms.
+//
 // Backends: plotly renders in-webview; GR renders via one round-trip to the
 // warm serve process (deps.renderPlot, wired by extension.js) and lands as an
 // image/png frame carrying the same meta.id, so it attaches to the existing
@@ -83,6 +90,281 @@ function titleFor(frame, seq) {
   return `Plot ${seq}`;
 }
 
+// --- Live plot streams (pure) --------------------------------------------------
+//
+// Wire contract (frozen — the compiler side implements the same text, see
+// ../Blade/docs/plans/plan-equivariant-nn-notebooks.md §4):
+//
+//   mime  application/vnd.blade.plotstream.v1+json   (inline JSON, §1's +json rule)
+//   data  {channel, epoch, x[], y[], title, xlabel, ylabel}   epoch -1 = unmarked
+//   meta  {id: "<channel>", stream: true, backend: "plotly"}
+//
+// `meta.id` IS the channel name and is stable across calls AND session
+// replays, so it is the merge key on both sides. One frame is a CHUNK, not a
+// figure: the accumulated series lives here (newStreamAcc/mergeStreamFrame)
+// and the figure is derived from it on demand (streamFigure).
+
+const STREAM_MIME = "application/vnd.blade.plotstream.v1+json";
+
+/** Drawn-point budget per trace. Past this the FIGURE is built with a stride
+ *  so plotly never holds more than ~this many points; the accumulator keeps
+ *  every raw sample (decimation is a drawing decision, not a data one). */
+const STREAM_DRAW_LIMIT = 20000;
+
+/** Epoch markers drawn at once. A 500-epoch run would otherwise put 500
+ *  shapes AND 500 annotations in one layout; markers are strided the same way
+ *  points are. */
+const STREAM_MAX_MARKS = 60;
+
+/** Log one line per this many frames of a channel (plus always the first).
+ *  A per-batch training stream emits thousands. */
+const STREAM_LOG_EVERY = 25;
+
+function isStreamFrame(frame) {
+  return !!frame && frame.mime === STREAM_MIME;
+}
+
+/** A channel's accumulated series. `runs` counts run boundaries (see
+ *  mergeStreamFrame) — it is part of the webview's resync key, so a replay
+ *  can never be mistaken for a continuation of what is already drawn. */
+function newStreamAcc() {
+  return {
+    channel: "",
+    title: "",
+    xlabel: "",
+    ylabel: "",
+    x: [],
+    y: [],
+    boundaries: [], // [{x, epoch}] — where each epoch started, in x coordinates
+    lastEpoch: null,
+    lastChunk: null, // signature of the last merged chunk (idempotency, below)
+    runs: 0,
+    frames: 0,
+  };
+}
+
+/** Cheap identity of one chunk: enough to recognize the SAME chunk delivered
+ *  twice without hashing the whole payload. */
+function chunkSignature(x, y, epoch) {
+  return [x.length, x[0], x[x.length - 1], y[0], y[y.length - 1], epoch].join("|");
+}
+
+/**
+ * Merge one stream frame's `data` into `acc`.
+ *
+ * Three rules, in order:
+ *
+ *  - **Idempotent.** A chunk identical to the one merged immediately before is
+ *    dropped. In the serve lane the compiler skips buffering sink-forwarded
+ *    stream frames, so a frame is not supposed to arrive twice at all; this
+ *    makes a double delivery a no-op instead of a doubled series. (It only
+ *    catches an ADJACENT repeat — the panel does not keep a hash of every
+ *    chunk ever seen.)
+ *  - **Run boundary resets.** A Blade session re-runs every accumulated
+ *    snippet, so an earlier cell's `plot.stream` calls are re-emitted verbatim
+ *    under the same stable `meta.id` on every later eval. A chunk that starts
+ *    at or before the accumulated series' FIRST x, or whose epoch went
+ *    backwards, is that replay starting over: the accumulator is emptied and
+ *    rebuilt, so a replayed run redraws identically instead of appending a
+ *    second copy of itself. (Nothing out-of-band announces a run boundary —
+ *    see the report/README: the signal is in the data.)
+ *  - **Append.** x/y are concatenated; a ragged chunk is truncated to the
+ *    shorter of the two rather than padded.
+ *
+ * @returns {{appended: number, reset: boolean, skipped: boolean}}
+ */
+function mergeStreamFrame(acc, data) {
+  const d = data && typeof data === "object" && !Array.isArray(data) ? data : {};
+  const x = Array.isArray(d.x) ? d.x : [];
+  const y = Array.isArray(d.y) ? d.y : [];
+  const n = Math.min(x.length, y.length);
+  const epoch = typeof d.epoch === "number" && isFinite(d.epoch) ? d.epoch : -1;
+
+  const sig = n > 0 ? chunkSignature(x, y, epoch) : null;
+  if (sig !== null && acc.lastChunk === sig) return { appended: 0, reset: false, skipped: true };
+
+  // Label fields are carried whenever provided — they may only appear on the
+  // first chunk, or change mid-run; last one wins.
+  if (typeof d.channel === "string" && d.channel) acc.channel = d.channel;
+  if (typeof d.title === "string" && d.title) acc.title = d.title;
+  if (typeof d.xlabel === "string" && d.xlabel) acc.xlabel = d.xlabel;
+  if (typeof d.ylabel === "string" && d.ylabel) acc.ylabel = d.ylabel;
+
+  let reset = false;
+  const restarted =
+    (n > 0 && acc.x.length > 0 && x[0] <= acc.x[0]) ||
+    (epoch >= 0 && acc.lastEpoch !== null && epoch < acc.lastEpoch);
+  if (restarted) {
+    acc.x = [];
+    acc.y = [];
+    acc.boundaries = [];
+    acc.lastEpoch = null;
+    acc.runs++;
+    reset = true;
+  }
+
+  if (epoch >= 0 && epoch !== acc.lastEpoch) {
+    // The boundary is recorded at the x position the new epoch STARTS at, so
+    // the marker lands on the first sample of that epoch (the very first
+    // marked chunk therefore marks the start of the plot — that is the epoch
+    // the program asked to have marked, not an artifact).
+    acc.boundaries.push({ x: n > 0 ? x[0] : acc.x.length, epoch });
+    acc.lastEpoch = epoch;
+  }
+
+  for (let i = 0; i < n; i++) {
+    acc.x.push(x[i]);
+    acc.y.push(y[i]);
+  }
+  if (sig !== null) acc.lastChunk = sig;
+  acc.frames++;
+  return { appended: n, reset, skipped: false };
+}
+
+/** Draw every `stride`-th sample. Stride 1 is a plain copy. */
+function strideSample(arr, stride) {
+  if (stride <= 1) return arr.slice();
+  const out = [];
+  for (let i = 0; i < arr.length; i += stride) out.push(arr[i]);
+  return out;
+}
+
+/** The stride the DRAWN trace uses for `n` accumulated points. Recomputed on
+ *  every post: it only changes when n crosses a multiple of the limit, which
+ *  is exactly when the webview needs a full redraw rather than an extend. */
+function streamStride(n) {
+  return Math.max(1, Math.ceil(n / STREAM_DRAW_LIMIT));
+}
+
+/** Epoch markers as plotly layout pieces: a paper-height dotted vertical line
+ *  plus a small label. Neutral grey so both themes read it. */
+function streamMarks(acc) {
+  const b = acc.boundaries;
+  const stride = Math.max(1, Math.ceil(b.length / STREAM_MAX_MARKS));
+  const marks = strideSample(b, stride);
+  return {
+    shapes: marks.map((m) => ({
+      type: "line",
+      xref: "x",
+      yref: "paper",
+      x0: m.x,
+      x1: m.x,
+      y0: 0,
+      y1: 1,
+      line: { color: "rgba(128,128,128,0.55)", width: 1, dash: "dot" },
+      layer: "below",
+    })),
+    annotations: marks.map((m) => ({
+      x: m.x,
+      xref: "x",
+      y: 1,
+      yref: "paper",
+      yanchor: "bottom",
+      text: `e${m.epoch}`,
+      showarrow: false,
+      font: { size: 10, color: "rgba(128,128,128,0.9)" },
+    })),
+  };
+}
+
+/** The plotly figure for an accumulated stream. `uirevision` is the channel,
+ *  so a user's zoom/pan survives every incremental update. */
+function streamFigure(acc) {
+  const stride = streamStride(acc.x.length);
+  const marks = streamMarks(acc);
+  const layout = {
+    xaxis: { title: { text: acc.xlabel || "" } },
+    yaxis: { title: { text: acc.ylabel || "" } },
+    shapes: marks.shapes,
+    annotations: marks.annotations,
+    uirevision: acc.channel || "stream",
+    showlegend: false,
+  };
+  if (acc.title) layout.title = { text: acc.title };
+  return {
+    data: [
+      {
+        type: "scatter",
+        mode: "lines",
+        name: acc.channel || "series",
+        x: strideSample(acc.x, stride),
+        y: strideSample(acc.y, stride),
+      },
+    ],
+    layout,
+  };
+}
+
+/** The plotly frame a stream entry renders as, rebuilt only when the
+ *  accumulator actually moved (`{n, runs}` is the whole cache key — a reset
+ *  bumps `runs`, so "same length, different run" is not a cache hit). */
+function streamRenderFrame(entry) {
+  const acc = entry.stream;
+  const built = entry._streamBuilt;
+  if (built && built.n === acc.x.length && built.runs === acc.runs && entry.renders.plotly) {
+    return entry.renders.plotly;
+  }
+  const frame = {
+    v: display.FRAME_VERSION,
+    mime: display.PLOTLY_MIME,
+    encoding: "json",
+    data: streamFigure(acc),
+    meta: { id: entry.id, backend: "plotly", stream: true },
+  };
+  entry.renders.plotly = frame;
+  entry._streamBuilt = { n: acc.x.length, runs: acc.runs };
+  return frame;
+}
+
+/** A stream entry's label: the program's title, else the channel name, else
+ *  the usual `Plot N`. Recomputed per frame — a title may arrive late. */
+function streamTitle(acc, seq) {
+  return acc.title || acc.channel || `Plot ${seq}`;
+}
+
+/** Merge one stream frame into `hist` by `meta.id` (the channel name), or
+ *  open the channel's entry on its first frame. Never appends a second entry
+ *  for a channel, and never builds a figure — see streamRenderFrame. */
+function appendStreamFrame(hist, frame) {
+  const meta = frame.meta || {};
+  const data = frame.data && typeof frame.data === "object" ? frame.data : {};
+  const id =
+    (typeof meta.id === "string" && meta.id) ||
+    (typeof data.channel === "string" && data.channel) ||
+    "stream";
+
+  let idx = hist.entries.findIndex((e) => e.id === id);
+  let merged = true;
+  let entry;
+  if (idx < 0) {
+    const seq = ++hist.seq;
+    entry = {
+      id,
+      seq,
+      title: `Plot ${seq}`,
+      receivedAt: Date.now(),
+      primary: "plotly",
+      prefer: null,
+      renders: {},
+      spec: null,
+      stream: newStreamAcc(),
+    };
+    hist.entries.push(entry);
+    idx = hist.entries.length - 1;
+    merged = false;
+  } else {
+    entry = hist.entries[idx];
+    // An id shared with a non-stream plot: the stream takes over that entry
+    // rather than opening a rival one under the same identity.
+    if (!entry.stream) entry.stream = newStreamAcc();
+  }
+
+  const res = mergeStreamFrame(entry.stream, data);
+  entry.title = streamTitle(entry.stream, entry.seq);
+  hist.cursor = idx;
+  return { entry, index: idx, merged, stream: res };
+}
+
 /**
  * Append `frame` to `hist`, or merge it into the entry it re-renders.
  *
@@ -91,9 +373,13 @@ function titleFor(frame, seq) {
  * lands in that entry's `renders` under its backend and the history does not
  * grow. Everything else appends and becomes the current entry.
  *
+ * A STREAM frame is merged by the same key but on different terms — it is a
+ * chunk of a series, not a render of a figure — see appendStreamFrame.
+ *
  * @returns {{entry: object, index: number, merged: boolean}}
  */
 function appendFrame(hist, frame) {
+  if (isStreamFrame(frame)) return appendStreamFrame(hist, frame);
   const backend = display.backendFor(frame);
   const meta = frame.meta || {};
   const id = typeof meta.id === "string" && meta.id ? meta.id : null;
@@ -154,6 +440,10 @@ function currentEntry(hist) {
  *  right answer). */
 function renderFor(entry, backend) {
   if (!entry) return undefined;
+  // A stream entry's plotly render is DERIVED from the accumulator, so it is
+  // built (and cached) here rather than stored on arrival — the alternative
+  // is rebuilding the whole figure on every chunk of a burst.
+  if (entry.stream && (backend === "plotly" || !entry.renders[backend])) return streamRenderFrame(entry);
   return entry.renders[backend] || entry.renders[entry.primary] || Object.values(entry.renders)[0];
 }
 
@@ -164,6 +454,7 @@ function renderFor(entry, backend) {
 function specFor(entry) {
   if (!entry) return null;
   if (entry.spec !== null && entry.spec !== undefined) return entry.spec;
+  if (entry.stream) return streamRenderFrame(entry).data;
   const p = entry.renders.plotly;
   return p && p.mime === display.PLOTLY_MIME && p.encoding === "json" ? p.data : null;
 }
@@ -181,6 +472,18 @@ let userPinnedBackend = false;
 let panel;
 let webviewReady = false;
 let pendingShow = false; // a show() that landed before the webview said "ready"
+
+/** What the webview currently holds for a live stream:
+ *  `{id, count, stride, runs}` — the number of accumulated points it has been
+ *  told about, the stride those were drawn at, and which run they belong to.
+ *  A faithful mirror (the webview only ever does what it is told, and messages
+ *  are ordered), so no round-trip is needed to decide extend-vs-redraw.
+ *  Null whenever the webview is not holding a stream. */
+let liveStream = null;
+/** Trailing coalesce window for stream posts. A burst of chunks collapses
+ *  into ONE postMessage per window (≤10 fps at the default). */
+let streamCoalesceMs = 100;
+let streamTimer = null;
 
 function log(line) {
   if (deps && deps.output) deps.output.appendLine(`[plots] ${line}`);
@@ -335,6 +638,10 @@ function webviewScript() {
     "  var elStage = document.getElementById('stage');",
     "  var current = null;   // {frame, title, index, total}",
     "  var plotted = false;  // is elPlot holding a live plotly graph?",
+    // Which live stream channel elPlot is currently holding, if any. Set by
+    // every 'show'; an incoming 'streamAppend' for a DIFFERENT id is ignored
+    // (the host re-syncs with a full 'show' — it tracks this same value).
+    "  var streamId = null;",
     "",
     "  function setNote(text) {",
     "    elNote.hidden = !text;",
@@ -387,6 +694,35 @@ function webviewScript() {
     "    showOnly(elPlot);",
     "    var call = plotted ? Plotly.react : Plotly.newPlot;",
     "    return call(elPlot, traces, layout, config).then(function () { plotted = true; });",
+    "  }",
+    "",
+    // Incremental append for a live stream: extendTraces pushes the new
+    // points onto trace 0 in place (no re-layout, no re-parse of the whole
+    // series), and one relayout refreshes the epoch markers. The host only
+    // ever sends points at the stride the current figure was drawn with, so
+    // the trace stays aligned with what a full redraw would produce.
+    "  function extendStream(msg) {",
+    "    if (!plotted || elPlot.hidden || streamId === null || msg.id !== streamId) return;",
+    "    try {",
+    "      if (msg.x && msg.x.length) {",
+    "        Plotly.extendTraces(elPlot, { x: [msg.x], y: [msg.y] }, [0]);",
+    // Keep the retained frame in step with the DOM: a theme switch re-renders
+    // from current.frame, which would otherwise snap back to the last full
+    // show and drop everything appended since.
+    "        var tr = current && current.frame && current.frame.data && current.frame.data.data && current.frame.data.data[0];",
+    "        if (tr && tr.x && tr.x.push) {",
+    "          for (var i = 0; i < msg.x.length; i++) { tr.x.push(msg.x[i]); tr.y.push(msg.y[i]); }",
+    "        }",
+    "      }",
+    "      var lay = { shapes: msg.shapes || [], annotations: msg.annotations || [] };",
+    "      Plotly.relayout(elPlot, lay);",
+    "      if (current && current.frame && current.frame.data && current.frame.data.layout) {",
+    "        current.frame.data.layout.shapes = lay.shapes;",
+    "        current.frame.data.layout.annotations = lay.annotations;",
+    "      }",
+    "    } catch (e) {",
+    "      fail('could not extend this plot: ' + (e && e.message));",
+    "    }",
     "  }",
     "",
     "  function renderImage(frame) {",
@@ -468,6 +804,7 @@ function webviewScript() {
     "    var msg = ev.data || {};",
     "    if (msg.type === 'show') {",
     "      current = { frame: msg.frame, title: msg.title, index: msg.index, total: msg.total };",
+    "      streamId = msg.streamId || null;",
     "      elPos.textContent = (msg.index + 1) + ' / ' + msg.total;",
     "      elTitle.textContent = msg.title || '';",
     "      elPrev.disabled = msg.index <= 0;",
@@ -481,6 +818,8 @@ function webviewScript() {
     "      });",
     "      setNote(null);",
     "      render();",
+    "    } else if (msg.type === 'streamAppend') {",
+    "      extendStream(msg);",
     "    } else if (msg.type === 'pending') {",
     "      setNote(msg.message || 'rendering\\u2026');",
     "    } else if (msg.type === 'note') {",
@@ -488,7 +827,7 @@ function webviewScript() {
     "    } else if (msg.type === 'exportData') {",
     "      download('data:' + msg.mime + ';base64,' + msg.data, msg.filename);",
     "    } else if (msg.type === 'empty') {",
-    "      current = null; elPos.textContent = '0 / 0'; elTitle.textContent = '';",
+    "      current = null; streamId = null; elPos.textContent = '0 / 0'; elTitle.textContent = '';",
     "      elPrev.disabled = true; elNext.disabled = true; elPng.disabled = true; elSvg.disabled = true; elPdf.disabled = true;",
     "      setNote(null);",
     "      showOnly(elEmpty);",
@@ -517,10 +856,18 @@ function postCurrent() {
   }
   const entry = currentEntry(history);
   if (!entry) {
+    liveStream = null;
     panel.webview.postMessage({ type: "empty" });
     return;
   }
   const frame = renderFor(entry, backend);
+  // A full `show` of a stream entry is also the resync point: after it, the
+  // webview holds exactly this many points at this stride, so the next post
+  // can be an extend.
+  liveStream =
+    entry.stream && frame && frame.mime === display.PLOTLY_MIME
+      ? { id: entry.id, count: entry.stream.x.length, stride: streamStride(entry.stream.x.length), runs: entry.stream.runs }
+      : null;
   panel.webview.postMessage({
     type: "show",
     frame,
@@ -528,6 +875,81 @@ function postCurrent() {
     index: history.cursor,
     total: history.entries.length,
     backend,
+    streamId: liveStream ? liveStream.id : null,
+  });
+}
+
+// --- Stream posting: trailing coalesce + incremental extend --------------------
+
+/** Schedule a post of whatever the current stream has accumulated. TRAILING:
+ *  the first chunk of a burst arms the timer and every chunk that lands inside
+ *  the window rides it, so N chunks in 100 ms cost exactly one postMessage. */
+function scheduleStreamPost() {
+  if (streamTimer) return;
+  if (streamCoalesceMs <= 0) {
+    flushStreamPost();
+    return;
+  }
+  streamTimer = setTimeout(() => {
+    streamTimer = null;
+    flushStreamPost();
+  }, streamCoalesceMs);
+}
+
+/** Post the pending stream update now (the timer's body; also the hook
+ *  hermetic tests drive instead of waiting on a real timer). */
+function flushStreamPost() {
+  if (streamTimer) {
+    clearTimeout(streamTimer);
+    streamTimer = null;
+  }
+  const entry = currentEntry(history);
+  if (!entry) return;
+  if (!entry.stream) {
+    postCurrent();
+    return;
+  }
+  if (!panel || !webviewReady) {
+    pendingShow = true;
+    return;
+  }
+  const acc = entry.stream;
+  const stride = streamStride(acc.x.length);
+  // Extend only when the webview is provably holding the SAME run of the SAME
+  // channel at the SAME stride, with something new to add. Everything else —
+  // a first frame, a replay's reset, crossing the decimation threshold, the
+  // user having navigated elsewhere — is a full redraw.
+  const canExtend =
+    liveStream &&
+    liveStream.id === entry.id &&
+    liveStream.runs === acc.runs &&
+    liveStream.stride === stride &&
+    liveStream.count < acc.x.length &&
+    backend === "plotly";
+  if (!canExtend) {
+    postCurrent();
+    return;
+  }
+  const x = [];
+  const y = [];
+  // Same phase as strideSample (indices 0, stride, 2·stride, …), so an
+  // extended trace stays aligned with the one a redraw would produce.
+  for (let i = liveStream.count; i < acc.x.length; i++) {
+    if (i % stride === 0) {
+      x.push(acc.x[i]);
+      y.push(acc.y[i]);
+    }
+  }
+  liveStream.count = acc.x.length;
+  const marks = streamMarks(acc);
+  panel.webview.postMessage({
+    type: "streamAppend",
+    id: entry.id,
+    x,
+    y,
+    shapes: marks.shapes,
+    annotations: marks.annotations,
+    points: acc.x.length,
   });
 }
 
@@ -697,9 +1119,44 @@ function ensurePanel() {
   return panel;
 }
 
+/** A stream channel's log line, throttled: the first frame, then every
+ *  STREAM_LOG_EVERY-th one, plus every run boundary and every dropped
+ *  duplicate (both rare and both worth seeing). A per-batch training stream
+ *  emits thousands of chunks — logging each one is its own performance bug. */
+function logStream(entry, res, origin) {
+  const acc = entry.stream;
+  if (res.stream.skipped) {
+    log(`stream ${entry.id}: duplicate chunk from ${origin} ignored (${acc.x.length} points)`);
+    return;
+  }
+  if (res.stream.reset) {
+    log(`stream ${entry.id}: run boundary from ${origin} — accumulator reset (run ${acc.runs})`);
+  }
+  if (acc.frames === 1 || acc.frames % STREAM_LOG_EVERY === 0) {
+    log(
+      `stream ${entry.id} from ${origin} — ${acc.frames} frame(s), ${acc.x.length} points, ` +
+        `epoch ${acc.lastEpoch === null ? "—" : acc.lastEpoch} (${history.entries.length} in history)`
+    );
+  }
+}
+
 /** display.subscribe() handler: every routed frame lands here. */
 function onFrame(frame, origin) {
   const res = appendFrame(history, frame);
+
+  // Stream chunks take the throttled path: the panel is revealed on a
+  // channel's FIRST frame only (a mid-edit chunk must not keep fronting the
+  // panel), logging is sampled, and the repost is coalesced. A stream frame
+  // is plotly-only by contract (`meta.backend: "plotly"`), so none of the GR
+  // preference handling below applies to it.
+  if (isStreamFrame(frame)) {
+    logStream(res.entry, res, origin);
+    ensurePanel();
+    if (!res.merged) panel.reveal(vscode.ViewColumn.Beside, true);
+    scheduleStreamPost();
+    return;
+  }
+
   log(`${res.merged ? "merged" : "added"} ${frame.mime} from ${origin} — ${res.entry.title} (${history.entries.length} in history)`);
   ensurePanel();
   panel.reveal(vscode.ViewColumn.Beside, true);
@@ -782,6 +1239,11 @@ function init(context, dependencies) {
 }
 
 function dispose() {
+  if (streamTimer) {
+    clearTimeout(streamTimer);
+    streamTimer = null;
+  }
+  liveStream = null;
   if (panel) {
     panel.dispose();
     panel = undefined;
@@ -794,7 +1256,19 @@ function dispose() {
   userPinnedBackend = false;
 }
 
-module.exports = { init, dispose };
+// The stream primitives are part of the module's REAL surface, not just its
+// test surface: src/notebook.js animates an executing cell from the same
+// accumulator/figure pair so the cell and the panel can never disagree about
+// what a channel's series is.
+module.exports = {
+  init,
+  dispose,
+  STREAM_MIME,
+  isStreamFrame,
+  newStreamAcc,
+  mergeStreamFrame,
+  streamFigure,
+};
 
 // Headless test surface (scripts/, not used by VS Code).
 module.exports._test = {
@@ -812,6 +1286,26 @@ module.exports._test = {
   demoFrame,
   commandPlotDemo,
   history,
+  // Streams.
+  STREAM_MIME,
+  STREAM_DRAW_LIMIT,
+  STREAM_MAX_MARKS,
+  isStreamFrame,
+  newStreamAcc,
+  mergeStreamFrame,
+  chunkSignature,
+  strideSample,
+  streamStride,
+  streamMarks,
+  streamFigure,
+  streamRenderFrame,
+  appendStreamFrame,
+  flushStreamPost,
+  setCoalesceMs: (ms) => {
+    streamCoalesceMs = ms;
+  },
+  coalesceMs: () => streamCoalesceMs,
+  liveStream: () => liveStream,
   setDeps: (d) => {
     deps = d;
   },

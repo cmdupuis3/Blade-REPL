@@ -12,6 +12,10 @@ const vscodeMock = require("./vscode-mock");
 const mock = vscodeMock.install();
 const nb = require("../src/notebook");
 const _test = nb._test;
+// Live plot streams: the frame bus a cell animates from, and the stream
+// primitives src/notebook.js shares with the Blade Plots panel.
+const display = require("@blade-lang/ide-protocol").display;
+const plots = require("../src/plots");
 // N3 (session-aware IDE features) fans a remapped check payload out through
 // extension.js's OWN applyCheckPayload/hoverProvider/codeLensProvider — the
 // same real providers scripts/provider-test.js drives with canned payloads —
@@ -330,6 +334,67 @@ function testInterruptMarksReplay() {
   check("interrupt with kept history sets needsReplay", state.needsReplay === true, state);
 
   _test.sessionStates.delete(key); // isolate from other tests reusing this uri
+}
+
+/** A transport-level eval rejection (timeout, spawn failure, process exit —
+ *  any rejection WITHOUT the protocolError tag) means the protocol client
+ *  tore the process down and the server-side session's bindings died with
+ *  it. executeCell's catch must mark the session for replay exactly like
+ *  interruptHandler does — otherwise the next cell runs against a fresh,
+ *  EMPTY session and earlier cells' names come back unbound. Guarded the
+ *  same way too: nothing kept yet = nothing to replay. */
+async function testTransportFailureMarksReplay() {
+  const fakeUri = mock.Uri.parse("file:///teardown.bladenb");
+  const notebookDoc = { uri: fakeUri };
+  const key = fakeUri.toString();
+  const state = _test.sessionStateFor(key);
+  const controller = mock.notebooks.createNotebookController("t-teardown", "blade-notebook", "Test");
+  const cell = { document: vscodeMock.makeDoc("let y = x + 1", "cell1.blade") };
+  // A canned dedicated client whose eval rejects the way the real one does
+  // after sendRequest's timeout teardown: a plain Error, no protocolError.
+  _test.clients.set(key, {
+    eval: () => Promise.reject(new Error("blade ide serve: request 2 timed out after 5ms")),
+    dispose() {},
+  });
+
+  await _test.executeCell(cell, notebookDoc, controller);
+  check("transport failure with nothing kept: needsReplay stays false", state.needsReplay === false, state);
+
+  state.keptSources.push("let x = 1");
+  await _test.executeCell(cell, notebookDoc, controller);
+  check("transport failure with kept history sets needsReplay", state.needsReplay === true, state);
+  check("transport failure does not latch unsupported", !_test.unsupported.has(key), Array.from(_test.unsupported));
+  const exec = controller._executions[1];
+  check(
+    "transport failure still fails the cell with an error output",
+    exec._success === false && exec._outputs.length === 1,
+    exec._outputs
+  );
+
+  _test.cleanupNotebook(notebookDoc);
+}
+
+/** The protocolError twin: a LIVE `{"error": ...}` answer (an old compiler
+ *  that doesn't know "eval") is NOT a teardown — the process, and whatever
+ *  session it holds, survived — so no replay must be scheduled; the notebook
+ *  latches unsupported instead (executeCell's existing old-compiler path). */
+async function testProtocolErrorDoesNotMarkReplay() {
+  const fakeUri = mock.Uri.parse("file:///oldcompiler.bladenb");
+  const notebookDoc = { uri: fakeUri };
+  const key = fakeUri.toString();
+  const state = _test.sessionStateFor(key);
+  state.keptSources.push("let x = 1"); // history exists — the discriminator must be protocolError, not keptSources
+  const err = new Error("unknown cmd 'eval'");
+  err.protocolError = true;
+  _test.clients.set(key, { eval: () => Promise.reject(err), dispose() {} });
+  const controller = mock.notebooks.createNotebookController("t-oldcompiler", "blade-notebook", "Test");
+  const cell = { document: vscodeMock.makeDoc("let y = 2", "cell2.blade") };
+
+  await _test.executeCell(cell, notebookDoc, controller);
+  check("protocol error does NOT set needsReplay (process alive, session intact)", state.needsReplay === false, state);
+  check("protocol error latches unsupported", _test.unsupported.has(key), Array.from(_test.unsupported));
+
+  _test.cleanupNotebook(notebookDoc);
 }
 
 async function testRestartClearsStateWithoutLiveClient() {
@@ -663,6 +728,152 @@ function testRemapCarriesParseFailureToEveryCell() {
   check("and it DOES clear the cell's bindings", !hoverHelper() || !hoverHelper().includes("Int64"), hoverHelper());
 }
 
+// --- Live plot streams in a cell (plan-equivariant-nn-notebooks.md §4) -------
+//
+// A long cell (a training loop) emits `plot.stream` chunks while it runs. They
+// reach the extension on the display bus — during an `ide serve` eval as
+// out-of-band `{"event":"display", …}` NDJSON lines, which the protocol
+// client publishes (@blade-lang/ide-protocol client.js: handleEvent →
+// display.publish). An executing cell subscribes for the duration of its own
+// eval and repaints from the accumulated series; the subscription dies in a
+// finally, and NOTHING a stream produced is ever a persistent cell output.
+
+function streamFrame(channel, data) {
+  return display.decodeFrame({
+    mime: plots.STREAM_MIME,
+    data: Object.assign({ channel, epoch: -1, x: [], y: [] }, data || {}),
+    meta: { id: channel, stream: true, backend: "plotly" },
+  }).frame;
+}
+
+function streamOutputsOf(exec) {
+  return exec._outputs.filter((o) => o.items.some((it) => it.mime === plots.STREAM_MIME));
+}
+
+function testStreamFramesNeverPersist() {
+  // A stream frame that DOES reach an eval response's display[] (the lanes
+  // with no sink; the serve lane is supposed to skip buffering these) must
+  // not become a cell output, and must not enter seenFrameIds — the id is
+  // stable per CHANNEL, so recording it would suppress every later frame of
+  // that channel for the rest of the session.
+  const seenFrameIds = new Set();
+  const outputs = _test.assembleOutputs(
+    {
+      kept: true,
+      exitCode: 0,
+      stdout: "",
+      stderr: "",
+      bindings: [],
+      diagnostics: [],
+      display: [
+        { mime: plots.STREAM_MIME, data: { channel: "loss", epoch: 0, x: [0], y: [1] }, meta: { id: "loss", stream: true } },
+        { mime: "application/vnd.plotly.v1+json", data: { data: [], layout: {} }, meta: { id: "S1", title: "final" } },
+      ],
+    },
+    seenFrameIds
+  );
+  check("stream frames are not persistent cell outputs", outputs.length === 1, outputs.length);
+  check("the persistent output is the ordinary figure frame", outputs[0].items[0].mime === "application/vnd.plotly.v1+json", outputs[0].items[0].mime);
+  check("a stream channel id never enters seenFrameIds", !seenFrameIds.has("loss") && seenFrameIds.has("S1"), Array.from(seenFrameIds));
+}
+
+async function testLiveStreamRepaintsAndUnsubscribes() {
+  const controller = mock.notebooks.createNotebookController("t-live", "blade-notebook", "Test");
+  const exec = controller.createNotebookCellExecution({ document: vscodeMock.makeDoc("train()", "cell0.blade") });
+  const live = _test.startLiveStream(exec);
+
+  display.publish(streamFrame("loss", { epoch: 0, x: [0, 1], y: [2, 1.8], title: "training loss", ylabel: "loss" }), "notebook");
+  display.publish(streamFrame("loss", { epoch: 1, x: [2, 3], y: [1.5, 1.2] }), "notebook");
+  // A non-stream frame belongs to the panel and to the cell's FINAL outputs —
+  // the live animator must ignore it entirely.
+  display.publish(display.decodeFrame({ mime: "application/vnd.plotly.v1+json", data: { data: [], layout: {} }, meta: { id: "S1" } }).frame, "notebook");
+
+  live.flush();
+  const shown = streamOutputsOf(exec);
+  check("live: one output per streaming channel", exec._outputs.length === 1 && shown.length === 1, exec._outputs.length);
+  const figure = jsonOf(shown[0].items[0]);
+  check("live: the cell shows the ACCUMULATED series, not the last chunk", figure.data[0].x.join(",") === "0,1,2,3", figure.data[0].x);
+  check("live: epoch boundaries are drawn", (figure.layout.shapes || []).length === 2, figure.layout.shapes);
+  check("live: figure keeps the program's labels", figure.layout.title.text === "training loss" && figure.layout.yaxis.title.text === "loss", figure.layout);
+  check("live: a text/plain summary rides along for hosts with no renderer", shown[0].items[1].mime === "text/plain", shown[0].items.map((i) => i.mime));
+  check("live: repainted once for the burst", live.repaints() === 1, live.repaints());
+
+  // A replayed run (same channel, starting over) rebuilds instead of doubling.
+  display.publish(streamFrame("loss", { epoch: 0, x: [0, 1], y: [2, 1.8] }), "notebook");
+  live.flush();
+  check("live: a replayed run resets the accumulator", jsonOf(streamOutputsOf(exec)[0].items[0]).data[0].x.join(",") === "0,1", jsonOf(streamOutputsOf(exec)[0].items[0]).data[0].x);
+
+  // Two channels, two outputs.
+  display.publish(streamFrame("accuracy", { epoch: 0, x: [0], y: [0.1] }), "notebook");
+  live.flush();
+  check("live: a second channel gets its own output", streamOutputsOf(exec).length === 2, exec._outputs.length);
+
+  // Disposed: the subscription is gone and a late chunk changes nothing.
+  live.dispose();
+  const repaintsAtDispose = live.repaints();
+  display.publish(streamFrame("loss", { epoch: 9, x: [99], y: [0] }), "notebook");
+  live.flush();
+  await new Promise((r) => setTimeout(r, 5));
+  check("live: dispose unsubscribes — a later chunk is not accumulated", live.channels.get("loss").x.indexOf(99) === -1, live.channels.get("loss").x.slice(-3));
+  check("live: and no repaint happens after dispose", live.repaints() === repaintsAtDispose, [repaintsAtDispose, live.repaints()]);
+}
+
+async function testExecuteCellAnimatesThenPersists() {
+  const fakeUri = mock.Uri.parse("file:///stream.bladenb");
+  const notebookDoc = { uri: fakeUri };
+  const key = fakeUri.toString();
+  const state = _test.sessionStateFor(key);
+  const controller = mock.notebooks.createNotebookController("t-stream", "blade-notebook", "Test");
+  const cell = { document: vscodeMock.makeDoc("train()", "cell0.blade") };
+  _test.setLiveStreamIntervalMs(0); // trailing timer fires on the next tick
+
+  let midRun = null;
+  _test.clients.set(key, {
+    eval: async () => {
+      // The compiler streams while the eval is still in flight.
+      const exec = controller._executions[controller._executions.length - 1];
+      display.publish(streamFrame("loss", { epoch: 0, x: [0, 1], y: [2, 1.8] }), "notebook");
+      display.publish(streamFrame("loss", { epoch: 1, x: [2, 3], y: [1.5, 1.2] }), "notebook");
+      await new Promise((r) => setTimeout(r, 5));
+      midRun = exec._outputs.slice();
+      // …and the run ends with the ordinary figure frame that PERSISTS.
+      return {
+        kept: true,
+        exitCode: 0,
+        stdout: "",
+        stderr: "",
+        bindings: [],
+        diagnostics: [],
+        display: [{ mime: "application/vnd.plotly.v1+json", data: { data: [], layout: {} }, meta: { id: "loss-final", title: "training loss" } }],
+      };
+    },
+    dispose() {},
+  });
+
+  await _test.executeCell(cell, notebookDoc, controller);
+  const exec = controller._executions[controller._executions.length - 1];
+
+  check("executeCell: the cell animated WHILE the eval was in flight", !!midRun && midRun.some((o) => o.items.some((it) => it.mime === plots.STREAM_MIME)), midRun && midRun.length);
+  check("executeCell: the mid-run figure held the accumulated series",
+    jsonOf(midRun.find((o) => o.items.some((it) => it.mime === plots.STREAM_MIME)).items[0]).data[0].x.join(",") === "0,1,2,3");
+  check("executeCell: the final outputs carry no stream output", streamOutputsOf(exec).length === 0, exec._outputs.map((o) => o.items[0].mime));
+  check("executeCell: the persistent chart is the ordinary figure frame",
+    exec._outputs.some((o) => o.items[0].mime === "application/vnd.plotly.v1+json"),
+    exec._outputs.map((o) => o.items[0].mime));
+  check("executeCell: the cell succeeded", exec._success === true, exec._success);
+  check("executeCell: no stream channel polluted seenFrameIds", !state.seenFrameIds.has("loss") && state.seenFrameIds.has("loss-final"), Array.from(state.seenFrameIds));
+
+  // The subscription died with the execution: a stray late chunk must not
+  // repaint a finished cell.
+  const after = exec._outputs.slice();
+  display.publish(streamFrame("loss", { epoch: 9, x: [99], y: [0] }), "notebook");
+  await new Promise((r) => setTimeout(r, 5));
+  check("executeCell: a chunk after the run does not touch the finished cell", exec._outputs.length === after.length && streamOutputsOf(exec).length === 0, exec._outputs.length);
+
+  _test.setLiveStreamIntervalMs(500);
+  _test.cleanupNotebook(notebookDoc);
+}
+
 // --- Run -----------------------------------------------------------------------
 
 (async () => {
@@ -689,8 +900,14 @@ function testRemapCarriesParseFailureToEveryCell() {
   testRemapCarriesParseFailureToEveryCell();
 
   testInterruptMarksReplay();
+  await testTransportFailureMarksReplay();
+  await testProtocolErrorDoesNotMarkReplay();
   await testRestartClearsStateWithoutLiveClient();
   await testRestartClearsSeenFrameIds();
+
+  testStreamFramesNeverPersist();
+  await testLiveStreamRepaintsAndUnsubscribes();
+  await testExecuteCellAnimatesThenPersists();
 
   if (failures) {
     console.error(`\n${failures} notebook check(s) failed.`);

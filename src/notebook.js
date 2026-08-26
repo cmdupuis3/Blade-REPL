@@ -28,6 +28,12 @@
 const vscode = require("vscode");
 const path = require("path");
 const serve = require("./serve");
+// Only the stream primitives (STREAM_MIME/isStreamFrame/newStreamAcc/
+// mergeStreamFrame/streamFigure) — the accumulator an executing cell animates
+// from is the SAME one the Blade Plots panel merges into, so the cell and the
+// panel can never disagree about what a channel's series is. Nothing in here
+// touches the panel itself.
+const plots = require("./plots");
 const display = require("@blade-lang/ide-protocol").display;
 
 const NOTEBOOK_TYPE = "blade-notebook";
@@ -209,9 +215,11 @@ function formatDiagnosticLine(d) {
  * One display frame (docs/display-frames.md) as a notebook output. The rich
  * item comes FIRST — VS Code renders the highest-priority mime it has a
  * renderer for — followed by a `text/plain` summary that shows instead when
- * nothing can render the rich one (no plotly notebook renderer is contributed
- * yet, so today a plotly frame reads as that summary in the cell while the
- * Blade Plots panel draws it for real).
+ * nothing can render the rich one. A plotly frame draws in the cell through
+ * this extension's own contributed renderer (package.json →
+ * contributes.notebookRenderers, renderer/plotly-renderer.js); the summary is
+ * the fallback for a host that has no renderer for the mime, and the Blade
+ * Plots panel draws the same frame beside the editor either way.
  */
 function displayOutput(frame) {
   const items = [];
@@ -257,6 +265,11 @@ function displayOutput(frame) {
  * unconditional route() call in applyEvalResult, whose merge-by-id absorbs
  * the replay. A frame with no `meta.id` can never be told apart from a fresh
  * one, so it is always attached.
+ *
+ * Live-stream frames are dropped here outright — never an output, never a
+ * seenFrameIds entry. They are a cell's TRANSIENT animation (startLiveStream)
+ * while the eval runs; what persists is the ordinary figure frame the program
+ * emits at the end.
  */
 function assembleOutputs(resp, seenFrameIds) {
   const outputs = [];
@@ -283,6 +296,17 @@ function assembleOutputs(resp, seenFrameIds) {
 
   const shown = display.framesFromEval(resp);
   for (const frame of shown.frames) {
+    // Live-stream chunks are NEVER persistent cell outputs and never enter
+    // seenFrameIds: a chunk is one slice of a running series, the cell shows
+    // it only while the cell is executing (startLiveStream below), and the
+    // chart that PERSISTS is the ordinary figure frame the program emits at
+    // the end (plot.line). Recording a channel id here would additionally
+    // poison the replay filter — the id is stable per channel, so the first
+    // chunk would suppress every later one for the rest of the session. The
+    // serve lane is not supposed to deliver these in `display` at all (the
+    // compiler skips buffering sink-forwarded stream frames), so this is a
+    // belt-and-braces filter for the lanes with no sink.
+    if (plots.isStreamFrame(frame)) continue;
     const id = frame.meta && frame.meta.id;
     if (id !== undefined && seenFrameIds) {
       if (seenFrameIds.has(id)) continue; // replayed — already shown by an earlier cell
@@ -340,6 +364,132 @@ function oldCompilerError() {
 
 function evalErrorOutputs(e) {
   return [new vscode.NotebookCellOutput([vscode.NotebookCellOutputItem.error(e)])];
+}
+
+// --- Live cell animation (plan-equivariant-nn-notebooks.md §4) ----------------
+//
+// A cell that runs for minutes (a training loop) emits `plot.stream` chunks as
+// it goes. During an `ide serve` eval those arrive as out-of-band
+// `{"event":"display", …}` NDJSON lines, which the protocol client publishes
+// on the display bus (@blade-lang/ide-protocol client.js handleEvent →
+// display.publish) — the same bus the Blade Plots panel subscribes to. An
+// executing cell subscribes for the duration of its own eval and repaints its
+// output from the accumulated series at ~2 Hz, so the chart animates in the
+// cell instead of appearing only when the run ends.
+//
+// Two invariants:
+//   - These outputs are TRANSIENT. applyEvalResult's replaceOutput (or the
+//     error path's) overwrites them with the cell's real outputs the moment
+//     the eval settles, and assembleOutputs drops stream frames outright, so
+//     nothing a stream produced is ever a persistent cell output and no
+//     channel id ever enters seenFrameIds.
+//   - The subscription is per EXECUTION and is disposed in a finally — a
+//     leaked one would keep repainting a finished cell (and would double-paint
+//     the next one).
+
+/** Repaint interval for an executing cell's live chart (~2 Hz). Mutable for
+ *  hermetic tests, which set it to 0 to make the trailing timer fire on the
+ *  next tick. */
+let liveStreamIntervalMs = 500;
+
+/** The accumulated channels of an in-flight execution as cell outputs: one
+ *  output per channel, the accumulated plotly figure under the STREAM mime
+ *  (renderer/plotly-renderer.js draws it), plus the usual text/plain summary
+ *  for hosts with no renderer. */
+function liveStreamOutputs(channels) {
+  const outputs = [];
+  for (const [id, acc] of channels) {
+    const label = acc.title || acc.channel || id;
+    outputs.push(
+      new vscode.NotebookCellOutput(
+        [
+          vscode.NotebookCellOutputItem.json(plots.streamFigure(acc), plots.STREAM_MIME),
+          vscode.NotebookCellOutputItem.text(`[${label} — ${acc.x.length} points, streaming…]`, "text/plain"),
+        ],
+        { blade: { id, stream: true } }
+      )
+    );
+  }
+  return outputs;
+}
+
+/**
+ * Subscribe to the display bus for the duration of one cell execution and
+ * animate `execution`'s output from whatever stream chunks arrive. Non-stream
+ * frames are ignored here entirely — they belong to the panel and to the
+ * cell's final outputs.
+ *
+ * Repaints are trailing-throttled: the first chunk of a burst arms the timer,
+ * every chunk inside the window rides it, and one replaceOutput happens per
+ * window. Returns a handle whose `dispose()` unsubscribes and cancels the
+ * pending repaint (call it in a finally); `flush()` repaints now and is what
+ * hermetic tests drive instead of waiting on a timer.
+ */
+function startLiveStream(execution) {
+  const channels = new Map(); // meta.id (channel name) -> accumulator
+  let timer = null;
+  let dirty = false;
+  let disposed = false;
+  let repaints = 0;
+
+  function repaint() {
+    timer = null;
+    if (disposed || !dirty) return;
+    dirty = false;
+    repaints++;
+    // Fire-and-forget, and never fatal: a repaint that lands after the
+    // execution ended (VS Code rejects — or throws on — output writes to a
+    // finished execution) must not surface as an unhandled rejection or an
+    // uncaught timer exception. The cell's real outputs are the ones that
+    // matter; a lost live frame is not worth a broken run.
+    try {
+      Promise.resolve(execution.replaceOutput(liveStreamOutputs(channels))).catch(() => {});
+    } catch (_) {
+      /* execution already finished */
+    }
+  }
+
+  function schedule() {
+    if (timer || disposed) return;
+    timer = setTimeout(repaint, liveStreamIntervalMs);
+  }
+
+  const sub = display.subscribe((frame) => {
+    if (disposed || !plots.isStreamFrame(frame)) return;
+    const meta = frame.meta || {};
+    const data = frame.data && typeof frame.data === "object" ? frame.data : {};
+    const id =
+      (typeof meta.id === "string" && meta.id) ||
+      (typeof data.channel === "string" && data.channel) ||
+      "stream";
+    let acc = channels.get(id);
+    if (!acc) channels.set(id, (acc = plots.newStreamAcc()));
+    // Same merge as the panel's: idempotent on a repeated chunk, and a
+    // session replay (the same channel restarting from its first x) resets
+    // the accumulator instead of appending a second copy of the run.
+    const res = plots.mergeStreamFrame(acc, data);
+    if (res.skipped) return;
+    dirty = true;
+    schedule();
+  });
+
+  return {
+    channels,
+    flush() {
+      if (timer) clearTimeout(timer);
+      dirty = true;
+      repaint();
+    },
+    repaints: () => repaints,
+    dispose() {
+      disposed = true;
+      if (timer) {
+        clearTimeout(timer);
+        timer = null;
+      }
+      sub.dispose();
+    },
+  };
 }
 
 /**
@@ -413,10 +563,15 @@ function notebookCwd(notebookDoc) {
   return notebookDoc.uri.scheme === "file" ? path.dirname(notebookDoc.uri.fsPath) : undefined;
 }
 
-/** eval's timeout mirrors "Blade: Run File"'s (blade.runTimeoutSeconds,
- *  default 180s) — a cell can fall back to g++ exactly like a full run can. */
+/** eval's timeout is notebook-specific (blade.notebookEvalTimeoutSeconds,
+ *  default 1800s), NOT "Blade: Run File"'s blade.runTimeoutSeconds (default
+ *  180s): a cell can legitimately run for minutes (a training loop, a g++
+ *  fallback compile), and on timeout the client doesn't just fail the one
+ *  request — it tears the whole process down (protocol client sendRequest),
+ *  killing the server-side session with it. Every other run/eval path keeps
+ *  runTimeoutSeconds. */
 function evalTimeoutMs() {
-  return vscode.workspace.getConfiguration("blade").get("runTimeoutSeconds", 180) * 1000;
+  return vscode.workspace.getConfiguration("blade").get("notebookEvalTimeoutSeconds", 1800) * 1000;
 }
 
 /** Replay `state.keptSources` through `client` in order, discarding their
@@ -463,13 +618,34 @@ async function executeCell(cell, notebookDoc, controller) {
 
   const source = cell.document.getText();
   let resp;
+  // Animate this cell from the stream chunks its own eval emits (see
+  // startLiveStream). Disposed in the finally below — including on the error
+  // path, which returns from inside the try.
+  const live = startLiveStream(execution);
   try {
     resp = await client.eval(key, source, cwd, evalTimeoutMs());
   } catch (e) {
-    if (e && e.protocolError) unsupported.add(key);
+    if (e && e.protocolError) {
+      // The process answered LIVE with "I don't understand this request" —
+      // an old compiler. The process (and whatever session it holds) is
+      // fine; retrying eval is pointless, so latch unsupported instead.
+      unsupported.add(key);
+    } else if (state.keptSources.length > 0) {
+      // Every other rejection is a transport failure (timeout, spawn
+      // failure, process exit — see the protocol client's sendRequest/
+      // teardown): the client killed the process, and the server-side
+      // session's accumulated bindings died with it. Same recovery as
+      // interruptHandler: mark for replay so the next execution rebuilds
+      // the session from keptSources before running its own cell. A cell's
+      // own compile error can never land here — a rejected snippet RESOLVES
+      // with kept:false; only protocol-level failures reject.
+      state.needsReplay = true;
+    }
     await execution.replaceOutput(evalErrorOutputs(e && e.protocolError ? oldCompilerError() : e));
     execution.end(false, Date.now());
     return;
+  } finally {
+    live.dispose();
   }
 
   await applyEvalResult(execution, resp, source, state);
@@ -919,6 +1095,13 @@ module.exports._test = {
   displayOutput,
   assembleOutputs,
   applyEvalResult,
+  // Live cell animation.
+  startLiveStream,
+  liveStreamOutputs,
+  setLiveStreamIntervalMs: (ms) => {
+    liveStreamIntervalMs = ms;
+  },
+  liveStreamIntervalMs: () => liveStreamIntervalMs,
   executeCell,
   executeHandler,
   interruptHandler,

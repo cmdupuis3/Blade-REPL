@@ -8,6 +8,10 @@
 
 "use strict";
 
+const fs = require("fs");
+const path = require("path");
+const { spawnSync } = require("child_process");
+const { pathToFileURL } = require("url");
 const vscodeMock = require("./vscode-mock");
 const mock = vscodeMock.install();
 const display = require("@blade-lang/ide-protocol").display;
@@ -45,6 +49,24 @@ function plotlyFrame(extra) {
 
 function pngFrame(extra) {
   return Object.assign({ mime: display.PNG_MIME, data: PNG_B64 }, extra || {});
+}
+
+/** One chunk of a live plot stream, exactly as the frozen wire contract spells
+ *  it (plan-equivariant-nn-notebooks.md §4): `meta.id` IS the channel name and
+ *  is stable across calls AND session replays. */
+function streamFrame(channel, data, extraMeta) {
+  return {
+    mime: _p.STREAM_MIME,
+    data: Object.assign({ channel, epoch: -1, x: [], y: [] }, data || {}),
+    meta: Object.assign({ id: channel, stream: true, backend: "plotly" }, extraMeta || {}),
+  };
+}
+
+/** Push a frame through the REAL parse path (sentinel line -> decode ->
+ *  validate -> route), so a stream frame is exercised as a wire payload rather
+ *  than as a hand-built object. */
+function ingest(frame, origin) {
+  display.ingestReplText(display.encodeReplLine(frame), origin || "notebook");
 }
 
 // --- 1. Frame parsing --------------------------------------------------------
@@ -693,6 +715,320 @@ function testReplayedFrameStillRoutesToPanel() {
   });
 }
 
+// --- 7. Live plot streams (plan-equivariant-nn-notebooks.md §4) --------------
+//
+// A stream frame is ONE CHUNK of a named channel's series, not a figure. The
+// panel merges chunks by `meta.id` into an accumulator on that channel's
+// history entry and derives the plotly figure from it; the webview extends the
+// live trace instead of re-plotting it, and a burst of chunks collapses into
+// one postMessage.
+
+function testStreamMergeById() {
+  const h = _p.newHistory();
+  const decoded = (f) => display.decodeFrame(f).frame;
+
+  const first = _p.appendFrame(
+    h,
+    decoded(streamFrame("loss", { epoch: -1, x: [0, 1], y: [2.0, 1.5], title: "training loss", xlabel: "step", ylabel: "loss" }))
+  );
+  check("stream: the first chunk opens the channel's entry", h.entries.length === 1 && first.merged === false, h.entries.length);
+  check("stream: entry id is the channel name", first.entry.id === "loss", first.entry.id);
+  check("stream: title comes from the chunk", first.entry.title === "training loss", first.entry.title);
+  check("stream: labels retained", first.entry.stream.xlabel === "step" && first.entry.stream.ylabel === "loss", first.entry.stream);
+
+  const second = _p.appendFrame(h, decoded(streamFrame("loss", { x: [2, 3], y: [1.2, 1.0] })));
+  check("stream: a second chunk merges — history does not grow", h.entries.length === 1 && second.merged === true, h.entries.length);
+  check("stream: series concatenated in order", first.entry.stream.x.join(",") === "0,1,2,3", first.entry.stream.x);
+  check("stream: y concatenated in step", first.entry.stream.y.join(",") === "2,1.5,1.2,1", first.entry.stream.y);
+  check("stream: chunk count tracked", first.entry.stream.frames === 2, first.entry.stream.frames);
+
+  // The derived figure is what the panel/webview and the notebook renderer get.
+  const rendered = _p.renderFor(first.entry, "plotly");
+  check("stream: renders as a plotly frame", rendered.mime === display.PLOTLY_MIME && rendered.encoding === "json", rendered.mime);
+  check("stream: one line trace over the whole series", rendered.data.data.length === 1 && rendered.data.data[0].x.join(",") === "0,1,2,3", rendered.data.data[0]);
+  check("stream: figure skeleton carries title/xlabel/ylabel",
+    rendered.data.layout.title.text === "training loss" &&
+      rendered.data.layout.xaxis.title.text === "step" &&
+      rendered.data.layout.yaxis.title.text === "loss",
+    rendered.data.layout);
+  check("stream: the derived frame is cached until the series moves", _p.renderFor(first.entry, "plotly") === rendered);
+  _p.appendFrame(h, decoded(streamFrame("loss", { x: [4], y: [0.9] })));
+  check("stream: a new chunk invalidates the cached figure", _p.renderFor(first.entry, "plotly") !== rendered);
+
+  // A ragged chunk is truncated to the shorter side, never NaN-padded.
+  _p.appendFrame(h, decoded(streamFrame("loss", { x: [5, 6], y: [0.8] })));
+  check("stream: ragged chunk truncated to the shorter side", first.entry.stream.x.length === first.entry.stream.y.length, [first.entry.stream.x.length, first.entry.stream.y.length]);
+
+  // A different channel is a different plot.
+  const other = _p.appendFrame(h, decoded(streamFrame("accuracy", { x: [0], y: [0.1] })));
+  check("stream: a different channel appends a new entry", h.entries.length === 2 && other.merged === false, h.entries.length);
+  check("stream: channels keep separate series", other.entry.stream.x.length === 1, other.entry.stream.x);
+}
+
+function testStreamEpochBoundaries() {
+  const h = _p.newHistory();
+  const decoded = (f) => display.decodeFrame(f).frame;
+  const push = (data) => _p.appendFrame(h, decoded(streamFrame("loss", data)));
+
+  const r = push({ epoch: 0, x: [0, 1], y: [1, 1] });
+  const acc = r.entry.stream;
+  check("epoch: the first marked chunk records epoch 0 at its first x", acc.boundaries.length === 1 && acc.boundaries[0].epoch === 0 && acc.boundaries[0].x === 0, acc.boundaries);
+
+  push({ epoch: 0, x: [2, 3], y: [1, 1] });
+  check("epoch: the same epoch again records nothing new", acc.boundaries.length === 1, acc.boundaries);
+
+  push({ epoch: 1, x: [4, 5], y: [1, 1] });
+  check("epoch: a new epoch records a boundary at the x it starts on", acc.boundaries.length === 2 && acc.boundaries[1].epoch === 1 && acc.boundaries[1].x === 4, acc.boundaries);
+
+  push({ epoch: -1, x: [6], y: [1] });
+  check("epoch: -1 is unmarked and records nothing", acc.boundaries.length === 2, acc.boundaries);
+  check("epoch: last epoch survives an unmarked chunk", acc.lastEpoch === 1, acc.lastEpoch);
+
+  const fig = _p.streamFigure(acc);
+  check("epoch: one vertical rule per boundary", (fig.layout.shapes || []).length === 2, fig.layout.shapes);
+  check("epoch: rules span the paper height at the boundary x",
+    fig.layout.shapes[1].x0 === 4 && fig.layout.shapes[1].x1 === 4 && fig.layout.shapes[1].yref === "paper",
+    fig.layout.shapes[1]);
+  check("epoch: one label per boundary", (fig.layout.annotations || []).map((a) => a.text).join(",") === "e0,e1", fig.layout.annotations);
+
+  // Markers are strided the same way points are, so a 500-epoch run cannot
+  // put 500 shapes AND 500 annotations in one layout.
+  const many = _p.newStreamAcc();
+  for (let e = 0; e < 400; e++) _p.mergeStreamFrame(many, { epoch: e, x: [e], y: [0] });
+  check("epoch: markers capped by striding", _p.streamFigure(many).layout.shapes.length <= _p.STREAM_MAX_MARKS, _p.streamFigure(many).layout.shapes.length);
+}
+
+function testStreamReplayReset() {
+  // A Blade session re-runs every accumulated snippet, so a later eval
+  // replays an earlier cell's stream verbatim under the SAME stable meta.id.
+  // The merge has to recognize the restart and rebuild, not double-append.
+  const h = _p.newHistory();
+  const decoded = (f) => display.decodeFrame(f).frame;
+  const push = (data) => _p.appendFrame(h, decoded(streamFrame("loss", data)));
+
+  push({ epoch: 0, x: [0, 1], y: [2, 1.8] });
+  push({ epoch: 1, x: [2, 3], y: [1.5, 1.2] });
+  const acc = h.entries[0].stream;
+  check("replay: the first run accumulated 4 points", acc.x.length === 4, acc.x);
+  check("replay: run counter starts at 0", acc.runs === 0, acc.runs);
+
+  // The replay: same channel, same ids, starting over from the first x.
+  const res = push({ epoch: 0, x: [0, 1], y: [2, 1.8] });
+  check("replay: recognized as a run boundary", res.stream.reset === true, res.stream);
+  check("replay: accumulator reset, not doubled", acc.x.length === 2 && acc.x.join(",") === "0,1", acc.x);
+  check("replay: boundaries reset with it", acc.boundaries.length === 1 && acc.boundaries[0].epoch === 0, acc.boundaries);
+  check("replay: run counter advanced", acc.runs === 1, acc.runs);
+  check("replay: still ONE history entry for the channel", h.entries.length === 1, h.entries.length);
+
+  push({ epoch: 1, x: [2, 3], y: [1.5, 1.2] });
+  check("replay: the rest of the replayed run appends normally", acc.x.join(",") === "0,1,2,3", acc.x);
+  check("replay: and does not re-trigger a reset", acc.runs === 1, acc.runs);
+
+  // An epoch that goes backwards is the same signal, even when x keeps rising
+  // (a run whose x axis is a global step counter).
+  const acc2 = _p.newStreamAcc();
+  _p.mergeStreamFrame(acc2, { epoch: 3, x: [10, 11], y: [1, 1] });
+  const back = _p.mergeStreamFrame(acc2, { epoch: 0, x: [12, 13], y: [1, 1] });
+  check("replay: an epoch going backwards also resets", back.reset === true && acc2.x.join(",") === "12,13", acc2.x);
+
+  // Idempotency: the serve lane is not supposed to deliver a stream frame
+  // twice (the compiler skips buffering sink-forwarded ones), but a repeat
+  // must be a no-op rather than a doubled series.
+  const acc3 = _p.newStreamAcc();
+  _p.mergeStreamFrame(acc3, { epoch: 0, x: [0, 1], y: [5, 6] });
+  const dup = _p.mergeStreamFrame(acc3, { epoch: 0, x: [0, 1], y: [5, 6] });
+  check("idempotent: a repeated chunk is dropped", dup.skipped === true && dup.appended === 0, dup);
+  check("idempotent: the series is unchanged", acc3.x.join(",") === "0,1" && acc3.runs === 0, acc3.x);
+}
+
+function testStreamDecimation() {
+  // Past the drawn-point budget the FIGURE is strided; the accumulator keeps
+  // every raw sample (decimation is a drawing decision, not a data one).
+  const acc = _p.newStreamAcc();
+  const n = _p.STREAM_DRAW_LIMIT * 2 + 500;
+  const x = [];
+  const y = [];
+  for (let i = 0; i < n; i++) {
+    x.push(i);
+    y.push(i % 7);
+  }
+  _p.mergeStreamFrame(acc, { epoch: 0, x, y });
+  check("decimate: every raw sample is kept extension-side", acc.x.length === n, acc.x.length);
+
+  const stride = _p.streamStride(acc.x.length);
+  check("decimate: stride grows past the limit", stride === 3, stride);
+  const fig = _p.streamFigure(acc);
+  check("decimate: the drawn trace stays inside the budget", fig.data[0].x.length <= _p.STREAM_DRAW_LIMIT, fig.data[0].x.length);
+  check("decimate: drawn points are every stride-th sample from index 0",
+    fig.data[0].x[0] === 0 && fig.data[0].x[1] === stride && fig.data[0].x[2] === 2 * stride,
+    fig.data[0].x.slice(0, 3));
+  check("decimate: y is sampled in the same phase", fig.data[0].y[1] === acc.y[stride], [fig.data[0].y[1], acc.y[stride]]);
+
+  const small = _p.newStreamAcc();
+  _p.mergeStreamFrame(small, { epoch: -1, x: [0, 1, 2], y: [0, 1, 2] });
+  check("decimate: a small series is drawn whole", _p.streamFigure(small).data[0].x.length === 3, _p.streamFigure(small).data[0].x);
+}
+
+/** The panel end-to-end: reveal on the FIRST chunk only, throttled logging,
+ *  one coalesced postMessage per burst, and extendTraces rather than a redraw
+ *  once the webview holds the channel. */
+async function testStreamPanel() {
+  const logs = [];
+  _p.setDeps({ output: { appendLine: (l) => logs.push(l) } });
+  _p.setCoalesceMs(100);
+
+  const before = _p.history.entries.length;
+  ingest(streamFrame("loss", { epoch: 0, x: [0, 1], y: [2, 1.8], title: "training loss", xlabel: "step" }), "notebook");
+  const panel = mock.window._webviewPanels[mock.window._webviewPanels.length - 1];
+  check("stream panel: a panel exists", !!panel && panel._disposed !== true);
+  check("stream panel: the channel opened one entry", _p.history.entries.length === before + 1, _p.history.entries.length - before);
+  check("stream panel: revealed on the channel's first chunk", panel._revealed.length === 1, panel._revealed.length);
+  check("stream panel: nothing posted before the webview is ready", panel._posted.length === 0, panel._posted.length);
+
+  panel.webview._send({ type: "ready" });
+  const show = panel._posted[panel._posted.length - 1];
+  check("stream panel: the first draw is a full show", show.type === "show" && show.frame.mime === display.PLOTLY_MIME, show.type);
+  check("stream panel: the show names the stream it holds", show.streamId === "loss", show.streamId);
+  check("stream panel: the figure carries the accumulated series", show.frame.data.data[0].x.join(",") === "0,1", show.frame.data.data[0].x);
+
+  // A burst of chunks inside one coalescing window: one postMessage, total.
+  const postsBefore = panel._posted.length;
+  for (let i = 1; i <= 3; i++) {
+    ingest(streamFrame("loss", { epoch: 1, x: [2 * i, 2 * i + 1], y: [1, 1] }), "notebook");
+  }
+  check("stream panel: the burst posted nothing yet (coalescing)", panel._posted.length === postsBefore, panel._posted.length - postsBefore);
+  check("stream panel: a mid-run chunk never re-reveals the panel", panel._revealed.length === 1, panel._revealed.length);
+
+  _p.flushStreamPost();
+  check("stream panel: the whole burst collapsed into ONE post", panel._posted.length === postsBefore + 1, panel._posted.length - postsBefore);
+  const appended = panel._posted[panel._posted.length - 1];
+  check("stream panel: it extends rather than redraws", appended.type === "streamAppend" && appended.id === "loss", appended.type);
+  check("stream panel: only the new points ride along", appended.x.join(",") === "2,3,4,5,6,7", appended.x);
+  check("stream panel: epoch markers ride with the append", appended.shapes.length === 2 && appended.annotations.map((a) => a.text).join(",") === "e0,e1", appended.annotations);
+
+  // Logging is sampled — a per-batch stream emits thousands of chunks.
+  const streamLogs = () => logs.filter((l) => /^\[plots\] stream loss/.test(l)).length;
+  const logsAfterFour = streamLogs();
+  for (let i = 4; i < 30; i++) ingest(streamFrame("loss", { epoch: 2, x: [100 + i], y: [1] }), "notebook");
+  _p.flushStreamPost();
+  check("stream panel: logging is throttled, not one line per chunk", streamLogs() - logsAfterFour <= 2, [logsAfterFour, streamLogs()]);
+  check("stream panel: the first chunk did log", logsAfterFour >= 1, logs.slice(0, 3));
+
+  // A second channel is a second entry, revealed once, and forces a full
+  // show (the webview cannot extend a trace it isn't holding).
+  ingest(streamFrame("accuracy", { epoch: 0, x: [0], y: [0.1] }), "notebook");
+  _p.flushStreamPost();
+  const other = panel._posted[panel._posted.length - 1];
+  check("stream panel: a new channel is a full show", other.type === "show" && other.streamId === "accuracy", other.type + "/" + other.streamId);
+  check("stream panel: the new channel revealed once", panel._revealed.length === 2, panel._revealed.length);
+
+  // A replay of the FIRST channel resets its accumulator and forces a redraw
+  // (the run key changed), instead of appending a second copy of the run.
+  ingest(streamFrame("loss", { epoch: 0, x: [0, 1], y: [2, 1.8] }), "notebook");
+  _p.flushStreamPost();
+  const replayed = panel._posted[panel._posted.length - 1];
+  const lossEntry = _p.history.entries.find((e) => e.id === "loss");
+  check("stream panel: a replay redraws instead of extending", replayed.type === "show" && replayed.streamId === "loss", replayed.type);
+  check("stream panel: the replayed series is the new run only", lossEntry.stream.x.join(",") === "0,1", lossEntry.stream.x);
+  check("stream panel: still one entry for the channel", _p.history.entries.filter((e) => e.id === "loss").length === 1);
+
+  // The real timer path (not just the flush hook): chunks in one window post
+  // exactly once, on their own.
+  _p.setCoalesceMs(20);
+  const beforeTimer = panel._posted.length;
+  for (let i = 0; i < 4; i++) ingest(streamFrame("loss", { epoch: 3, x: [50 + i], y: [1] }), "notebook");
+  await new Promise((r) => setTimeout(r, 80));
+  check("stream panel: the trailing timer fires once for the burst", panel._posted.length === beforeTimer + 1, panel._posted.length - beforeTimer);
+
+  _p.setCoalesceMs(100);
+  plots.dispose();
+}
+
+/** The webview half of the stream contract: an extendTraces path that only
+ *  fires for the stream the webview is actually holding. */
+function testStreamWebviewScript() {
+  const js = _p.webviewScript();
+  // The webview body is assembled by string concatenation, so `node --check
+  // src/plots.js` says nothing about it. `new Function` PARSES without
+  // running — the cheapest possible syntax gate on generated code.
+  let parses = true;
+  try {
+    new Function(js); // eslint-disable-line no-new-func
+  } catch (e) {
+    parses = false;
+    check("stream webview: the generated script parses", false, e.message);
+  }
+  if (parses) check("stream webview: the generated script parses", true);
+  check("stream webview: has an extendTraces path", js.indexOf("Plotly.extendTraces") !== -1);
+  check("stream webview: relayouts the epoch markers", js.indexOf("Plotly.relayout") !== -1);
+  check("stream webview: newPlot only on creation", js.indexOf("plotted ? Plotly.react : Plotly.newPlot") !== -1);
+  check("stream webview: ignores an append for another stream", /msg\.id !== streamId/.test(js), js.indexOf("streamId"));
+  check("stream webview: the panel HTML still nonces every script", (() => {
+    const html = _p.panelHtml({ cspSource: "vscode-webview://abc", plotlyUri: "u", nonce: "N" });
+    return (html.match(/<script/g) || []).length === (html.match(/<script nonce="N"/g) || []).length;
+  })());
+}
+
+// --- 8. Notebook renderer contribution ---------------------------------------
+//
+// Without a contributed renderer a plotly cell output degrades to the
+// text/plain summary and the chart lives only in the panel. The manifest and
+// the entrypoint are checked here because nothing else in the hermetic suite
+// would notice them rotting.
+
+async function testRendererContribution() {
+  const root = path.join(__dirname, "..");
+  const pkg = JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8"));
+  const renderers = (pkg.contributes && pkg.contributes.notebookRenderers) || [];
+  check("renderer: contributed in package.json", renderers.length === 1, renderers.length);
+  const r = renderers[0] || {};
+  check("renderer: declares the plotly mime", (r.mimeTypes || []).indexOf(display.PLOTLY_MIME) !== -1, r.mimeTypes);
+  check("renderer: declares the stream mime", (r.mimeTypes || []).indexOf(_p.STREAM_MIME) !== -1, r.mimeTypes);
+  check("renderer: has an id and a display name", !!r.id && !!r.displayName, r);
+
+  const entry = path.join(root, r.entrypoint || "");
+  check("renderer: the entrypoint file exists", !!r.entrypoint && fs.existsSync(entry), r.entrypoint);
+  const syntax = spawnSync(process.execPath, ["--check", entry], { encoding: "utf8" });
+  check("renderer: the entrypoint passes node --check", syntax.status === 0, syntax.stderr);
+
+  const mod = await import(pathToFileURL(entry).href);
+  check("renderer: exports activate (the VS Code entrypoint contract)", typeof mod.activate === "function", Object.keys(mod));
+  check("renderer: its mime list matches the manifest", mod.mimeTypes.join(",") === (r.mimeTypes || []).join(","), [mod.mimeTypes, r.mimeTypes]);
+
+  // OFFLINE: plotly is addressed relative to the renderer module itself, i.e.
+  // the extension's own already-bundled copy — no CDN, no second copy.
+  const asset = mod.plotlyAssetUrl();
+  check("renderer: plotly resolves to the bundled media/plotly.min.js", /\/media\/plotly\.min\.js$/.test(asset), asset);
+  check("renderer: no remote host in the asset URL", asset.indexOf("cdn.plot.ly") === -1 && !/^https?:/.test(asset), asset);
+  check("renderer: that file is really there", fs.existsSync(path.join(root, "media", "plotly.min.js")));
+  // Comments talk about URL schemes; the CODE must not contain one.
+  const code = fs
+    .readFileSync(entry, "utf8")
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .replace(/^\s*\/\/.*$/gm, "");
+  check("renderer: the entrypoint fetches nothing", !/fetch\(|XMLHttpRequest|https?:\/\//.test(code), "network access in renderer");
+
+  // The pure half: what the renderer draws for each payload shape.
+  const figure = mod.figureFor({ data: [{ type: "contour", z: [[1]] }], layout: { title: { text: "t" } } });
+  check("renderer: a plotly figure passes straight through", figure.ok && figure.data[0].type === "contour", figure);
+  const accumulated = _p.streamFigure(
+    (() => {
+      const acc = _p.newStreamAcc();
+      _p.mergeStreamFrame(acc, { channel: "loss", epoch: 0, x: [0, 1], y: [2, 1], title: "training loss", ylabel: "loss" });
+      return acc;
+    })()
+  );
+  const fromStream = mod.figureFor(accumulated);
+  check("renderer: an accumulated stream figure renders as-is",
+    fromStream.ok && fromStream.data[0].x.join(",") === "0,1" && fromStream.layout.title.text === "training loss",
+    fromStream.layout);
+  const raw = mod.figureFor({ channel: "loss", epoch: 0, x: [0, 1, 2], y: [3, 4, 5], xlabel: "step" });
+  check("renderer: a RAW wire chunk is wrapped into a single-trace figure",
+    raw.ok && raw.data.length === 1 && raw.data[0].y.join(",") === "3,4,5" && raw.layout.xaxis.title.text === "step",
+    raw.data[0]);
+  check("renderer: an unrecognizable payload degrades instead of throwing", mod.figureFor({ nope: 1 }).ok === false);
+}
+
 // --- Run ------------------------------------------------------------------------
 
 (async () => {
@@ -716,10 +1052,18 @@ function testReplayedFrameStillRoutesToPanel() {
   testAssembleOutputsSuppressesReplayedIds();
   await testReplayedFrameStillRoutesToPanel();
 
+  testStreamMergeById();
+  testStreamEpochBoundaries();
+  testStreamReplayReset();
+  testStreamDecimation();
+  testStreamWebviewScript();
+  await testRendererContribution();
+
   await testDemoEndToEnd();
   await testGrRoundTrip();
   await testGrExport();
   await testPreferredBackend();
+  await testStreamPanel();
 
   if (failures) {
     console.error(`\n${failures} plot check(s) failed.`);

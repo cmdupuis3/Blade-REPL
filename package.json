@@ -18,7 +18,7 @@
   "main": "./src/extension.js",
   "activationEvents": [],
   "scripts": {
-    "test": "node --check src/extension.js && node --check src/repl.js && node --check src/serve.js && node --check src/notebook.js && node --check src/plots.js && node --check src/builtins.js && node --check src/types.js && node --check src/keywords.js && node --check scripts/vscode-mock.js && node --check scripts/provider-test.js && node --check scripts/notebook-test.js && node --check scripts/plots-test.js && node --check scripts/check-consistency.js && node --check scripts/repl-protocol-test.js && node --check scripts/serve-protocol-test.js && node --check scripts/nav-integration-test.js && node --check scripts/notebook-eval-test.js && node --check scripts/fetch-vendor.js && node --check src/gr.js && node --check scripts/gr-test.js && node scripts/check-consistency.js && node scripts/provider-test.js && node scripts/notebook-test.js && node scripts/plots-test.js && node scripts/gr-test.js",
+    "test": "node --check renderer/plotly-renderer.js && node --check src/extension.js && node --check src/repl.js && node --check src/serve.js && node --check src/notebook.js && node --check src/plots.js && node --check src/builtins.js && node --check src/types.js && node --check src/keywords.js && node --check scripts/vscode-mock.js && node --check scripts/provider-test.js && node --check scripts/notebook-test.js && node --check scripts/plots-test.js && node --check scripts/check-consistency.js && node --check scripts/repl-protocol-test.js && node --check scripts/serve-protocol-test.js && node --check scripts/nav-integration-test.js && node --check scripts/notebook-eval-test.js && node --check scripts/fetch-vendor.js && node --check src/gr.js && node --check scripts/gr-test.js && node scripts/check-consistency.js && node scripts/provider-test.js && node scripts/notebook-test.js && node scripts/plots-test.js && node scripts/gr-test.js",
     "test:repl": "node scripts/repl-protocol-test.js",
     "test:serve": "node scripts/serve-protocol-test.js",
     "test:nav": "node scripts/nav-integration-test.js",
@@ -62,6 +62,18 @@
         ]
       }
     ],
+    "notebookRenderers": [
+      {
+        "id": "blade-plotly",
+        "displayName": "Blade Plot (plotly)",
+        "entrypoint": "./renderer/plotly-renderer.js",
+        "requiresMessaging": "never",
+        "mimeTypes": [
+          "application/vnd.plotly.v1+json",
+          "application/vnd.blade.plotstream.v1+json"
+        ]
+      }
+    ],
     "configuration": {
       "title": "Blade",
       "properties": {
@@ -89,6 +101,11 @@
           "type": "number",
           "default": 180,
           "description": "Timeout for 'Blade run' invocations (compile + execute; first runs invoke g++)."
+        },
+        "blade.notebookEvalTimeoutSeconds": {
+          "type": "number",
+          "default": 1800,
+          "description": "Timeout for evaluating one notebook cell (compile + execute; a cell can legitimately run for minutes, e.g. a training loop). Applies only to notebook cell evaluation; 'Blade run' and the REPL keep using blade.runTimeoutSeconds."
         },
         "blade.inlineReplResults": {
           "type": "boolean",
