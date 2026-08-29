@@ -924,6 +924,53 @@ function testRecordZoomTargets() {
   _test.zoomTargets.clear();
 }
 
+/** REGRESSION (the "frames is not iterable" hang). applyEvalResult ran
+ *  `for (const frame of display.framesFromEval(resp))` — but framesFromEval
+ *  returns {frames, errors}, an OBJECT. Iterating it threw a TypeError that
+ *  escaped applyEvalResult BEFORE execution.end(), orphaning the cell: VS Code
+ *  spun that cell forever, no compiler process running, and a kernel restart
+ *  could not clear it (the session resets; the orphaned execution does not).
+ *
+ *  The bug hid because makeExecution()'s cell carries only {document} — no
+ *  .notebook/.index — so recordZoomTargets early-returned before the loop.
+ *  This test uses a cell shaped like a REAL one, with display frames present,
+ *  which is the path the editor actually takes. */
+async function testApplyEvalResultWithRealCell() {
+  const controller = mock.notebooks.createNotebookController("zt", "blade-notebook", "Test");
+  const cell = {
+    document: vscodeMock.makeDoc("import plot", "cell0.blade"),
+    notebook: { uri: { toString: () => "nb://real" } },
+    index: 3,
+  };
+  const execution = controller.createNotebookCellExecution(cell);
+  execution.start(0);
+  const state = { keptSources: [], seenFrameIds: new Set() };
+  const resp = {
+    kept: true, exitCode: 0, lane: "interp", elapsedMs: 5, stdout: "", stderr: "",
+    bindings: [], diagnostics: [],
+    display: [{
+      v: 1, mime: "application/vnd.plotly.v1+json", encoding: "json",
+      data: { data: [{ type: "heatmap" }], layout: { blade_camera: { bindings: "cam_cx,cam_cy,cam_r" } } },
+      meta: { id: "mandelbrot-view" },
+    }],
+  };
+  _test.zoomTargets.clear();
+  let threw = null;
+  try {
+    await _test.applyEvalResult(execution, resp, "import plot", state);
+  } catch (e) {
+    threw = e;
+  }
+  check("real cell: applyEvalResult does not throw", threw === null, threw && threw.message);
+  check("real cell: the execution ENDED (an orphan is the hang)", execution._ended !== undefined, execution._ended);
+  check("real cell: it ended successfully", execution._success === true, execution._success);
+  check("real cell: the camera frame was recorded for zoom", (() => {
+    const t = _test.zoomTargets.get("mandelbrot-view");
+    return !!t && t.key === "nb://real" && t.cellIndex === 3;
+  })(), _test.zoomTargets.get("mandelbrot-view"));
+  _test.zoomTargets.clear();
+}
+
 // --- Run -----------------------------------------------------------------------
 
 (async () => {
@@ -962,6 +1009,7 @@ function testRecordZoomTargets() {
   testBladeFloat();
   testRewriteCameraSource();
   testRecordZoomTargets();
+  await testApplyEvalResultWithRealCell();
 
   if (failures) {
     console.error(`\n${failures} notebook check(s) failed.`);

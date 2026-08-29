@@ -508,9 +508,11 @@ async function applyEvalResult(execution, resp, source, state) {
   // routing is UNCONDITIONAL — every frame, replayed or not — the panel
   // merges by meta.id itself (docs/display-frames.md §10); only the cell
   // output below is filtered against state.seenFrameIds.
-  const frames = display.framesFromEval(resp);
-  display.route(frames, "notebook");
-  recordZoomTargets(execution, frames);
+  // framesFromEval returns {frames, errors} -- display.route consumes that
+  // object whole; anything wanting the frames themselves takes .frames.
+  const routed = display.framesFromEval(resp);
+  display.route(routed, "notebook");
+  recordZoomTargets(execution, routed.frames);
   await execution.replaceOutput(assembleOutputs(resp, state.seenFrameIds));
   if (resp.kept) state.keptSources.push(source);
   execution.end(!!resp.kept && resp.exitCode === 0, Date.now());
@@ -539,6 +541,11 @@ const zoomTargets = new Map();
 function recordZoomTargets(execution, frames) {
   const cell = execution && execution.cell;
   if (!cell || !cell.notebook || typeof cell.index !== "number") return;
+  // Never throw out of here: an exception escapes applyEvalResult BEFORE
+  // execution.end(), which orphans the cell's execution -- VS Code then
+  // spins that cell forever, with no process running and no kernel restart
+  // able to clear it.
+  if (!Array.isArray(frames)) return;
   for (const frame of frames) {
     const id = frame && frame.meta && frame.meta.id;
     const lay = frame && frame.data && frame.data.layout;
