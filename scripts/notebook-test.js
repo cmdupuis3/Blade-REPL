@@ -874,6 +874,56 @@ async function testExecuteCellAnimatesThenPersists() {
   _test.cleanupNotebook(notebookDoc);
 }
 
+// --- Zoom-to-recompute helpers (docs/plot-zoom-reeval.md) ----------------------
+
+function testBladeFloat() {
+  check("bladeFloat: integers gain a point", _test.bladeFloat(2) === "2.0");
+  check("bladeFloat: negative integers too", _test.bladeFloat(-1) === "-1.0");
+  check("bladeFloat: round-trip decimals pass through", _test.bladeFloat(-0.743643887037151) === "-0.743643887037151");
+  check("bladeFloat: bare exponent gains a point", _test.bladeFloat(1e-14) === "1.0e-14", _test.bladeFloat(1e-14));
+  check("bladeFloat: pointed exponent untouched", _test.bladeFloat(7.8125e-17) === "7.8125e-17", _test.bladeFloat(7.8125e-17));
+}
+
+function testRewriteCameraSource() {
+  const src = [
+    "// the camera",
+    "let cam_cx = -0.743643887037151",
+    "let cam_cy = 0.131825904205330   // seahorse",
+    "let cam_r = 0.004",
+    "let unrelated = 7",
+  ].join("\n");
+  const { text, replaced } = _test.rewriteCameraSource(src, ["cam_cx", "cam_cy", "cam_r"], [-0.75, 0.13, 1e-14]);
+  const lines = text.split("\n");
+  check("rewrite: all three bindings replaced", replaced.size === 3, [...replaced]);
+  check("rewrite: value replaced in place", lines[1] === "let cam_cx = -0.75", lines[1]);
+  check("rewrite: trailing comment preserved", lines[2] === "let cam_cy = 0.13   // seahorse", lines[2]);
+  check("rewrite: exponent value is lexically a Float", lines[3] === "let cam_r = 1.0e-14", lines[3]);
+  check("rewrite: unrelated binding untouched", lines[4] === "let unrelated = 7", lines[4]);
+  const miss = _test.rewriteCameraSource("let other = 1", ["cam_cx", "cam_cy", "cam_r"], [1, 2, 3]);
+  check("rewrite: missing bindings reported, text unchanged", miss.replaced.size === 0 && miss.text === "let other = 1");
+}
+
+function testRecordZoomTargets() {
+  _test.zoomTargets.clear();
+  const cell = { index: 4, notebook: { uri: { toString: () => "nb://one" } } };
+  const camFrame = {
+    meta: { id: "mandel-view" },
+    data: { layout: { blade_camera: { bindings: "a,b,c" } } },
+  };
+  const plainFrame = { meta: { id: "plain" }, data: { layout: {} } };
+  _test.recordZoomTargets({ cell }, [camFrame, plainFrame]);
+  check("zoom targets: camera frame recorded with its cell", (() => {
+    const t = _test.zoomTargets.get("mandel-view");
+    return !!t && t.key === "nb://one" && t.cellIndex === 4;
+  })(), _test.zoomTargets.get("mandel-view"));
+  check("zoom targets: plain frame not recorded", !_test.zoomTargets.has("plain"));
+  // The hermetic mock executions carry no real cell — recording tolerates that.
+  _test.recordZoomTargets({}, [camFrame]);
+  _test.recordZoomTargets(undefined, [camFrame]);
+  check("zoom targets: cell-less executions tolerated", _test.zoomTargets.size === 1, _test.zoomTargets.size);
+  _test.zoomTargets.clear();
+}
+
 // --- Run -----------------------------------------------------------------------
 
 (async () => {
@@ -908,6 +958,10 @@ async function testExecuteCellAnimatesThenPersists() {
   testStreamFramesNeverPersist();
   await testLiveStreamRepaintsAndUnsubscribes();
   await testExecuteCellAnimatesThenPersists();
+
+  testBladeFloat();
+  testRewriteCameraSource();
+  testRecordZoomTargets();
 
   if (failures) {
     console.error(`\n${failures} notebook check(s) failed.`);

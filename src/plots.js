@@ -40,7 +40,10 @@ const vscode = require("vscode");
 const path = require("path");
 const display = require("@blade-lang/ide-protocol").display;
 
-// Injected by init(): { output, findGr, renderPlot } from extension.js.
+// Injected by init(): { output, findGr, renderPlot, onPlotZoom } from
+// extension.js. onPlotZoom is the zoom-to-recompute hook (wired to the
+// notebook module); when absent, a zoom on a camera-carrying figure gets a
+// "not wired" note and nothing else.
 let deps;
 
 const VIEW_TYPE = "bladePlots";
@@ -638,6 +641,7 @@ function webviewScript() {
     "  var elStage = document.getElementById('stage');",
     "  var current = null;   // {frame, title, index, total}",
     "  var plotted = false;  // is elPlot holding a live plotly graph?",
+    "  var zoomHooked = false; // plotly_relayout listener attached to elPlot?",
     // Which live stream channel elPlot is currently holding, if any. Set by
     // every 'show'; an incoming 'streamAppend' for a DIFFERENT id is ignored
     // (the host re-syncs with a full 'show' — it tracks this same value).
@@ -693,7 +697,28 @@ function webviewScript() {
     "    var config = Object.assign({ responsive: true, displaylogo: false }, spec.config || {});",
     "    showOnly(elPlot);",
     "    var call = plotted ? Plotly.react : Plotly.newPlot;",
-    "    return call(elPlot, traces, layout, config).then(function () { plotted = true; });",
+    "    return call(elPlot, traces, layout, config).then(function () { plotted = true; attachZoom(); });",
+    "  }",
+    "",
+    // Zoom-to-recompute (docs/plot-zoom-reeval.md): a drag-zoom on a figure
+    // whose layout carries a `blade_camera` contract is reported to the host,
+    // which maps it back onto the camera bindings and re-evaluates. Only a
+    // gesture qualifies: the four explicit range keys appear together exactly
+    // when plotly resolves a user zoom/pan; programmatic relayouts (theme,
+    // epoch markers, autorange resets) carry other keys and fall through.
+    // Attached once — plotly keeps the listener across Plotly.react calls.
+    "  function attachZoom() {",
+    "    if (zoomHooked || typeof elPlot.on !== 'function') return;",
+    "    zoomHooked = true;",
+    "    elPlot.on('plotly_relayout', function (e) {",
+    "      if (!e) return;",
+    "      var x0 = e['xaxis.range[0]'], x1 = e['xaxis.range[1]'];",
+    "      var y0 = e['yaxis.range[0]'], y1 = e['yaxis.range[1]'];",
+    "      if (x0 === undefined || x1 === undefined || y0 === undefined || y1 === undefined) return;",
+    "      var lay = current && current.frame && current.frame.data && current.frame.data.layout;",
+    "      if (!lay || !lay.blade_camera) return;",
+    "      api.postMessage({ type: 'zoom', xr: [Number(x0), Number(x1)], yr: [Number(y0), Number(y1)] });",
+    "    });",
     "  }",
     "",
     // Incremental append for a live stream: extendTraces pushes the new
@@ -975,6 +1000,70 @@ function note(message) {
   if (panel && webviewReady) panel.webview.postMessage({ type: "note", message });
 }
 
+// --- Zoom-to-recompute (docs/plot-zoom-reeval.md) ------------------------------
+
+/** The camera contract a spec carries, or null: `layout.blade_camera` with a
+ *  `bindings` string naming exactly three session bindings — center-x,
+ *  center-y, half-width, in that order (stdlib plot.blade's `camera` slot). */
+function cameraFromSpec(spec) {
+  const cam = spec && spec.layout && spec.layout.blade_camera;
+  if (!cam || typeof cam.bindings !== "string") return null;
+  const names = cam.bindings.split(",").map((s) => s.trim());
+  if (names.length !== 3 || names.some((n) => !/^[A-Za-z_]\w*$/.test(n))) return null;
+  return { bindings: names };
+}
+
+/** A zoom gesture's ranges → the camera values that reproduce it: center of
+ *  the selection, half-width the LARGER half-span (the canvas is square, so
+ *  the larger span is the one that keeps the whole selection in frame). */
+function zoomCamera(xr, yr) {
+  const nums = [xr && xr[0], xr && xr[1], yr && yr[0], yr && yr[1]].map(Number);
+  if (nums.some((v) => !isFinite(v))) return null;
+  const [x0, x1, y0, y1] = nums;
+  const r = Math.max(Math.abs(x1 - x0), Math.abs(y1 - y0)) / 2;
+  if (!(r > 0)) return null;
+  return { cx: (x0 + x1) / 2, cy: (y0 + y1) / 2, r };
+}
+
+/** Plot ids whose zoom re-evaluation is still running: one at a time per
+ *  plot — a gesture during a recompute is dropped with a note rather than
+ *  queued (the serve session is serial anyway, and the newest camera always
+ *  wins on the next gesture). */
+const zoomInflight = new Set();
+
+/** One zoom gesture from the webview: map it onto the current entry's camera
+ *  contract and hand it to the re-evaluation hook (deps.onPlotZoom — wired to
+ *  the notebook module, which rewrites the camera cell and re-runs it). This
+ *  function owns the plumbing and the notes; what "re-evaluate" means belongs
+ *  wholly to the hook. */
+function handleZoom(msg) {
+  const entry = currentEntry(history);
+  if (!entry) return;
+  const camera = cameraFromSpec(specFor(entry));
+  if (!camera) return; // a zoom on an ordinary figure is plotly's own affair
+  if (!deps || typeof deps.onPlotZoom !== "function") {
+    note("zoom-to-recompute: no re-evaluation hook wired");
+    return;
+  }
+  const cam = zoomCamera(msg.xr, msg.yr);
+  if (!cam) return;
+  if (zoomInflight.has(entry.id)) {
+    note("zoom-to-recompute: previous recompute still running — gesture dropped");
+    return;
+  }
+  zoomInflight.add(entry.id);
+  note(`recomputing ${entry.id} at r = ${cam.r.toExponential(3)}…`);
+  Promise.resolve(deps.onPlotZoom({ plotId: entry.id, bindings: camera.bindings, cx: cam.cx, cy: cam.cy, r: cam.r }))
+    .then(() => {
+      zoomInflight.delete(entry.id);
+      note("");
+    })
+    .catch((e) => {
+      zoomInflight.delete(entry.id);
+      note(`zoom-to-recompute failed: ${(e && e.message) || e}`);
+    });
+}
+
 /** Ask the warm serve process to render `entry`'s spec with GR. The response
  *  frame re-enters through display.publish, so the ordinary onFrame →
  *  appendFrame path merges it into this entry by meta.id and re-posts — no
@@ -1077,6 +1166,10 @@ function onWebviewMessage(msg) {
   }
   if (msg.type === "export") {
     requestGrExport(msg.format === "pdf" ? "pdf" : "svg", msg.width, msg.height);
+    return;
+  }
+  if (msg.type === "zoom") {
+    handleZoom(msg);
     return;
   }
   if (msg.type === "error") {
@@ -1286,6 +1379,11 @@ module.exports._test = {
   demoFrame,
   commandPlotDemo,
   history,
+  // Zoom-to-recompute.
+  cameraFromSpec,
+  zoomCamera,
+  handleZoom,
+  zoomInflight,
   // Streams.
   STREAM_MIME,
   STREAM_DRAW_LIMIT,

@@ -508,10 +508,116 @@ async function applyEvalResult(execution, resp, source, state) {
   // routing is UNCONDITIONAL — every frame, replayed or not — the panel
   // merges by meta.id itself (docs/display-frames.md §10); only the cell
   // output below is filtered against state.seenFrameIds.
-  display.route(display.framesFromEval(resp), "notebook");
+  const frames = display.framesFromEval(resp);
+  display.route(frames, "notebook");
+  recordZoomTargets(execution, frames);
   await execution.replaceOutput(assembleOutputs(resp, state.seenFrameIds));
   if (resp.kept) state.keptSources.push(source);
   execution.end(!!resp.kept && resp.exitCode === 0, Date.now());
+}
+
+// --- Zoom-to-recompute (docs/plot-zoom-reeval.md) ------------------------------
+//
+// A figure whose layout carries `blade_camera` (stdlib plot.blade's `camera`
+// slot) declares that three session bindings position it. The plot panel maps
+// a drag-zoom back onto those bindings and calls onPlotZoom below, which does
+// exactly what the user would have done by hand: REWRITE the camera cell's
+// text and RE-RUN it plus the cell that emitted the figure. The gesture and
+// the hand edit are the same operation, so the notebook's text is never a lie
+// about what the picture shows, and the recomputed frame replaces the old one
+// in the panel by its stable meta.id.
+
+// plot meta.id -> { key: notebook URI string, cellIndex } for every
+// camera-carrying frame seen this session. Re-recorded on every eval of the
+// emitting cell, so it survives cell insertions above it (the entry just
+// updates on the next run; a zoom between an insertion and a re-run re-runs
+// the OLD index — the eval it triggers re-records the truth).
+const zoomTargets = new Map();
+
+/** Record where camera-carrying frames come from. Tolerates the hermetic
+ *  tests' mock executions, which carry no real cell. */
+function recordZoomTargets(execution, frames) {
+  const cell = execution && execution.cell;
+  if (!cell || !cell.notebook || typeof cell.index !== "number") return;
+  for (const frame of frames) {
+    const id = frame && frame.meta && frame.meta.id;
+    const lay = frame && frame.data && frame.data.layout;
+    if (typeof id === "string" && id && lay && lay.blade_camera) {
+      zoomTargets.set(id, { key: cell.notebook.uri.toString(), cellIndex: cell.index });
+    }
+  }
+}
+
+/** A Float64 as Blade source: JavaScript's shortest round-trip decimal, made
+ *  lexically a Float ("2" would parse as an Int, "1e-14" needs its point). */
+function bladeFloat(v) {
+  let s = String(v);
+  if (/^-?\d+$/.test(s)) return s + ".0";
+  if (/e/i.test(s) && !/\./.test(s)) s = s.replace(/e/i, ".0e");
+  return s;
+}
+
+/** Rewrite `let <name> = <value>` lines for the given bindings, preserving
+ *  everything else on the line (indentation, a trailing // comment). Returns
+ *  the new text and the set of bindings actually rewritten. */
+function rewriteCameraSource(text, names, values) {
+  const wanted = new Map(names.map((n, i) => [n, values[i]]));
+  const replaced = new Set();
+  const out = text.split("\n").map((line) => {
+    const m = line.match(/^(\s*let\s+(\w+)\s*=\s*)([^\n]*?)(\s*\/\/.*)?$/);
+    if (!m || !wanted.has(m[2])) return line;
+    replaced.add(m[2]);
+    return m[1] + bladeFloat(wanted.get(m[2])) + (m[4] || "");
+  });
+  return { text: out.join("\n"), replaced };
+}
+
+/** The cell whose text DEFINES the camera bindings: the first code cell
+ *  containing a top-level-looking `let <first binding> =`. */
+function findCameraCell(notebookDoc, names) {
+  const re = new RegExp(`(^|\\n)\\s*let\\s+${names[0]}\\s*=`);
+  for (const cell of notebookDoc.getCells()) {
+    if (cell.kind !== vscode.NotebookCellKind.Code) continue;
+    if (re.test(cell.document.getText())) return cell;
+  }
+  return undefined;
+}
+
+/**
+ * The plot panel's zoom hook (wired via extension.js -> plots.init deps).
+ * `bindings` are [cx, cy, r] names from the figure's own contract; the values
+ * are the gesture's. Throws with a user-facing message on any gap — the panel
+ * turns that into a note.
+ */
+async function onPlotZoom({ plotId, bindings, cx, cy, r }) {
+  const target = zoomTargets.get(plotId);
+  if (!target) throw new Error(`no notebook cell on record for plot "${plotId}" — run its cell once first`);
+  const notebookDoc = vscode.workspace.notebookDocuments.find((d) => d.uri.toString() === target.key);
+  if (!notebookDoc) throw new Error(`the notebook that produced "${plotId}" is no longer open`);
+  if (!notebookController) throw new Error("notebook controller not initialized");
+
+  const cameraCell = findCameraCell(notebookDoc, bindings);
+  if (!cameraCell) throw new Error(`no cell defines \`let ${bindings[0]} = …\` — cannot rewrite the camera`);
+
+  const doc = cameraCell.document;
+  const { text, replaced } = rewriteCameraSource(doc.getText(), bindings, [cx, cy, r]);
+  const missing = bindings.filter((n) => !replaced.has(n));
+  if (missing.length > 0) throw new Error(`camera cell does not define: ${missing.join(", ")}`);
+
+  const edit = new vscode.WorkspaceEdit();
+  const lastLine = doc.lineAt(doc.lineCount - 1);
+  edit.replace(doc.uri, new vscode.Range(0, 0, doc.lineCount - 1, lastLine.text.length), text);
+  const applied = await vscode.workspace.applyEdit(edit);
+  if (!applied) throw new Error("could not rewrite the camera cell");
+
+  // Re-run: the camera cell (rebinding the three names in the session), then
+  // the frame cell, which recomputes and re-emits under the stable id. When
+  // one cell is both, once is enough.
+  await executeCell(cameraCell, notebookDoc, notebookController);
+  const frameCell = notebookDoc.cellAt(target.cellIndex);
+  if (frameCell && frameCell.index !== cameraCell.index) {
+    await executeCell(frameCell, notebookDoc, notebookController);
+  }
 }
 
 // --- Session / client bookkeeping ---------------------------------------------
@@ -542,6 +648,10 @@ const sessionStates = new Map();
 const unsupported = new Set();
 
 let executionCounter = 0;
+
+// The notebook controller, held module-wide so onPlotZoom can create
+// executions outside a user-initiated run. Set once in init().
+let notebookController;
 
 function clientFor(notebookDoc) {
   const key = notebookDoc.uri.toString();
@@ -1046,6 +1156,7 @@ function init(context, dependencies) {
   controller.supportsExecutionOrder = true;
   controller.executeHandler = executeHandler;
   controller.interruptHandler = interruptHandler;
+  notebookController = controller;
 
   context.subscriptions.push(
     controller,
@@ -1077,7 +1188,7 @@ function dispose() {
   checkTimers.clear();
 }
 
-module.exports = { init, dispose };
+module.exports = { init, dispose, onPlotZoom };
 
 // Headless test surface (scripts/notebook-test.js) — mirrors extension.js's
 // own module.exports._test convention.
@@ -1115,6 +1226,13 @@ module.exports._test = {
   commandNewNotebook,
   commandOpenAsNotebook,
   commandRestart,
+  // Zoom-to-recompute.
+  zoomTargets,
+  recordZoomTargets,
+  bladeFloat,
+  rewriteCameraSource,
+  findCameraCell,
+  onPlotZoom,
   // Session-aware IDE features (N3).
   shiftSpan,
   lineInWindow,
