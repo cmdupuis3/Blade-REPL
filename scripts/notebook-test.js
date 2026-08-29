@@ -1025,6 +1025,39 @@ function testNotebookForRestartResolvesToolbarArg() {
   mock.window.activeNotebookEditor = prevActive;
 }
 
+/** REGRESSION: live-frame forwarding emptied the registry. Stable-id frames
+ *  arrive as out-of-band events, not in resp.display, so the response-side
+ *  recordZoomTargets never sees them -- a zoom then failed with "no notebook
+ *  cell on record". Two fixes pinned here: executeCell records from the live
+ *  bus, and onPlotZoom falls back to scanning open notebooks by the
+ *  contract's own bindings when the registry has nothing. */
+async function testZoomTargetFromLiveFrame() {
+  // The live path: a camera frame published on the bus during an eval is
+  // recorded against the executing cell (drive applyEvalResult-adjacent
+  // machinery directly -- the subscription body is recordZoomTargets).
+  _test.zoomTargets.clear();
+  const cell = { index: 7, notebook: { uri: { toString: () => "nb://live" } } };
+  _test.recordZoomTargets({ cell }, [{
+    meta: { id: "mandelbrot-view" },
+    data: { layout: { blade_camera: { bindings: "cam_cx,cam_cy,cam_r" } } },
+  }]);
+  const t = _test.zoomTargets.get("mandelbrot-view");
+  check("live zoom target: recorded from a bus frame", !!t && t.cellIndex === 7, t);
+  _test.zoomTargets.clear();
+
+  // The fallback path: with NOTHING on record and no open notebooks, the
+  // error names the contract's binding -- proving the scan ran instead of
+  // the old "no notebook cell on record" dead end.
+  const prevDocs = mock.workspace.notebookDocuments;
+  mock.workspace.notebookDocuments = [];
+  let err = null;
+  try {
+    await _test.onPlotZoom({ plotId: "mandelbrot-view", bindings: ["cam_cx", "cam_cy", "cam_r"], cx: 0, cy: 0, r: 1 });
+  } catch (e) { err = e; }
+  check("fallback: reaches the notebook scan", !!err && /no open Blade notebook defines/.test(err.message), err && err.message);
+  mock.workspace.notebookDocuments = prevDocs;
+}
+
 // --- Run -----------------------------------------------------------------------
 
 (async () => {
@@ -1066,6 +1099,7 @@ function testNotebookForRestartResolvesToolbarArg() {
   await testApplyEvalResultWithRealCell();
   await testRestartDisposesTheClient();
   testNotebookForRestartResolvesToolbarArg();
+  await testZoomTargetFromLiveFrame();
 
   if (failures) {
     console.error(`\n${failures} notebook check(s) failed.`);

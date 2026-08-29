@@ -597,11 +597,23 @@ function findCameraCell(notebookDoc, names) {
  * turns that into a note.
  */
 async function onPlotZoom({ plotId, bindings, cx, cy, r }) {
+  // Prefer the registry; fall back to scanning open Blade notebooks for
+  // the cell that defines the contract's first binding. The contract is
+  // self-describing, so the registry's only irreplaceable job is
+  // disambiguating several notebooks that define the same camera names.
   const target = zoomTargets.get(plotId);
-  if (!target) throw new Error(`no notebook cell on record for plot "${plotId}" — run its cell once first`);
-  const notebookDoc = vscode.workspace.notebookDocuments.find((d) => d.uri.toString() === target.key);
-  if (!notebookDoc) throw new Error(`the notebook that produced "${plotId}" is no longer open`);
-  if (!notebookController) throw new Error("notebook controller not initialized");
+  let notebookDoc = target
+    ? vscode.workspace.notebookDocuments.find((d) => d.uri.toString() === target.key)
+    : undefined;
+  if (!notebookDoc) {
+    const candidates = vscode.workspace.notebookDocuments.filter(
+      (d) => d.notebookType === NOTEBOOK_TYPE && findCameraCell(d, bindings)
+    );
+    if (candidates.length === 1) notebookDoc = candidates[0];
+    else if (candidates.length > 1)
+      throw new Error(`${candidates.length} open notebooks define 'let ${bindings[0]}' — run the plot's cell once to disambiguate`);
+  }
+  if (!notebookDoc) throw new Error(`no open Blade notebook defines 'let ${bindings[0]} = …' for plot "${plotId}"`);
 
   const cameraCell = findCameraCell(notebookDoc, bindings);
   if (!cameraCell) throw new Error(`no cell defines \`let ${bindings[0]} = …\` — cannot rewrite the camera`);
@@ -616,6 +628,7 @@ async function onPlotZoom({ plotId, bindings, cx, cy, r }) {
   edit.replace(doc.uri, new vscode.Range(0, 0, doc.lineCount - 1, lastLine.text.length), text);
   const applied = await vscode.workspace.applyEdit(edit);
   if (!applied) throw new Error("could not rewrite the camera cell");
+  if (!notebookController) throw new Error("notebook controller not initialized");
 
   // Re-run the CAMERA CELL ONLY. Rebinding splices the new camera values
   // ahead of everything downstream, and a Blade session re-runs its whole
@@ -742,6 +755,14 @@ async function executeCell(cell, notebookDoc, controller) {
   // startLiveStream). Disposed in the finally below — including on the error
   // path, which returns from inside the try.
   const live = startLiveStream(execution);
+  // Live camera-frame registration: a stable-id figure is forwarded the
+  // moment it is emitted and never reaches resp.display, so the
+  // response-side recordZoomTargets below cannot see it. Watch the bus for
+  // the duration of this eval and record camera-carrying frames against
+  // THIS cell.
+  const zoomSub = display.subscribe((frame) => {
+    recordZoomTargets(execution, [frame]);
+  });
   try {
     resp = await client.eval(key, source, cwd, evalTimeoutMs());
   } catch (e) {
@@ -766,6 +787,7 @@ async function executeCell(cell, notebookDoc, controller) {
     return;
   } finally {
     live.dispose();
+    zoomSub.dispose();
   }
 
   await applyEvalResult(execution, resp, source, state);
