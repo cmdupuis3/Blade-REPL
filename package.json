@@ -188,7 +188,8 @@
       },
       {
         "command": "blade.notebookRestart",
-        "title": "Blade: Restart Notebook Kernel"
+        "title": "Blade: Restart Notebook Kernel",
+        "icon": "$(debug-restart)"
       },
       {
         "command": "blade.plotDemo",

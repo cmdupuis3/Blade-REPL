@@ -798,19 +798,41 @@ function interruptHandler(notebookDoc) {
  *  first-time frames (docs/display-frames.md §10). */
 async function resetNotebookSession(notebookDoc) {
   const key = notebookDoc.uri.toString();
-  const client = clientFor(notebookDoc);
   const state = sessionStateFor(key);
-  try {
-    await client.resetSession(key);
-    unsupported.delete(key);
-  } catch (e) {
-    if (e && e.protocolError) unsupported.add(key);
-    // Transport failure: state still gets cleared locally below — the next
-    // eval will lazily reconnect and start a fresh session either way.
+  // A "Restart Kernel" must restart the KERNEL. The old implementation only
+  // sent resetSession into the existing process -- which cannot help in the
+  // case a user actually reaches for this button (a wedged, slow, or simply
+  // mistrusted process), because that request queues behind whatever is
+  // stuck. So: ask for a clean session reset first (cheap, and it lets a
+  // healthy process report an old-compiler protocol error), then DISPOSE the
+  // client outright. clientFor() lazily respawns on the next execution.
+  let protocolFailure = false;
+  const client = clients.get(key);
+  if (client) {
+    try {
+      await client.resetSession(key);
+    } catch (e) {
+      if (e && e.protocolError) protocolFailure = true;
+      // Any other failure is a dead/wedged transport -- exactly what the
+      // dispose below is for.
+    }
+    try {
+      client.dispose();
+    } catch (_) {
+      /* already gone */
+    }
+    clients.delete(key);
   }
+  if (protocolFailure) unsupported.add(key);
+  else unsupported.delete(key);
   state.keptSources = [];
   state.needsReplay = false;
   state.seenFrameIds = new Set();
+  // Zoom targets name cells of a session that no longer exists; a gesture
+  // against one would re-run cells into a fresh session that never built them.
+  for (const [plotId, target] of zoomTargets) {
+    if (target.key === key) zoomTargets.delete(plotId);
+  }
 }
 
 // --- Session-aware IDE features (N3): compiler-assembled check + fan-out ---
@@ -1139,10 +1161,38 @@ async function commandOpenAsNotebook() {
   await vscode.window.showNotebookDocument(doc);
 }
 
-async function commandRestart() {
-  const editor = vscode.window.activeNotebookEditor;
-  if (!editor || editor.notebook.notebookType !== NOTEBOOK_TYPE) return;
-  await resetNotebookSession(editor.notebook);
+/** The notebook a restart should target. A notebook/toolbar button passes
+ *  its own context ({notebookEditor:{notebookUri}}); the command palette
+ *  passes nothing and we fall back to the active editor. Resolving both is
+ *  what keeps the toolbar button working when focus sits in a cell editor. */
+function notebookForRestart(arg) {
+  const active = vscode.window.activeNotebookEditor;
+  if (active && active.notebook && active.notebook.notebookType === NOTEBOOK_TYPE) return active.notebook;
+  const uri =
+    (arg && arg.notebookEditor && arg.notebookEditor.notebookUri) ||
+    (arg && arg.notebookUri) ||
+    (arg && arg.uri);
+  if (uri) {
+    const want = uri.toString();
+    for (const doc of vscode.workspace.notebookDocuments) {
+      if (doc.uri.toString() === want && doc.notebookType === NOTEBOOK_TYPE) return doc;
+    }
+  }
+  return undefined;
+}
+
+async function commandRestart(arg) {
+  const notebookDoc = notebookForRestart(arg);
+  if (!notebookDoc) {
+    vscode.window.showWarningMessage("Blade: no Blade notebook is active to restart.");
+    return;
+  }
+  await resetNotebookSession(notebookDoc);
+  // Feedback is the feature. A silent restart is indistinguishable from a
+  // dead button -- which is exactly how this one was reported.
+  const name = path.basename(notebookDoc.uri.fsPath || notebookDoc.uri.path || "notebook");
+  if (deps && deps.output) deps.output.appendLine(`[blade notebook] kernel restarted: ${name}`);
+  vscode.window.setStatusBarMessage("Blade: notebook kernel restarted", 3000);
 }
 
 // --- Activation ---------------------------------------------------------------
@@ -1233,6 +1283,8 @@ module.exports._test = {
   commandNewNotebook,
   commandOpenAsNotebook,
   commandRestart,
+  notebookForRestart,
+  resetNotebookSession,
   // Zoom-to-recompute.
   zoomTargets,
   recordZoomTargets,

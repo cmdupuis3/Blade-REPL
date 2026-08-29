@@ -971,6 +971,60 @@ async function testApplyEvalResultWithRealCell() {
   _test.zoomTargets.clear();
 }
 
+/** "Restart Notebook Kernel" was reported as a dead button. It was not dead —
+ *  it was SILENT and it did not restart the kernel: it only sent resetSession
+ *  into the existing process (useless in the wedged case that makes a user
+ *  click it) and told nobody it had run. These pin the corrected contract. */
+async function testRestartDisposesTheClient() {
+  const fakeUri = mock.Uri.parse("file:///restart-dispose.bladenb");
+  const notebookDoc = { uri: fakeUri, notebookType: "blade-notebook" };
+  const key = fakeUri.toString();
+
+  let disposed = 0;
+  let resetCalls = 0;
+  _test.clients.set(key, {
+    resetSession: () => { resetCalls++; return Promise.resolve({ ok: true }); },
+    dispose: () => { disposed++; },
+  });
+  const state = _test.sessionStateFor(key);
+  state.keptSources = ["let a = 1", "let b = 2"];
+  state.needsReplay = true;
+  state.seenFrameIds.add("F1");
+  _test.zoomTargets.set("mandelbrot-view", { key, cellIndex: 2 });
+  _test.zoomTargets.set("other-notebook-plot", { key: "file:///elsewhere.bladenb", cellIndex: 0 });
+
+  await _test.resetNotebookSession(notebookDoc);
+
+  check("restart: asked the session to reset", resetCalls === 1, resetCalls);
+  check("restart: DISPOSED the client (a real kernel restart)", disposed === 1, disposed);
+  check("restart: dropped the client so the next run respawns", !_test.clients.has(key), _test.clients.has(key));
+  check("restart: cleared keptSources (no replay of a dead session)", state.keptSources.length === 0, state.keptSources);
+  check("restart: cleared needsReplay", state.needsReplay === false, state.needsReplay);
+  check("restart: cleared seenFrameIds", state.seenFrameIds.size === 0, state.seenFrameIds.size);
+  check("restart: dropped THIS notebook's zoom targets", !_test.zoomTargets.has("mandelbrot-view"));
+  check("restart: left another notebook's zoom targets alone", _test.zoomTargets.has("other-notebook-plot"));
+  _test.zoomTargets.clear();
+}
+
+/** The toolbar passes its own context object, not the active editor. Resolving
+ *  only via activeNotebookEditor is how a toolbar button silently no-ops. */
+function testNotebookForRestartResolvesToolbarArg() {
+  const uri = mock.Uri.parse("file:///toolbar-target.bladenb");
+  const doc = { uri, notebookType: "blade-notebook" };
+  const prevDocs = mock.workspace.notebookDocuments;
+  const prevActive = mock.window.activeNotebookEditor;
+  mock.workspace.notebookDocuments = [doc];
+  mock.window.activeNotebookEditor = undefined;
+
+  const viaToolbar = _test.notebookForRestart({ notebookEditor: { notebookUri: uri } });
+  check("restart target: resolved from the toolbar's context arg", viaToolbar === doc, !!viaToolbar);
+  const viaNothing = _test.notebookForRestart(undefined);
+  check("restart target: no active editor and no arg -> undefined (warned, not silent)", viaNothing === undefined, viaNothing);
+
+  mock.workspace.notebookDocuments = prevDocs;
+  mock.window.activeNotebookEditor = prevActive;
+}
+
 // --- Run -----------------------------------------------------------------------
 
 (async () => {
@@ -1010,6 +1064,8 @@ async function testApplyEvalResultWithRealCell() {
   testRewriteCameraSource();
   testRecordZoomTargets();
   await testApplyEvalResultWithRealCell();
+  await testRestartDisposesTheClient();
+  testNotebookForRestartResolvesToolbarArg();
 
   if (failures) {
     console.error(`\n${failures} notebook check(s) failed.`);
