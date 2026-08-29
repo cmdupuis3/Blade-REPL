@@ -1057,8 +1057,49 @@ async function testZoomHostFlow() {
   // The generated webview script carries the gesture filter and the gate.
   const js = _p.webviewScript();
   check("zoom webview: relayout listener attached once", js.indexOf("plotly_relayout") !== -1 && js.indexOf("zoomHooked") !== -1);
+  check("zoom webview: wheel zoom enabled", js.indexOf("scrollZoom: true") !== -1);
+  check("zoom webview: settle debounce present", js.indexOf("ZOOM_SETTLE_MS") !== -1 && js.indexOf("clearTimeout(zoomTimer)") !== -1);
+  check("zoom webview: only the LATEST gesture survives the debounce", js.indexOf("zoomLatest") !== -1);
   check("zoom webview: requires all four explicit range keys", js.indexOf("xaxis.range[0]") !== -1 && js.indexOf("yaxis.range[1]") !== -1);
   check("zoom webview: gated on the layout contract", js.indexOf("blade_camera") !== -1);
+}
+
+/** A gesture during a recompute must supersede, not drop: the LATEST camera
+ *  fires when the current recompute settles, intermediates never run. */
+async function testZoomSupersede() {
+  const calls = [];
+  let release;
+  const gate = new Promise((r) => (release = r));
+  _p.setDeps({
+    output: { appendLine: () => {} },
+    onPlotZoom: (req) => {
+      calls.push(req.r);
+      return calls.length === 1 ? gate : Promise.resolve();
+    },
+  });
+  display.ingestReplText(
+    display.encodeReplLine({ mime: display.PLOTLY_MIME, data: cameraSpec("cam_cx,cam_cy,cam_r"), meta: { id: "sup-view" } }),
+    "repl"
+  );
+  const panels = mock.window._webviewPanels;
+  const panel = panels[panels.length - 1];
+  panel.webview._send({ type: "ready" });
+
+  // First gesture starts a slow recompute; two more arrive while it runs.
+  panel.webview._send({ type: "zoom", xr: [0, 2], yr: [0, 2] });      // r=1
+  await Promise.resolve();
+  panel.webview._send({ type: "zoom", xr: [0, 1], yr: [0, 1] });      // r=0.5 (superseded)
+  panel.webview._send({ type: "zoom", xr: [0, 0.5], yr: [0, 0.5] });  // r=0.25 (latest)
+  await Promise.resolve();
+  check("supersede: only the first recompute ran so far", calls.length === 1, calls);
+
+  release();
+  await Promise.resolve();
+  await Promise.resolve();
+  await Promise.resolve();
+  check("supersede: exactly one follow-up ran", calls.length === 2, calls);
+  check("supersede: and it carried the LATEST camera (r=0.25)", Math.abs(calls[1] - 0.25) < 1e-12, calls);
+  check("supersede: inflight fully released", _p.zoomInflight.size === 0, [..._p.zoomInflight]);
 }
 
 // --- 8. Notebook renderer contribution ---------------------------------------
@@ -1158,6 +1199,7 @@ async function testRendererContribution() {
   await testStreamPanel();
   testZoomContract();
   await testZoomHostFlow();
+  await testZoomSupersede();
 
   if (failures) {
     console.error(`\n${failures} plot check(s) failed.`);

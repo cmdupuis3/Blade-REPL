@@ -694,19 +694,28 @@ function webviewScript() {
     "    var spec = frame.data || {};",
     "    var traces = spec.data || [];",
     "    var layout = mergeLayout(themeLayout(), spec.layout);",
-    "    var config = Object.assign({ responsive: true, displaylogo: false }, spec.config || {});",
+    "    var config = Object.assign({ responsive: true, displaylogo: false, scrollZoom: true }, spec.config || {});",
     "    showOnly(elPlot);",
     "    var call = plotted ? Plotly.react : Plotly.newPlot;",
     "    return call(elPlot, traces, layout, config).then(function () { plotted = true; attachZoom(); });",
     "  }",
     "",
-    // Zoom-to-recompute (docs/plot-zoom-reeval.md): a drag-zoom on a figure
-    // whose layout carries a `blade_camera` contract is reported to the host,
-    // which maps it back onto the camera bindings and re-evaluates. Only a
-    // gesture qualifies: the four explicit range keys appear together exactly
-    // when plotly resolves a user zoom/pan; programmatic relayouts (theme,
-    // epoch markers, autorange resets) carry other keys and fall through.
+    // Zoom-to-recompute (docs/plot-zoom-reeval.md): a zoom on a figure whose
+    // layout carries a `blade_camera` contract is reported to the host, which
+    // maps it back onto the camera bindings and re-evaluates. Only a gesture
+    // qualifies: the four explicit range keys appear together exactly when
+    // plotly resolves a user zoom/pan; programmatic relayouts (theme, epoch
+    // markers, autorange resets) carry other keys and fall through.
+    //
+    // DEBOUNCED: wheel zoom (scrollZoom above) fires one relayout per tick,
+    // and a recompute costs seconds — so the LATEST ranges are held until
+    // ZOOM_SETTLE_MS pass without another tick, i.e. until the user stops
+    // scrolling, and only then does one gesture reach the host. A drag-zoom
+    // fires once and simply pays the settle delay.
     // Attached once — plotly keeps the listener across Plotly.react calls.
+    "  var ZOOM_SETTLE_MS = 450;",
+    "  var zoomTimer = null;",
+    "  var zoomLatest = null;",
     "  function attachZoom() {",
     "    if (zoomHooked || typeof elPlot.on !== 'function') return;",
     "    zoomHooked = true;",
@@ -717,7 +726,12 @@ function webviewScript() {
     "      if (x0 === undefined || x1 === undefined || y0 === undefined || y1 === undefined) return;",
     "      var lay = current && current.frame && current.frame.data && current.frame.data.layout;",
     "      if (!lay || !lay.blade_camera) return;",
-    "      api.postMessage({ type: 'zoom', xr: [Number(x0), Number(x1)], yr: [Number(y0), Number(y1)] });",
+    "      zoomLatest = { type: 'zoom', xr: [Number(x0), Number(x1)], yr: [Number(y0), Number(y1)] };",
+    "      if (zoomTimer) clearTimeout(zoomTimer);",
+    "      zoomTimer = setTimeout(function () {",
+    "        zoomTimer = null;",
+    "        if (zoomLatest) { api.postMessage(zoomLatest); zoomLatest = null; }",
+    "      }, ZOOM_SETTLE_MS);",
     "    });",
     "  }",
     "",
@@ -1026,10 +1040,12 @@ function zoomCamera(xr, yr) {
 }
 
 /** Plot ids whose zoom re-evaluation is still running: one at a time per
- *  plot — a gesture during a recompute is dropped with a note rather than
- *  queued (the serve session is serial anyway, and the newest camera always
- *  wins on the next gesture). */
+ *  plot. A gesture arriving DURING a recompute is not dropped — the latest
+ *  one is held (zoomPending) and fired when the current recompute settles,
+ *  so continuous scrolling converges on the final camera with at most one
+ *  extra recompute. Intermediate gestures are superseded, never queued. */
 const zoomInflight = new Set();
+const zoomPending = new Map();
 
 /** One zoom gesture from the webview: map it onto the current entry's camera
  *  contract and hand it to the re-evaluation hook (deps.onPlotZoom — wired to
@@ -1048,20 +1064,32 @@ function handleZoom(msg) {
   const cam = zoomCamera(msg.xr, msg.yr);
   if (!cam) return;
   if (zoomInflight.has(entry.id)) {
-    note("zoom-to-recompute: previous recompute still running — gesture dropped");
+    zoomPending.set(entry.id, cam);
+    note("zoom-to-recompute: still recomputing — latest gesture will follow");
     return;
   }
-  zoomInflight.add(entry.id);
-  note(`recomputing ${entry.id} at r = ${cam.r.toExponential(3)}…`);
-  Promise.resolve(deps.onPlotZoom({ plotId: entry.id, bindings: camera.bindings, cx: cam.cx, cy: cam.cy, r: cam.r }))
-    .then(() => {
-      zoomInflight.delete(entry.id);
-      note("");
-    })
-    .catch((e) => {
-      zoomInflight.delete(entry.id);
-      note(`zoom-to-recompute failed: ${(e && e.message) || e}`);
-    });
+  runZoom(entry.id, camera.bindings, cam);
+}
+
+/** Fire one recompute; when it settles, fire the latest gesture that arrived
+ *  while it ran (if any). The chain is at most as long as the user kept
+ *  zooming, and each link supersedes everything before it. */
+function runZoom(plotId, bindings, cam) {
+  zoomInflight.add(plotId);
+  note(`recomputing ${plotId} at r = ${cam.r.toExponential(3)}…`);
+  const settle = (message) => {
+    zoomInflight.delete(plotId);
+    const next = zoomPending.get(plotId);
+    if (next) {
+      zoomPending.delete(plotId);
+      runZoom(plotId, bindings, next);
+    } else {
+      note(message);
+    }
+  };
+  Promise.resolve(deps.onPlotZoom({ plotId, bindings, cx: cam.cx, cy: cam.cy, r: cam.r }))
+    .then(() => settle(""))
+    .catch((e) => settle(`zoom-to-recompute failed: ${(e && e.message) || e}`));
 }
 
 /** Ask the warm serve process to render `entry`'s spec with GR. The response

@@ -12,7 +12,7 @@ A program opts a figure in with two `plot.heatmap` slots (stdlib
 `plot.blade`):
 
 ```blade
-plot.heatmap(xs, ys, z,
+plot.contourf(xs, ys, z, 24: levels,
     "mandelbrot-view": plotid,            // stable meta.id -> re-emits REPLACE
     "cam_cx,cam_cy,cam_r": camera)        // the bindings that position the view
 ```
