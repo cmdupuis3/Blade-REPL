@@ -400,7 +400,13 @@ function appendFrame(hist, frame) {
       if (meta.spec !== undefined) entry.spec = meta.spec;
       // A re-render never revokes the original request, only restates it.
       if (prefer) entry.prefer = prefer;
-      hist.cursor = idx;
+      // A MERGE does not move the cursor. A Blade session re-runs every
+      // accumulated snippet, so one cell eval re-emits EVERY earlier plot;
+      // if each replayed frame stole focus, the panel would end every eval
+      // showing whichever plot happened to re-emit last -- during a
+      // zoom-to-recompute, that was reliably some other figure entirely.
+      // The updated render is retained either way; onFrame repaints when
+      // the merged entry is the one on screen.
       return { entry, index: idx, merged: true };
     }
   }
@@ -1279,6 +1285,10 @@ function onFrame(frame, origin) {
   }
 
   log(`${res.merged ? "merged" : "added"} ${frame.mime} from ${origin} — ${res.entry.title} (${history.entries.length} in history)`);
+  // A background merge (a replayed frame updating an entry that is not on
+  // screen) is bookkeeping, not an event: no reveal, no repaint, no backend
+  // switching. Navigating to it later shows the updated render.
+  if (res.merged && res.index !== history.cursor) return;
   ensurePanel();
   panel.reveal(vscode.ViewColumn.Beside, true);
 

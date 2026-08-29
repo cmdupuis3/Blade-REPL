@@ -617,14 +617,17 @@ async function onPlotZoom({ plotId, bindings, cx, cy, r }) {
   const applied = await vscode.workspace.applyEdit(edit);
   if (!applied) throw new Error("could not rewrite the camera cell");
 
-  // Re-run: the camera cell (rebinding the three names in the session), then
-  // the frame cell, which recomputes and re-emits under the stable id. When
-  // one cell is both, once is enough.
+  // Re-run the CAMERA CELL ONLY. Rebinding splices the new camera values
+  // ahead of everything downstream, and a Blade session re-runs its whole
+  // accumulated program on every eval -- so this one execution already
+  // recomputes the frame binding at the new camera and re-emits it under
+  // the stable id. Running the frame cell afterwards (the original design)
+  // recomputed everything a SECOND time: gestures took twice their cost,
+  // and the replayed emission re-recorded the plot as coming from the
+  // camera cell, quietly corrupting this registry's cellIndex. The
+  // cellIndex is therefore treated as informational; the recompute rides
+  // the session's own replay semantics.
   await executeCell(cameraCell, notebookDoc, notebookController);
-  const frameCell = notebookDoc.cellAt(target.cellIndex);
-  if (frameCell && frameCell.index !== cameraCell.index) {
-    await executeCell(frameCell, notebookDoc, notebookController);
-  }
 }
 
 // --- Session / client bookkeeping ---------------------------------------------

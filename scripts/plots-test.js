@@ -1043,10 +1043,13 @@ async function testZoomHostFlow() {
   check("zoom flow: no contract, no hook call", zooms.length === 1, zooms.length);
 
   // A failing hook surfaces as a note and releases the inflight guard.
+  // The re-ingest above MERGED (same id), and a merge no longer moves the
+  // cursor -- so step back onto the camera entry the way a user would.
   display.ingestReplText(
     display.encodeReplLine({ mime: display.PLOTLY_MIME, data: cameraSpec("cam_cx,cam_cy,cam_r"), meta: { id: "mandel-view" } }),
     "repl"
   );
+  _p.history.cursor = _p.history.entries.findIndex((e) => e.id === "mandel-view");
   failNext = true;
   panel.webview._send({ type: "zoom", xr: [0, 1], yr: [0, 1] });
   await Promise.resolve();
@@ -1062,6 +1065,33 @@ async function testZoomHostFlow() {
   check("zoom webview: only the LATEST gesture survives the debounce", js.indexOf("zoomLatest") !== -1);
   check("zoom webview: requires all four explicit range keys", js.indexOf("xaxis.range[0]") !== -1 && js.indexOf("yaxis.range[1]") !== -1);
   check("zoom webview: gated on the layout contract", js.indexOf("blade_camera") !== -1);
+}
+
+/** THE replay glitch, pinned: a session re-runs every accumulated snippet,
+ *  so one cell eval re-emits every earlier plot. A replayed MERGE must not
+ *  steal the panel cursor -- with the old behavior, every recompute ended
+ *  with the panel showing whichever plot re-emitted last, not the zoom view. */
+function testMergeDoesNotStealCursor() {
+  _p.setDeps({ output: { appendLine: () => {} } });
+  const mk = (id, title) => display.encodeReplLine({
+    mime: display.PLOTLY_MIME,
+    data: { data: [{ type: "contour", z: [[1, 2]] }], layout: { title: { text: title } } },
+    meta: { id },
+  });
+  display.ingestReplText(mk("steal-a", "view A"), "repl");
+  display.ingestReplText(mk("steal-b", "view B"), "repl");
+  // Navigate back to A -- the user is looking at A.
+  _p.history.cursor = _p.history.entries.findIndex((e) => e.id === "steal-a");
+  const at = _p.history.cursor;
+  // A replayed re-emission of B (a MERGE) arrives, as session replay does.
+  display.ingestReplText(mk("steal-b", "view B"), "repl");
+  check("merge: cursor stays on the entry being viewed", _p.history.cursor === at, _p.history.cursor);
+  // A merge into the CURRENT entry keeps the cursor too (and repaints).
+  display.ingestReplText(mk("steal-a", "view A"), "repl");
+  check("merge: updating the viewed entry keeps the cursor", _p.history.cursor === at, _p.history.cursor);
+  // A genuinely NEW plot still takes focus.
+  display.ingestReplText(mk("steal-c", "view C"), "repl");
+  check("append: a new plot still takes focus", _p.history.entries[_p.history.cursor].id === "steal-c", _p.history.cursor);
 }
 
 /** A gesture during a recompute must supersede, not drop: the LATEST camera
@@ -1200,6 +1230,7 @@ async function testRendererContribution() {
   testZoomContract();
   await testZoomHostFlow();
   await testZoomSupersede();
+  testMergeDoesNotStealCursor();
 
   if (failures) {
     console.error(`\n${failures} plot check(s) failed.`);
