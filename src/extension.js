@@ -2846,8 +2846,15 @@ function activate(context) {
   // Plots panel: subscribes to the display-frame hub and registers
   // blade.plotDemo. Frames reach it through the hub, never through this
   // module; the extra deps are the GR round-trip — findGr gates the toolbar
-  // toggle, renderPlot is the serve request behind it.
-  plots.init(context, { output, findGr, renderPlot: (args, opts) => serve.renderPlot(args, opts) });
+  // toggle, renderPlot is the serve request behind it — and the
+  // zoom-to-recompute hook, which hands a camera-carrying figure's drag-zoom
+  // to the notebook module (docs/plot-zoom-reeval.md).
+  plots.init(context, {
+    output,
+    findGr,
+    renderPlot: (args, opts) => serve.renderPlot(args, opts),
+    onPlotZoom: (req) => notebook.onPlotZoom(req),
+  });
 
   const cfg = () => vscode.workspace.getConfiguration("blade");
 

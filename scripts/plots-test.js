@@ -969,6 +969,98 @@ function testStreamWebviewScript() {
   })());
 }
 
+// --- 7b. Zoom-to-recompute (docs/plot-zoom-reeval.md) --------------------------
+
+function cameraSpec(bindings) {
+  return {
+    data: [{ type: "heatmap", z: [[1, 2], [3, 4]] }],
+    layout: { title: { text: "view" }, blade_camera: { bindings } },
+  };
+}
+
+function testZoomContract() {
+  // cameraFromSpec: the contract's happy path and every malformed shape.
+  const good = _p.cameraFromSpec(cameraSpec("cam_cx, cam_cy ,cam_r"));
+  check("zoom contract: three trimmed binding names", !!good && good.bindings.join("|") === "cam_cx|cam_cy|cam_r", good);
+  check("zoom contract: no layout entry -> null", _p.cameraFromSpec({ layout: {} }) === null);
+  check("zoom contract: null spec -> null", _p.cameraFromSpec(null) === null);
+  check("zoom contract: two names -> null", _p.cameraFromSpec(cameraSpec("a,b")) === null);
+  check("zoom contract: non-identifier -> null", _p.cameraFromSpec(cameraSpec("a,b,c-d")) === null);
+  check("zoom contract: non-string bindings -> null", _p.cameraFromSpec({ layout: { blade_camera: { bindings: 3 } } }) === null);
+
+  // zoomCamera: center + larger-half-span rule, and the degenerate guards.
+  const cam = _p.zoomCamera([-1, 3], [10, 12]);
+  check("zoom camera: center of the selection", !!cam && cam.cx === 1 && cam.cy === 11, cam);
+  check("zoom camera: r is the larger half-span", !!cam && cam.r === 2, cam);
+  const inv = _p.zoomCamera([3, -1], [12, 10]); // inverted axes still measure a span
+  check("zoom camera: inverted ranges still zoom", !!inv && inv.r === 2 && inv.cx === 1, inv);
+  check("zoom camera: zero-area selection -> null", _p.zoomCamera([1, 1], [2, 2]) === null);
+  check("zoom camera: non-finite -> null", _p.zoomCamera([NaN, 1], [0, 1]) === null);
+}
+
+async function testZoomHostFlow() {
+  const notes = [];
+  const zooms = [];
+  let failNext = false;
+  _p.setDeps({
+    output: { appendLine: (l) => notes.push(l) },
+    onPlotZoom: (req) => {
+      zooms.push(req);
+      return failNext ? Promise.reject(new Error("no cell on record")) : Promise.resolve();
+    },
+  });
+
+  // A camera-carrying figure under a stable id becomes the current entry.
+  display.ingestReplText(
+    display.encodeReplLine({ mime: display.PLOTLY_MIME, data: cameraSpec("cam_cx,cam_cy,cam_r"), meta: { id: "mandel-view" } }),
+    "repl"
+  );
+  const panels = mock.window._webviewPanels;
+  const panel = panels[panels.length - 1];
+  panel.webview._send({ type: "ready" });
+
+  // A gesture on it reaches the hook with the contract's bindings + values.
+  panel.webview._send({ type: "zoom", xr: [-0.75, -0.73], yr: [0.12, 0.14] });
+  await Promise.resolve();
+  check("zoom flow: hook called once", zooms.length === 1, zooms.length);
+  const req = zooms[0];
+  check("zoom flow: plotId is the stable id", !!req && req.plotId === "mandel-view", req);
+  check("zoom flow: bindings from the layout contract", !!req && req.bindings.join() === "cam_cx,cam_cy,cam_r", req);
+  check("zoom flow: camera math applied", !!req && Math.abs(req.cx - -0.74) < 1e-12 && Math.abs(req.r - 0.01) < 1e-12, req);
+
+  // The recompute replaces the SAME entry: a re-emission under the id merges.
+  const entries = _p.history.entries.length;
+  display.ingestReplText(
+    display.encodeReplLine({ mime: display.PLOTLY_MIME, data: cameraSpec("cam_cx,cam_cy,cam_r"), meta: { id: "mandel-view" } }),
+    "repl"
+  );
+  check("zoom flow: recomputed frame merged, history did not grow", _p.history.entries.length === entries);
+
+  // A gesture on a figure with NO contract is plotly's own affair: no hook.
+  display.ingestReplText(display.encodeReplLine(plotlyFrame({ meta: { id: "plain-fig" } })), "repl");
+  panel.webview._send({ type: "zoom", xr: [0, 1], yr: [0, 1] });
+  await Promise.resolve();
+  check("zoom flow: no contract, no hook call", zooms.length === 1, zooms.length);
+
+  // A failing hook surfaces as a note and releases the inflight guard.
+  display.ingestReplText(
+    display.encodeReplLine({ mime: display.PLOTLY_MIME, data: cameraSpec("cam_cx,cam_cy,cam_r"), meta: { id: "mandel-view" } }),
+    "repl"
+  );
+  failNext = true;
+  panel.webview._send({ type: "zoom", xr: [0, 1], yr: [0, 1] });
+  await Promise.resolve();
+  await Promise.resolve();
+  check("zoom flow: hook failure noted", notes.some((l) => /zoom-to-recompute failed: no cell on record/.test(l)), notes.slice(-3));
+  check("zoom flow: inflight released after failure", _p.zoomInflight.size === 0, [..._p.zoomInflight]);
+
+  // The generated webview script carries the gesture filter and the gate.
+  const js = _p.webviewScript();
+  check("zoom webview: relayout listener attached once", js.indexOf("plotly_relayout") !== -1 && js.indexOf("zoomHooked") !== -1);
+  check("zoom webview: requires all four explicit range keys", js.indexOf("xaxis.range[0]") !== -1 && js.indexOf("yaxis.range[1]") !== -1);
+  check("zoom webview: gated on the layout contract", js.indexOf("blade_camera") !== -1);
+}
+
 // --- 8. Notebook renderer contribution ---------------------------------------
 //
 // Without a contributed renderer a plotly cell output degrades to the
@@ -1064,6 +1156,8 @@ async function testRendererContribution() {
   await testGrExport();
   await testPreferredBackend();
   await testStreamPanel();
+  testZoomContract();
+  await testZoomHostFlow();
 
   if (failures) {
     console.error(`\n${failures} plot check(s) failed.`);
