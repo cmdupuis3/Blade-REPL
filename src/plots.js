@@ -1057,6 +1057,13 @@ function zoomCamera(xr, yr) {
  *  extra recompute. Intermediate gestures are superseded, never queued. */
 const zoomInflight = new Set();
 const zoomPending = new Map();
+/** One-shot focus latch: armed when a gesture's recompute starts, consumed
+ *  by the FIRST camera-carrying frame that arrives (the live re-emission of
+ *  the view -- it always lands before the session's replayed frames). Field
+ *  report that forced the latch: with several plots carrying the contract,
+ *  EVERY replayed camera frame at end-of-eval stole focus back, so a zoom on
+ *  the view ended selected on the overview, repainted at default axes. */
+const zoomFocus = { armed: false };
 
 /** One zoom gesture from the webview: map it onto the current entry's camera
  *  contract and hand it to the re-evaluation hook (deps.onPlotZoom — wired to
@@ -1087,9 +1094,11 @@ function handleZoom(msg) {
  *  zooming, and each link supersedes everything before it. */
 function runZoom(plotId, bindings, cam) {
   zoomInflight.add(plotId);
+  zoomFocus.armed = true;
   note(`recomputing ${plotId} at r = ${cam.r.toExponential(3)}…`);
   const settle = (message) => {
     zoomInflight.delete(plotId);
+    zoomFocus.armed = false;
     const next = zoomPending.get(plotId);
     if (next) {
       zoomPending.delete(plotId);
@@ -1298,7 +1307,8 @@ function onFrame(frame, origin) {
   // a dive frame re-aims the camera, the view answers), and it takes focus.
   if (res.merged && res.index !== history.cursor) {
     const lay = frame.data && frame.data.layout;
-    if (!(zoomInflight.size > 0 && lay && lay.blade_camera)) return;
+    if (!(zoomFocus.armed && lay && lay.blade_camera)) return;
+    zoomFocus.armed = false;
     history.cursor = res.index;
   }
   ensurePanel();
@@ -1434,6 +1444,7 @@ module.exports._test = {
   zoomCamera,
   handleZoom,
   zoomInflight,
+  zoomFocus,
   // Streams.
   STREAM_MIME,
   STREAM_DRAW_LIMIT,

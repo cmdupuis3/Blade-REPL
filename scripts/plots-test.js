@@ -1087,12 +1087,17 @@ async function testZoomAnswerTakesFocus() {
   const at = _p.history.cursor;
   display.ingestReplText(camFrame("answer-view"), "repl");
   check("answer focus: background camera merge stays put when idle", _p.history.cursor === at, _p.history.cursor);
-  // With a recompute in flight, the same merge takes focus.
-  _p.zoomInflight.add("answer-dive");
+  // With the focus latch ARMED, the first camera merge takes focus...
+  _p.zoomFocus.armed = true;
   display.ingestReplText(camFrame("answer-view"), "repl");
   const vi = _p.history.entries.findIndex((e) => e.id === "answer-view");
-  check("answer focus: in-flight recompute's frame takes focus", _p.history.cursor === vi, _p.history.cursor);
-  _p.zoomInflight.delete("answer-dive");
+  check("answer focus: armed latch -> first camera frame takes focus", _p.history.cursor === vi, _p.history.cursor);
+  check("answer focus: the latch is CONSUMED by that frame", _p.zoomFocus.armed === false, _p.zoomFocus.armed);
+  // ...and every later camera-carrying replay (overview, money, dive
+  // installments) stays a background merge -- the field bug was each of
+  // them stealing focus back in turn.
+  display.ingestReplText(camFrame("answer-dive"), "repl");
+  check("answer focus: a later camera replay does NOT steal focus", _p.history.cursor === vi, _p.history.cursor);
 }
 
 /** THE replay glitch, pinned: a session re-runs every accumulated snippet,
