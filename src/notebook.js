@@ -628,6 +628,45 @@ async function onPlotZoom({ plotId, bindings, cx, cy, r }) {
   edit.replace(doc.uri, new vscode.Range(0, 0, doc.lineCount - 1, lastLine.text.length), text);
   const applied = await vscode.workspace.applyEdit(edit);
   if (!applied) throw new Error("could not rewrite the camera cell");
+  // THE RENDER FAST PATH. Rewriting the cell above is what
+  // keeps the notebook truthful; this is what makes the picture arrive in
+  // time. `render` recomputes the session under the new camera from an
+  // executable the compiler built ONCE -- the camera is erased out of the
+  // compiled program into a run-time read, so moving the lens recompiles
+  // nothing. Measured ~415ms a gesture against ~5.5s for the evaluation
+  // below, which is what fits a full-resolution recompute inside the pause
+  // the panel already waits for a scroll to settle.
+  //
+  // Every way it can fail -- a compiler predating the command, no g++, a
+  // session that has evaluated nothing, a camera name the erasure cannot pin
+  // down to one binding -- falls through to that evaluation, which is slower
+  // and correct. The cell text is rewritten either way, so a fallback costs
+  // speed and never truth.
+  const fastClient = clientFor(notebookDoc);
+  if (fastClient && typeof fastClient.render === "function") {
+    try {
+      const res = await fastClient.render(
+        notebookDoc.uri.toString(),
+        bindings,
+        [cx, cy, r],
+        notebookCwd(notebookDoc),
+        { timeoutMs: evalTimeoutMs() }
+      );
+      if (res && res.ok) {
+        // The picture and the cell now agree, but the SESSION still holds the
+        // camera it was last evaluated with -- this lane never touched it.
+        // Left alone, the user's next evaluation would replay that old camera
+        // and yank the panel back to where it was. So hand the rewritten cell
+        // to the next eval, which runs it first and puts the session back in
+        // step (a rebind splices by name, so position does not matter).
+        sessionStateFor(notebookDoc.uri.toString()).pendingCamera = text;
+        return;
+      }
+    } catch (_) {
+      // Fall through to the evaluation below.
+    }
+  }
+
   if (!notebookController) throw new Error("notebook controller not initialized");
 
   // Re-run the CAMERA CELL ONLY. Rebinding splices the new camera values
@@ -688,7 +727,11 @@ function clientFor(notebookDoc) {
 
 function sessionStateFor(key) {
   let s = sessionStates.get(key);
-  if (!s) sessionStates.set(key, (s = { keptSources: [], needsReplay: false, seenFrameIds: new Set() }));
+  if (!s)
+    sessionStates.set(
+      key,
+      (s = { keptSources: [], needsReplay: false, seenFrameIds: new Set(), pendingCamera: null })
+    );
   return s;
 }
 
@@ -764,6 +807,20 @@ async function executeCell(cell, notebookDoc, controller) {
     recordZoomTargets(execution, [frame]);
   });
   try {
+    // A render-fast-path gesture rewrote the camera cell without telling the
+    // session. Run it now, before this cell, so the session's camera is the
+    // one the notebook shows -- otherwise this eval replays the old camera
+    // and the panel jumps back to where the user zoomed away from.
+    if (state.pendingCamera) {
+      const pending = state.pendingCamera;
+      state.pendingCamera = null;
+      try {
+        const r = await client.eval(key, pending, cwd, evalTimeoutMs());
+        if (r && r.kept) state.keptSources.push(pending);
+      } catch (_) {
+        // Best effort: this cell's own eval below reports anything real.
+      }
+    }
     resp = await client.eval(key, source, cwd, evalTimeoutMs());
   } catch (e) {
     if (e && e.protocolError) {

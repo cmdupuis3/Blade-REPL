@@ -1058,6 +1058,105 @@ async function testZoomTargetFromLiveFrame() {
   mock.workspace.notebookDocuments = prevDocs;
 }
 
+/** THE RENDER FAST PATH. A gesture does two things: it rewrites the camera
+ *  cell (which is what keeps the notebook truthful) and then asks the
+ *  compiler to recompute from an already-built executable (which is what
+ *  makes the picture arrive in time). Pinned here: the fast path is taken
+ *  when the client offers it, it carries the gesture verbatim, a failure
+ *  falls back to re-running the cell, and a SUCCESS leaves the rewritten
+ *  camera for the next eval to settle -- without which the next evaluation
+ *  replays the old camera and yanks the panel back where the user zoomed
+ *  away from. */
+async function testRenderFastPath() {
+  const KEY = "nb://fast";
+  const camText = "let cam_cx = -0.5\nlet cam_cy = 0.25\nlet cam_r = 0.004\n";
+  const mkDoc = () => {
+    let text = camText;
+    const cell = {
+      kind: mock.NotebookCellKind.Code,
+      index: 3,
+      document: {
+        uri: { toString: () => KEY + "#3" },
+        getText: () => text,
+        get lineCount() { return text.split("\n").length; },
+        lineAt: (n) => ({ text: text.split("\n")[n] || "" }),
+      },
+    };
+    const doc = {
+      uri: { toString: () => KEY },
+      notebookType: _test.NOTEBOOK_TYPE,
+      getCells: () => [cell],
+    };
+    cell.notebook = doc;
+    return doc;
+  };
+
+  const prevDocs = mock.workspace.notebookDocuments;
+  const doc = mkDoc();
+  mock.workspace.notebookDocuments = [doc];
+  _test.zoomTargets.clear();
+  _test.clients.clear();
+  _test.sessionStates.clear();
+
+  // 1. Preferred when offered, and it carries the gesture verbatim.
+  const calls = [];
+  _test.clients.set(KEY, {
+    render: (session, bindings, values) => {
+      calls.push({ session, bindings, values });
+      return Promise.resolve({ ok: true, cached: true, frames: 21 });
+    },
+  });
+  await _test.onPlotZoom({
+    plotId: "mandelbrot-view", bindings: ["cam_cx", "cam_cy", "cam_r"],
+    cx: -0.75, cy: 0.13, r: 0.002,
+  });
+  check("render fast path: taken when the client offers it", calls.length === 1, calls.length);
+  check("render fast path: carries the session key", calls[0] && calls[0].session === KEY, calls[0]);
+  check(
+    "render fast path: carries the camera positionally",
+    calls[0] && JSON.stringify(calls[0].values) === JSON.stringify([-0.75, 0.13, 0.002]),
+    calls[0] && calls[0].values
+  );
+  // The session was never re-evaluated, so the rewritten camera is owed to it.
+  const st = _test.sessionStates.get(KEY);
+  check(
+    "render fast path: the rewritten camera is left for the next eval",
+    !!st && typeof st.pendingCamera === "string" && /cam_r\s*=\s*0.002/.test(st.pendingCamera),
+    st && st.pendingCamera
+  );
+
+  // 2. A failing fast path falls back to re-running the cell. Pinned by the
+  //    error the fallback raises with no controller wired -- reaching it at
+  //    all is the proof, and it is exactly what an old compiler would do.
+  const doc2 = mkDoc();
+  mock.workspace.notebookDocuments = [doc2];
+  _test.sessionStates.clear();
+  _test.clients.set(KEY, {
+    render: () => Promise.reject(Object.assign(new Error("unknown cmd"), { protocolError: true })),
+  });
+  let err = null;
+  try {
+    await _test.onPlotZoom({
+      plotId: "mandelbrot-view", bindings: ["cam_cx", "cam_cy", "cam_r"],
+      cx: -0.75, cy: 0.13, r: 0.002,
+    });
+  } catch (e) { err = e; }
+  check(
+    "render fast path: a protocol error falls back to re-running the cell",
+    !!err && /controller not initialized/.test(err.message),
+    err && err.message
+  );
+  check(
+    "render fast path: a fallback owes the session nothing",
+    !(_test.sessionStates.get(KEY) || {}).pendingCamera,
+    (_test.sessionStates.get(KEY) || {}).pendingCamera
+  );
+
+  mock.workspace.notebookDocuments = prevDocs;
+  _test.clients.clear();
+  _test.sessionStates.clear();
+}
+
 // --- Run -----------------------------------------------------------------------
 
 (async () => {
@@ -1100,6 +1199,7 @@ async function testZoomTargetFromLiveFrame() {
   await testRestartDisposesTheClient();
   testNotebookForRestartResolvesToolbarArg();
   await testZoomTargetFromLiveFrame();
+  await testRenderFastPath();
 
   if (failures) {
     console.error(`\n${failures} notebook check(s) failed.`);

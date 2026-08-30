@@ -1080,6 +1080,16 @@ async function testZoomAnswerTakesFocus() {
     data: cameraSpec("cam_cx,cam_cy,cam_r"),
     meta: { id },
   });
+  // The same, but SHOWING a window: an x axis spanning [cx-r, cx+r]. What
+  // makes a frame the answer to a gesture is that it renders the window the
+  // gesture asked for, not that it arrived first.
+  const camFrameAt = (id, cx, r) => {
+    const spec = cameraSpec("cam_cx,cam_cy,cam_r");
+    const n = 8;
+    const xs = Array.from({ length: n }, (_, i) => cx - r + (2 * r * i) / (n - 1));
+    spec.data = [{ type: "heatmap", x: xs, y: xs, z: [[1, 2]] }];
+    return display.encodeReplLine({ mime: display.PLOTLY_MIME, data: spec, meta: { id } });
+  };
   display.ingestReplText(camFrame("answer-view"), "repl");
   display.ingestReplText(camFrame("answer-dive"), "repl");
   // Viewing the dive; a background camera merge WITHOUT inflight stays put.
@@ -1087,26 +1097,45 @@ async function testZoomAnswerTakesFocus() {
   const at = _p.history.cursor;
   display.ingestReplText(camFrame("answer-view"), "repl");
   check("answer focus: background camera merge stays put when idle", _p.history.cursor === at, _p.history.cursor);
-  // With the focus latch ARMED, the first camera merge takes focus...
-  _p.zoomFocus.armed = true;
-  display.ingestReplText(camFrame("answer-view"), "repl");
+  // Register the overview too, so its later arrivals are MERGES rather than
+  // appends (a genuinely new plot takes focus by its own rule).
+  const WANT = { cx: 0.5, cy: 0.0, r: 0.25 };
+  display.ingestReplText(camFrameAt("answer-wide", -0.5, 2.0), "repl");
+
+  // Armed with the camera the gesture asked for, the frame that SHOWS that
+  // window takes focus...
+  _p.zoomFocus.armed = WANT;
+  display.ingestReplText(camFrameAt("answer-view", WANT.cx, WANT.r), "repl");
   const vi = _p.history.entries.findIndex((e) => e.id === "answer-view");
-  check("answer focus: armed latch -> first camera frame takes focus", _p.history.cursor === vi, _p.history.cursor);
-  check("answer focus: the latch is CONSUMED by that frame", _p.zoomFocus.armed === false, _p.zoomFocus.armed);
-  // ...and every later camera-carrying replay (overview, money, dive
-  // installments) stays a background merge -- the field bug was each of
-  // them stealing focus back in turn.
-  display.ingestReplText(camFrame("answer-dive"), "repl");
+  check("answer focus: the frame showing the requested window takes focus", _p.history.cursor === vi, _p.history.cursor);
+  check("answer focus: the latch is CONSUMED by that frame", _p.zoomFocus.armed === null, _p.zoomFocus.armed);
+  // ...and every later camera-carrying replay stays a background merge --
+  // the field bug was each of them stealing focus back in turn.
+  display.ingestReplText(camFrameAt("answer-dive", WANT.cx, WANT.r), "repl");
   check("answer focus: a later camera replay does NOT steal focus", _p.history.cursor === vi, _p.history.cursor);
+
+  // THE ORDERING HOLE the window rule closes. A recompute re-emits EVERY
+  // camera-carrying plot, in program order -- and with the camera cell last
+  // (which is what makes a gesture cheap) the answer is emitted LAST. A frame
+  // that arrives first while showing a different window must not consume the
+  // latch, or the panel fronts the overview and the answer lands unseen.
+  _p.history.cursor = _p.history.entries.findIndex((e) => e.id === "answer-dive");
+  const di = _p.history.cursor;
+  _p.zoomFocus.armed = WANT;
+  display.ingestReplText(camFrameAt("answer-wide", -0.5, 2.0), "repl");
+  check("answer focus: a camera frame showing another window is not the answer", _p.history.cursor === di, _p.history.cursor);
+  check("answer focus: and it leaves the latch armed", _p.zoomFocus.armed === WANT, _p.zoomFocus.armed);
+  display.ingestReplText(camFrameAt("answer-view", WANT.cx, WANT.r), "repl");
+  check("answer focus: the answer still fronts when it arrives last", _p.history.cursor === vi, _p.history.cursor);
 
   // THE CURRENT-ENTRY HOLE: zoom the plot you are already viewing, and the
   // answer merges into the CURRENT entry. That merge must consume the latch
   // too, or the next replayed camera frame inherits it and fronts.
-  _p.zoomFocus.armed = true;
-  display.ingestReplText(camFrame("answer-view"), "repl");   // answer, lands on current
-  check("answer focus: current-entry answer consumes the latch", _p.zoomFocus.armed === false, _p.zoomFocus.armed);
+  _p.zoomFocus.armed = WANT;
+  display.ingestReplText(camFrameAt("answer-view", WANT.cx, WANT.r), "repl");
+  check("answer focus: current-entry answer consumes the latch", _p.zoomFocus.armed === null, _p.zoomFocus.armed);
   check("answer focus: cursor unchanged by a current-entry answer", _p.history.cursor === vi, _p.history.cursor);
-  display.ingestReplText(camFrame("answer-dive"), "repl");   // the replay that used to steal
+  display.ingestReplText(camFrameAt("answer-dive", WANT.cx, WANT.r), "repl");
   check("answer focus: the replay after a current-entry answer stays background", _p.history.cursor === vi, _p.history.cursor);
 }
 

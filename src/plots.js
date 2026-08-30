@@ -1057,13 +1057,39 @@ function zoomCamera(xr, yr) {
  *  extra recompute. Intermediate gestures are superseded, never queued. */
 const zoomInflight = new Set();
 const zoomPending = new Map();
-/** One-shot focus latch: armed when a gesture's recompute starts, consumed
- *  by the FIRST camera-carrying frame that arrives (the live re-emission of
- *  the view -- it always lands before the session's replayed frames). Field
- *  report that forced the latch: with several plots carrying the contract,
- *  EVERY replayed camera frame at end-of-eval stole focus back, so a zoom on
- *  the view ended selected on the overview, repainted at default axes. */
-const zoomFocus = { armed: false };
+/** One-shot focus latch: holds the camera a gesture asked for while its
+ *  recompute is in flight, and is consumed by the frame that actually SHOWS
+ *  that window. Field report that forced the latch: with several plots
+ *  carrying the contract, every replayed camera frame at end-of-eval stole
+ *  focus back, so a zoom on the view ended selected on the overview,
+ *  repainted at default axes.
+ *
+ *  Why the window and not simply the first arrival: a recompute re-emits
+ *  EVERY camera-carrying plot in the notebook -- the overview, all 18 dive
+ *  frames, the view -- and their order is the program's, not the gesture's.
+ *  With the camera cell last (which is what makes a gesture cheap) the view
+ *  is emitted last, so 'first' is reliably the wrong plot. The answer is the
+ *  one whose axis spans the window that was requested, whatever its id --
+ *  which also keeps working for a zoom on the overview, whose answer
+ *  legitimately arrives under the view's id. */
+const zoomFocus = { armed: null };
+
+/** Does this figure show the window `cam` asked for? Compares the x axis's
+ *  own samples: centre and span, to within a few percent, because a decimated
+ *  axis stops one sample short of the exact half-span. */
+function frameShowsWindow(frame, cam) {
+  const traces = frame && frame.data && frame.data.data;
+  const xs = traces && traces[0] && traces[0].x;
+  if (!Array.isArray(xs) || xs.length < 2) return false;
+  const lo = Number(xs[0]);
+  const hi = Number(xs[xs.length - 1]);
+  if (!isFinite(lo) || !isFinite(hi) || !isFinite(cam.r) || cam.r <= 0) return false;
+  const span = Math.abs(hi - lo);
+  return (
+    Math.abs((lo + hi) / 2 - cam.cx) < cam.r * 0.05 &&
+    Math.abs(span - 2 * cam.r) < cam.r * 0.1
+  );
+}
 
 /** One zoom gesture from the webview: map it onto the current entry's camera
  *  contract and hand it to the re-evaluation hook (deps.onPlotZoom — wired to
@@ -1094,11 +1120,11 @@ function handleZoom(msg) {
  *  zooming, and each link supersedes everything before it. */
 function runZoom(plotId, bindings, cam) {
   zoomInflight.add(plotId);
-  zoomFocus.armed = true;
+  zoomFocus.armed = cam;
   note(`recomputing ${plotId} at r = ${cam.r.toExponential(3)}…`);
   const settle = (message) => {
     zoomInflight.delete(plotId);
-    zoomFocus.armed = false;
+    zoomFocus.armed = null;
     const next = zoomPending.get(plotId);
     if (next) {
       zoomPending.delete(plotId);
@@ -1307,14 +1333,15 @@ function onFrame(frame, origin) {
   // a dive frame re-aims the camera, the view answers), and it takes focus.
   {
     const lay = frame.data && frame.data.layout;
-    if (zoomFocus.armed && lay && lay.blade_camera) {
+    if (zoomFocus.armed && lay && lay.blade_camera
+        && frameShowsWindow(frame, zoomFocus.armed)) {
       // The gesture's answer. Consume the latch WHEREVER it lands -- when
       // the user zoomed the plot they were already viewing, the answer
       // merges into the CURRENT entry, and leaving the latch armed handed
       // focus to the next replayed camera frame instead (field symptoms:
       // zooming the view ended selected on the overview, repainted at its
       // default axes).
-      zoomFocus.armed = false;
+      zoomFocus.armed = null;
       history.cursor = res.index;
     } else if (res.merged && res.index !== history.cursor) {
       // Background merge: bookkeeping, not an event.
