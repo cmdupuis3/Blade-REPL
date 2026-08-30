@@ -1098,6 +1098,16 @@ async function testZoomAnswerTakesFocus() {
   // them stealing focus back in turn.
   display.ingestReplText(camFrame("answer-dive"), "repl");
   check("answer focus: a later camera replay does NOT steal focus", _p.history.cursor === vi, _p.history.cursor);
+
+  // THE CURRENT-ENTRY HOLE: zoom the plot you are already viewing, and the
+  // answer merges into the CURRENT entry. That merge must consume the latch
+  // too, or the next replayed camera frame inherits it and fronts.
+  _p.zoomFocus.armed = true;
+  display.ingestReplText(camFrame("answer-view"), "repl");   // answer, lands on current
+  check("answer focus: current-entry answer consumes the latch", _p.zoomFocus.armed === false, _p.zoomFocus.armed);
+  check("answer focus: cursor unchanged by a current-entry answer", _p.history.cursor === vi, _p.history.cursor);
+  display.ingestReplText(camFrame("answer-dive"), "repl");   // the replay that used to steal
+  check("answer focus: the replay after a current-entry answer stays background", _p.history.cursor === vi, _p.history.cursor);
 }
 
 /** THE replay glitch, pinned: a session re-runs every accumulated snippet,

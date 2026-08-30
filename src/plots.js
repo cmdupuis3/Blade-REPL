@@ -1305,11 +1305,21 @@ function onFrame(frame, origin) {
   // camera-carrying frame that arrives then is the ANSWER to the user's
   // gesture (possibly under a different id than the plot they gestured on --
   // a dive frame re-aims the camera, the view answers), and it takes focus.
-  if (res.merged && res.index !== history.cursor) {
+  {
     const lay = frame.data && frame.data.layout;
-    if (!(zoomFocus.armed && lay && lay.blade_camera)) return;
-    zoomFocus.armed = false;
-    history.cursor = res.index;
+    if (zoomFocus.armed && lay && lay.blade_camera) {
+      // The gesture's answer. Consume the latch WHEREVER it lands -- when
+      // the user zoomed the plot they were already viewing, the answer
+      // merges into the CURRENT entry, and leaving the latch armed handed
+      // focus to the next replayed camera frame instead (field symptoms:
+      // zooming the view ended selected on the overview, repainted at its
+      // default axes).
+      zoomFocus.armed = false;
+      history.cursor = res.index;
+    } else if (res.merged && res.index !== history.cursor) {
+      // Background merge: bookkeeping, not an event.
+      return;
+    }
   }
   ensurePanel();
   panel.reveal(vscode.ViewColumn.Beside, true);
