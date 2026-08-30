@@ -1065,6 +1065,7 @@ async function testZoomHostFlow() {
   check("zoom webview: only the LATEST gesture survives the debounce", js.indexOf("zoomLatest") !== -1);
   check("zoom webview: requires all four explicit range keys", js.indexOf("xaxis.range[0]") !== -1 && js.indexOf("yaxis.range[1]") !== -1);
   check("zoom webview: gated on the layout contract", js.indexOf("blade_camera") !== -1);
+  check("zoom webview: a contract-less gesture SAYS so", js.indexOf("zoomNoCamera") !== -1 && js.indexOf("noCameraSaid") !== -1);
 }
 
 /** A gesture's ANSWER takes focus: while a zoom recompute is in flight, a
