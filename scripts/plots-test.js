@@ -1067,6 +1067,33 @@ async function testZoomHostFlow() {
   check("zoom webview: gated on the layout contract", js.indexOf("blade_camera") !== -1);
 }
 
+/** A gesture's ANSWER takes focus: while a zoom recompute is in flight, a
+ *  camera-carrying merge fronts its entry even from the background -- the
+ *  user gestured on one plot (say the dive) and the recomputed view, under a
+ *  DIFFERENT id, is what they asked to see. Without inflight, background
+ *  camera merges stay background (the replay rule). */
+async function testZoomAnswerTakesFocus() {
+  _p.setDeps({ output: { appendLine: () => {} } });
+  const camFrame = (id) => display.encodeReplLine({
+    mime: display.PLOTLY_MIME,
+    data: cameraSpec("cam_cx,cam_cy,cam_r"),
+    meta: { id },
+  });
+  display.ingestReplText(camFrame("answer-view"), "repl");
+  display.ingestReplText(camFrame("answer-dive"), "repl");
+  // Viewing the dive; a background camera merge WITHOUT inflight stays put.
+  _p.history.cursor = _p.history.entries.findIndex((e) => e.id === "answer-dive");
+  const at = _p.history.cursor;
+  display.ingestReplText(camFrame("answer-view"), "repl");
+  check("answer focus: background camera merge stays put when idle", _p.history.cursor === at, _p.history.cursor);
+  // With a recompute in flight, the same merge takes focus.
+  _p.zoomInflight.add("answer-dive");
+  display.ingestReplText(camFrame("answer-view"), "repl");
+  const vi = _p.history.entries.findIndex((e) => e.id === "answer-view");
+  check("answer focus: in-flight recompute's frame takes focus", _p.history.cursor === vi, _p.history.cursor);
+  _p.zoomInflight.delete("answer-dive");
+}
+
 /** THE replay glitch, pinned: a session re-runs every accumulated snippet,
  *  so one cell eval re-emits every earlier plot. A replayed MERGE must not
  *  steal the panel cursor -- with the old behavior, every recompute ended
@@ -1231,6 +1258,7 @@ async function testRendererContribution() {
   await testZoomHostFlow();
   await testZoomSupersede();
   testMergeDoesNotStealCursor();
+  await testZoomAnswerTakesFocus();
 
   if (failures) {
     console.error(`\n${failures} plot check(s) failed.`);

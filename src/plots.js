@@ -1287,8 +1287,15 @@ function onFrame(frame, origin) {
   log(`${res.merged ? "merged" : "added"} ${frame.mime} from ${origin} — ${res.entry.title} (${history.entries.length} in history)`);
   // A background merge (a replayed frame updating an entry that is not on
   // screen) is bookkeeping, not an event: no reveal, no repaint, no backend
-  // switching. Navigating to it later shows the updated render.
-  if (res.merged && res.index !== history.cursor) return;
+  // switching -- EXCEPT while a zoom recompute is in flight: the
+  // camera-carrying frame that arrives then is the ANSWER to the user's
+  // gesture (possibly under a different id than the plot they gestured on --
+  // a dive frame re-aims the camera, the view answers), and it takes focus.
+  if (res.merged && res.index !== history.cursor) {
+    const lay = frame.data && frame.data.layout;
+    if (!(zoomInflight.size > 0 && lay && lay.blade_camera)) return;
+    history.cursor = res.index;
+  }
   ensurePanel();
   panel.reveal(vscode.ViewColumn.Beside, true);
 
