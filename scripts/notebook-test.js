@@ -882,6 +882,32 @@ function testBladeFloat() {
   check("bladeFloat: round-trip decimals pass through", _test.bladeFloat(-0.743643887037151) === "-0.743643887037151");
   check("bladeFloat: bare exponent gains a point", _test.bladeFloat(1e-14) === "1.0e-14", _test.bladeFloat(1e-14));
   check("bladeFloat: pointed exponent untouched", _test.bladeFloat(7.8125e-17) === "7.8125e-17", _test.bladeFloat(7.8125e-17));
+
+  // Double-double camera: the gesture is relative, the center update exact.
+  const ddNames = ["deep_cx_hi", "deep_cx_lo", "deep_cy_hi", "deep_cy_lo", "deep_r"];
+  const ddSrc = [
+    "// the deep camera",
+    "let deep_cx_hi = -0.743643887037151",
+    "let deep_cx_lo = 0.0   // refined by the lens",
+    "let deep_cy_hi = 0.13182590420533",
+    "let deep_cy_lo = 0.0",
+    "let deep_r = 1.0e-20",
+    "let deep_px = 96",
+  ].join("\n");
+  const cur = _test.readCameraValues(ddSrc, ddNames);
+  check("dd camera: all five values read", cur.size === 5 && cur.get("deep_r") === 1e-20, [...cur]);
+  check("dd camera: a trailing comment does not spoil the number", cur.get("deep_cx_lo") === 0, cur.get("deep_cx_lo"));
+  const [s, e] = _test.twoSum(1.0, 1e-20);
+  check("two-sum: the small addend survives in the low word", s === 1 && e === 1e-20, [s, e]);
+  const nv = _test.ddCameraValues(ddNames, cur, { cx: 0.5, cy: -0.25, r: 0.1 });
+  check("dd camera: hi words unchanged by a sub-ulp offset", nv[0] === -0.743643887037151 && nv[2] === 0.13182590420533, nv);
+  check("dd camera: the offset lands in the lo words", nv[1] === 5e-21 && nv[3] === -2.5e-21, nv);
+  check("dd camera: radius scales by the gesture's fraction", Math.abs(nv[4] - 1e-21) < 1e-36, nv[4]);
+  const twice = _test.ddCameraValues(ddNames, new Map(ddNames.map((n, i) => [n, nv[i]])), { cx: -0.5, cy: 0.25, r: 1 });
+  check("dd camera: a second gesture folds in at the NEW radius (1e-21 * -0.5)", twice[1] === 4.5e-21 && twice[3] === -2.25e-21, twice);
+  let threw = null;
+  try { _test.ddCameraValues(ddNames, new Map(), { cx: 0, cy: 0, r: 1 }); } catch (err) { threw = err.message; }
+  check("dd camera: a missing binding is a user-facing error", !!threw && /deep_cx_hi/.test(threw), threw);
 }
 
 function testRewriteCameraSource() {

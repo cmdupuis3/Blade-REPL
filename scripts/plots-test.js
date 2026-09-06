@@ -987,6 +987,13 @@ function testZoomContract() {
   check("zoom contract: two names -> null", _p.cameraFromSpec(cameraSpec("a,b")) === null);
   check("zoom contract: non-identifier -> null", _p.cameraFromSpec(cameraSpec("a,b,c-d")) === null);
   check("zoom contract: non-string bindings -> null", _p.cameraFromSpec({ layout: { blade_camera: { bindings: 3 } } }) === null);
+  check("zoom contract: three names are absolute", !!good && good.relative === false, good);
+  const dd = _p.cameraFromSpec(cameraSpec("cx_hi,cx_lo,cy_hi,cy_lo,r"));
+  check("zoom contract: five names are a relative (double-double) camera", !!dd && dd.relative === true && dd.bindings.length === 5, dd);
+  check("zoom contract: four names -> null", _p.cameraFromSpec(cameraSpec("a,b,c,d")) === null);
+  const unitFrame = { data: { data: [{ x: [-1, -0.5, 0, 0.5, 1] }] } };
+  check("zoom latch: a relative camera's answer is the unit window", _p.frameShowsWindow(unitFrame, { cx: 0.3, cy: 0.1, r: 0.25, relative: true }));
+  check("zoom latch: an absolute camera still wants its own window", !_p.frameShowsWindow(unitFrame, { cx: 0.3, cy: 0.1, r: 0.25 }));
 
   // zoomCamera: center + larger-half-span rule, and the degenerate guards.
   const cam = _p.zoomCamera([-1, 3], [10, 12]);

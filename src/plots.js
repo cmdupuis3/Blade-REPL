@@ -1028,14 +1028,22 @@ function note(message) {
 // --- Zoom-to-recompute (docs/plot-zoom-reeval.md) ------------------------------
 
 /** The camera contract a spec carries, or null: `layout.blade_camera` with a
- *  `bindings` string naming exactly three session bindings — center-x,
- *  center-y, half-width, in that order (stdlib plot.blade's `camera` slot). */
+ *  `bindings` string naming session bindings (stdlib plot.blade's `camera`
+ *  slot). Two shapes:
+ *   - THREE names: center-x, center-y, half-width, absolute Float64 -- the
+ *     figure's axes are the window itself.
+ *   - FIVE names: center-x (hi, lo), center-y (hi, lo), half-width -- a
+ *     DOUBLE-DOUBLE camera for the perturbation lens, whose axes are offsets
+ *     in UNITS OF THE HALF-WIDTH (the panel is Float64 too, so it draws
+ *     [-1, 1] and the camera carries the absolute position). A gesture on
+ *     such a figure is relative; the notebook hook folds it into the
+ *     current center with an exact two-sum (`ddCameraValues`). */
 function cameraFromSpec(spec) {
   const cam = spec && spec.layout && spec.layout.blade_camera;
   if (!cam || typeof cam.bindings !== "string") return null;
   const names = cam.bindings.split(",").map((s) => s.trim());
-  if (names.length !== 3 || names.some((n) => !/^[A-Za-z_]\w*$/.test(n))) return null;
-  return { bindings: names };
+  if ((names.length !== 3 && names.length !== 5) || names.some((n) => !/^[A-Za-z_]\w*$/.test(n))) return null;
+  return { bindings: names, relative: names.length === 5 };
 }
 
 /** A zoom gesture's ranges → the camera values that reproduce it: center of
@@ -1085,9 +1093,13 @@ function frameShowsWindow(frame, cam) {
   const hi = Number(xs[xs.length - 1]);
   if (!isFinite(lo) || !isFinite(hi) || !isFinite(cam.r) || cam.r <= 0) return false;
   const span = Math.abs(hi - lo);
+  // A double-double (relative) camera's answer always draws the unit window:
+  // its axes are offsets in units of the new half-width, so the frame that
+  // shows the requested window is the one centred on 0 spanning 2.
+  const want = cam.relative ? { cx: 0, r: 1 } : cam;
   return (
-    Math.abs((lo + hi) / 2 - cam.cx) < cam.r * 0.05 &&
-    Math.abs(span - 2 * cam.r) < cam.r * 0.1
+    Math.abs((lo + hi) / 2 - want.cx) < want.r * 0.05 &&
+    Math.abs(span - 2 * want.r) < want.r * 0.1
   );
 }
 
@@ -1112,7 +1124,7 @@ function handleZoom(msg) {
     note("zoom-to-recompute: still recomputing — latest gesture will follow");
     return;
   }
-  runZoom(entry.id, camera.bindings, cam);
+  runZoom(entry.id, camera.bindings, { ...cam, relative: !!camera.relative });
 }
 
 /** Fire one recompute; when it settles, fire the latest gesture that arrived
@@ -1133,7 +1145,7 @@ function runZoom(plotId, bindings, cam) {
       note(message);
     }
   };
-  Promise.resolve(deps.onPlotZoom({ plotId, bindings, cx: cam.cx, cy: cam.cy, r: cam.r }))
+  Promise.resolve(deps.onPlotZoom({ plotId, bindings, cx: cam.cx, cy: cam.cy, r: cam.r, relative: !!cam.relative }))
     .then(() => settle(""))
     .catch((e) => settle(`zoom-to-recompute failed: ${(e && e.message) || e}`));
 }
@@ -1479,6 +1491,7 @@ module.exports._test = {
   // Zoom-to-recompute.
   cameraFromSpec,
   zoomCamera,
+  frameShowsWindow,
   handleZoom,
   zoomInflight,
   zoomFocus,

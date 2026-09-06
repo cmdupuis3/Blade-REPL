@@ -555,6 +555,56 @@ function recordZoomTargets(execution, frames) {
   }
 }
 
+/** Current values of the `let <name> = <float>` lines a camera cell holds, by
+ *  name. The cell's own text is the source of truth for a double-double
+ *  camera update: the gesture is RELATIVE (offsets in units of the current
+ *  half-width), so the new center is computed from the old one. */
+function readCameraValues(text, names) {
+  const wanted = new Set(names);
+  const out = new Map();
+  for (const line of text.split("\n")) {
+    const m = line.match(/^\s*let\s+(\w+)\s*=\s*([^\/\n]*?)\s*(\/\/.*)?$/);
+    if (!m || !wanted.has(m[1])) continue;
+    const v = Number(m[2]);
+    if (isFinite(v)) out.set(m[1], v);
+  }
+  return out;
+}
+
+/** Knuth's two-sum: [s, e] with s + e == a + b EXACTLY. JavaScript numbers are
+ *  IEEE doubles with no fused contraction, so this is the same error-free
+ *  transformation the notebook's `two_sum` performs. */
+function twoSum(a, b) {
+  const s = a + b;
+  const bb = s - a;
+  return [s, (a - (s - bb)) + (b - bb)];
+}
+
+/** Fold a relative gesture into a double-double camera. `names` are the five
+ *  contract bindings [x_hi, x_lo, y_hi, y_lo, r]; `current` their values
+ *  (readCameraValues); `g` the gesture in units of the current half-width
+ *  (`zoomCamera` on a [-1, 1] axis: cx, cy the selection's center, r its
+ *  larger half-span as a FRACTION). Returns the five new values, in order.
+ *  Each center component gains r * offset through two_sum, so the (hi, lo)
+ *  pair stays exact to ~32 digits however deep the lens goes. */
+function ddCameraValues(names, current, g) {
+  const get = (n) => {
+    const v = current.get(n);
+    if (v === undefined) throw new Error(`camera cell does not define a numeric \`let ${n}\``);
+    return v;
+  };
+  const [xh, xl, yh, yl, r] = names.map(get);
+  const fold = (hi, lo, delta) => {
+    const [s, e] = twoSum(hi, delta);
+    const e2 = e + lo;
+    const s2 = s + e2;
+    return [s2, e2 - (s2 - s)];
+  };
+  const [nxh, nxl] = fold(xh, xl, r * g.cx);
+  const [nyh, nyl] = fold(yh, yl, r * g.cy);
+  return [nxh, nxl, nyh, nyl, r * g.r];
+}
+
 /** A Float64 as Blade source: JavaScript's shortest round-trip decimal, made
  *  lexically a Float ("2" would parse as an Int, "1e-14" needs its point). */
 function bladeFloat(v) {
@@ -596,7 +646,7 @@ function findCameraCell(notebookDoc, names) {
  * are the gesture's. Throws with a user-facing message on any gap — the panel
  * turns that into a note.
  */
-async function onPlotZoom({ plotId, bindings, cx, cy, r }) {
+async function onPlotZoom({ plotId, bindings, cx, cy, r, relative }) {
   // Prefer the registry; fall back to scanning open Blade notebooks for
   // the cell that defines the contract's first binding. The contract is
   // self-describing, so the registry's only irreplaceable job is
@@ -619,7 +669,13 @@ async function onPlotZoom({ plotId, bindings, cx, cy, r }) {
   if (!cameraCell) throw new Error(`no cell defines \`let ${bindings[0]} = …\` — cannot rewrite the camera`);
 
   const doc = cameraCell.document;
-  const { text, replaced } = rewriteCameraSource(doc.getText(), bindings, [cx, cy, r]);
+  // A three-binding camera takes the gesture's absolute values; a five-binding
+  // (double-double) camera takes them as offsets in units of the current
+  // half-width and folds them into the center it already holds.
+  const values = relative
+    ? ddCameraValues(bindings, readCameraValues(doc.getText(), bindings), { cx, cy, r })
+    : [cx, cy, r];
+  const { text, replaced } = rewriteCameraSource(doc.getText(), bindings, values);
   const missing = bindings.filter((n) => !replaced.has(n));
   if (missing.length > 0) throw new Error(`camera cell does not define: ${missing.join(", ")}`);
 
@@ -648,7 +704,7 @@ async function onPlotZoom({ plotId, bindings, cx, cy, r }) {
       const res = await fastClient.render(
         notebookDoc.uri.toString(),
         bindings,
-        [cx, cy, r],
+        values,
         notebookCwd(notebookDoc),
         { timeoutMs: evalTimeoutMs() }
       );
@@ -1371,6 +1427,9 @@ module.exports._test = {
   zoomTargets,
   recordZoomTargets,
   bladeFloat,
+  readCameraValues,
+  ddCameraValues,
+  twoSum,
   rewriteCameraSource,
   findCameraCell,
   onPlotZoom,

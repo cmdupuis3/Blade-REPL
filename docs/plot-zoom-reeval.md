@@ -26,6 +26,19 @@ plot.contourf(xs, ys, z, 24: levels,
   frame meta: `display.emit`'s meta must be a string literal (BL5700), while
   the layout is runtime-built JSON. A viewer that does not know the key
   ignores one extra layout entry.
+- **Five names** make a *double-double* camera: center-x (hi, lo), center-y
+  (hi, lo), half-width. This is the perturbation lens's contract
+  (examples/mandelbrot.bladenb, "The deep camera"): a Float64 axis cannot
+  address a window of half-width 1e-20 around |c| ≈ 1, so such a figure
+  draws its axes as offsets in UNITS OF THE HALF-WIDTH (always [-1, 1]) and
+  the camera carries the absolute position as two exact pairs. The gesture
+  is therefore relative: `handleZoom` marks it `relative`, and the notebook
+  hook folds it into the center the cell currently holds with an exact
+  two-sum (`ddCameraValues`: hi words unchanged by a sub-ulp offset, the
+  offset lands in the lo words), then rewrites the five lines. Everything
+  downstream — the render fast path with five bindings, the merge by id — is
+  the three-binding flow unchanged. The focus latch (`frameShowsWindow`)
+  knows the answer to a relative gesture is the unit window.
 
 ## The flow
 
