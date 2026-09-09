@@ -588,21 +588,42 @@ function twoSum(a, b) {
  *  Each center component gains r * offset through two_sum, so the (hi, lo)
  *  pair stays exact to ~32 digits however deep the lens goes. */
 function ddCameraValues(names, current, g) {
+  return limbCameraValues(names, current, g);
+}
+
+/** The same fold for a camera of ANY odd binding count 2N + 1: N limbs of the
+ *  real center, N limbs of the imaginary center, then r. Each center is an
+ *  N-double -- non-overlapping doubles in decreasing magnitude -- and the
+ *  gesture's offset r * frac is folded in by Shewchuk's grow-expansion from
+ *  the small end, keeping N limbs. N = 2 is exactly the double-double fold
+ *  above; N = 4 is the quad-double lens, exact to ~64 digits. The notebook's
+ *  `qd_grow` performs the same transformation, so the camera the editor
+ *  writes is one the program could have computed. */
+function limbCameraValues(names, current, g) {
   const get = (n) => {
     const v = current.get(n);
     if (v === undefined) throw new Error(`camera cell does not define a numeric \`let ${n}\``);
     return v;
   };
-  const [xh, xl, yh, yl, r] = names.map(get);
-  const fold = (hi, lo, delta) => {
-    const [s, e] = twoSum(hi, delta);
-    const e2 = e + lo;
-    const s2 = s + e2;
-    return [s2, e2 - (s2 - s)];
+  const vals = names.map(get);
+  if (names.length < 5 || names.length % 2 === 0)
+    throw new Error(`a limbed camera needs an odd binding count (2N + 1), got ${names.length}`);
+  const n = (names.length - 1) / 2;
+  const r = vals[names.length - 1];
+  const grow = (limbs, delta) => {
+    let q = delta;
+    const h = [];
+    for (let i = limbs.length - 1; i >= 0; i--) {
+      const [s, e] = twoSum(q, limbs[i]);
+      q = s;
+      h.unshift(e);
+    }
+    // (q, h[0], ..., h[n-2]); the smallest carry h[n-1] is dropped.
+    return [q, ...h.slice(0, n - 1)];
   };
-  const [nxh, nxl] = fold(xh, xl, r * g.cx);
-  const [nyh, nyl] = fold(yh, yl, r * g.cy);
-  return [nxh, nxl, nyh, nyl, r * g.r];
+  const re = grow(vals.slice(0, n), r * g.cx);
+  const im = grow(vals.slice(n, 2 * n), r * g.cy);
+  return [...re, ...im, r * g.r];
 }
 
 /** A Float64 as Blade source: JavaScript's shortest round-trip decimal, made
@@ -1430,6 +1451,7 @@ module.exports._test = {
   readCameraValues,
   ddCameraValues,
   twoSum,
+  limbCameraValues,
   rewriteCameraSource,
   findCameraCell,
   onPlotZoom,

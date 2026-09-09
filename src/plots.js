@@ -1043,7 +1043,9 @@ function cameraFromSpec(spec) {
   if (!cam || typeof cam.bindings !== "string") return null;
   const names = cam.bindings.split(",").map((s) => s.trim());
   if ((names.length !== 3 && names.length !== 5) || names.some((n) => !/^[A-Za-z_]\w*$/.test(n))) return null;
-  return { bindings: names, relative: names.length === 5 };
+  // A three-binding camera is absolute; any odd count 2N + 1 >= 5 is N limbs of
+  // Re, N of Im, and r -- a relative camera the hook folds the gesture into.
+  return { bindings: names, relative: names.length >= 5 && names.length % 2 === 1 };
 }
 
 /** A zoom gesture's ranges → the camera values that reproduce it: center of

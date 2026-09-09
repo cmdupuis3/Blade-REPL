@@ -908,6 +908,29 @@ function testBladeFloat() {
   let threw = null;
   try { _test.ddCameraValues(ddNames, new Map(), { cx: 0, cy: 0, r: 1 }); } catch (err) { threw = err.message; }
   check("dd camera: a missing binding is a user-facing error", !!threw && /deep_cx_hi/.test(threw), threw);
+
+  // The same fold at FOUR limbs (a quad-double camera, nine bindings): the
+  // gesture's offset lands in whichever limb its scale reaches, the limbs
+  // above it are untouched, and the radius scales as before.
+  const qdNames = ["q_re0", "q_re1", "q_re2", "q_re3", "q_im0", "q_im1", "q_im2", "q_im3", "q_r"];
+  const qdCur = new Map([
+    ["q_re0", -1.54368901269208], ["q_re1", 6.15676673813378e-18],
+    ["q_re2", -1.18793187483785e-34], ["q_re3", 1.94551807735112e-51],
+    ["q_im0", 0], ["q_im1", 0], ["q_im2", 0], ["q_im3", 0], ["q_r", 1e-50],
+  ]);
+  const qv = _test.limbCameraValues(qdNames, qdCur, { cx: 0.5, cy: -0.25, r: 0.1 });
+  check("qd camera: nine values back", qv.length === 9, qv.length);
+  check("qd camera: the three limbs above the offset's scale are untouched",
+        qv[0] === qdCur.get("q_re0") && qv[1] === qdCur.get("q_re1") && qv[2] === qdCur.get("q_re2"), qv.slice(0, 3));
+  check("qd camera: a 5e-51 offset lands in the fourth real limb",
+        Math.abs(qv[3] - (1.94551807735112e-51 + 5e-51)) < 1e-66, qv[3]);
+  // The imaginary center is ZERO, so there is no limb above the offset for it
+  // to sit under: it becomes the leading limb, and the rest stay zero.
+  check("qd camera: into a zero center the offset becomes the leading limb", qv[4] === -2.5e-51 && qv[5] === 0 && qv[7] === 0, qv.slice(4, 8));
+  check("qd camera: radius scales by the gesture's fraction", Math.abs(qv[8] - 1e-51) < 1e-66, qv[8]);
+  let qthrew = null;
+  try { _test.limbCameraValues(qdNames.slice(0, 8), qdCur, { cx: 0, cy: 0, r: 1 }); } catch (err) { qthrew = err.message; }
+  check("qd camera: an even binding count is refused", !!qthrew && /odd binding count/.test(qthrew), qthrew);
 }
 
 function testRewriteCameraSource() {
