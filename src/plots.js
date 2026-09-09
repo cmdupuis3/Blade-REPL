@@ -700,10 +700,20 @@ function webviewScript() {
     "    var spec = frame.data || {};",
     "    var traces = spec.data || [];",
     "    var layout = mergeLayout(themeLayout(), spec.layout);",
-    "    var config = Object.assign({ responsive: true, displaylogo: false, scrollZoom: true }, spec.config || {});",
+    // A RELATIVE camera (a limbed lens) draws offsets in units of its own
+    // half-width, so its answer ALWAYS spans [-1, 1]. Letting plotly zoom
+    // such a figure shows the old field magnified -- pixels that are about
+    // to be replaced -- and then snaps back the moment the answer lands,
+    // which reads as the view resetting itself. So the wheel does not move
+    // these axes at all: it is captured below and turned into a gesture,
+    // and the picture simply gets deeper in place. An ABSOLUTE camera keeps
+    // plotly's own zoom, where the preview is honest -- the answer arrives
+    // spanning exactly what was selected.
+    "    var rel = isRelativeCamera(spec.layout);",
+    "    var config = Object.assign({ responsive: true, displaylogo: false, scrollZoom: !rel }, spec.config || {});",
     "    showOnly(elPlot);",
     "    var call = plotted ? Plotly.react : Plotly.newPlot;",
-    "    return call(elPlot, traces, layout, config).then(function () { plotted = true; attachZoom(); });",
+    "    return call(elPlot, traces, layout, config).then(function () { plotted = true; attachZoom(); attachWheel(); });",
     "  }",
     "",
     // Zoom-to-recompute (docs/plot-zoom-reeval.md): a zoom on a figure whose
@@ -719,10 +729,51 @@ function webviewScript() {
     // scrolling, and only then does one gesture reach the host. A drag-zoom
     // fires once and simply pays the settle delay.
     // Attached once — plotly keeps the listener across Plotly.react calls.
+    // The contract's own shape says whether a gesture is relative: three
+    // bindings are an absolute camera, any odd 2N + 1 >= 5 is N limbs of Re,
+    // N of Im, and r. Kept in step with cameraFromSpec on the host.
+    "  function isRelativeCamera(lay) {",
+    "    var cam = lay && lay.blade_camera;",
+    "    if (!cam || typeof cam.bindings !== 'string') return false;",
+    "    var n = cam.bindings.split(',').length;",
+    "    return n >= 5 && n % 2 === 1;",
+    "  }",
+    "",
     "  var ZOOM_SETTLE_MS = 450;",
     "  var zoomTimer = null;",
     "  var zoomLatest = null;",
     "  var noCameraSaid = false;",
+    // The wheel gesture for a relative lens. plotly is not zooming these
+    // axes, so the selection is computed here: a factor per wheel tick,
+    // centred on the cursor, expressed as the [-1, 1] sub-window the user
+    // is pointing at -- the same {xr, yr} shape a plotly zoom reports, so
+    // the host sees one kind of gesture.
+    "  var wheelHooked = false;",
+    "  var wheelTimer = null;",
+    "  var wheelFactor = 1;",
+    "  function attachWheel() {",
+    "    if (wheelHooked) return;",
+    "    wheelHooked = true;",
+    "    elPlot.addEventListener('wheel', function (e) {",
+    "      var lay = current && current.frame && current.frame.data && current.frame.data.layout;",
+    "      if (!isRelativeCamera(lay)) return;   // plotly owns the wheel here",
+    "      e.preventDefault();",
+    "      wheelFactor *= Math.exp((e.deltaY > 0 ? 1 : -1) * 0.12);",
+    "      var drag = elPlot.querySelector('.nsewdrag') || elPlot;",
+    "      var box = drag.getBoundingClientRect();",
+    "      var fx = box.width > 0 ? (e.clientX - box.left) / box.width : 0.5;",
+    "      var fy = box.height > 0 ? (e.clientY - box.top) / box.height : 0.5;",
+    "      var cx = -1 + 2 * Math.min(1, Math.max(0, fx));",
+    "      var cy = 1 - 2 * Math.min(1, Math.max(0, fy));   // y grows upward",
+    "      var half = Math.min(1, Math.max(1e-6, wheelFactor));",
+    "      if (wheelTimer) clearTimeout(wheelTimer);",
+    "      wheelTimer = setTimeout(function () {",
+    "        wheelTimer = null; wheelFactor = 1;",
+    "        api.postMessage({ type: 'zoom', xr: [cx - half, cx + half], yr: [cy - half, cy + half] });",
+    "      }, ZOOM_SETTLE_MS);",
+    "    }, { passive: false });",
+    "  }",
+    "",
     "  function attachZoom() {",
     "    if (zoomHooked || typeof elPlot.on !== 'function') return;",
     "    zoomHooked = true;",

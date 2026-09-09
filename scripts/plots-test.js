@@ -1086,6 +1086,35 @@ async function testZoomHostFlow() {
   check("zoom webview: requires all four explicit range keys", js.indexOf("xaxis.range[0]") !== -1 && js.indexOf("yaxis.range[1]") !== -1);
   check("zoom webview: gated on the layout contract", js.indexOf("blade_camera") !== -1);
   check("zoom webview: a contract-less gesture SAYS so", js.indexOf("zoomNoCamera") !== -1 && js.indexOf("noCameraSaid") !== -1);
+
+  // FIELD REPORT: the lens "resets the zoom before rerendering". A relative
+  // camera's answer always spans [-1, 1], and no layout pins an axis range, so
+  // Plotly.react autoranged back to full frame on every answer -- discarding
+  // the scroll, after briefly showing the OLD field magnified. The wheel no
+  // longer moves those axes: it is captured and turned into a gesture, so the
+  // picture gets deeper in place. Absolute cameras keep plotly's own zoom,
+  // where the preview is honest.
+  check("zoom webview: scrollZoom is off for a relative camera only", js.indexOf("scrollZoom: !rel") !== -1);
+  check("zoom webview: the wheel is captured for those figures", js.indexOf("attachWheel") !== -1 && js.indexOf("preventDefault") !== -1);
+  check("zoom webview: a wheel gesture reports the same {xr, yr} shape", /type: 'zoom', xr: \[cx - half/.test(js));
+  check("zoom webview: the wheel settles on the same debounce", js.indexOf("wheelTimer") !== -1 && js.indexOf("ZOOM_SETTLE_MS") !== -1);
+  // The predicate the webview uses must agree with cameraFromSpec on the host.
+  // Extract the webview's own predicate and run it, so the two definitions
+  // cannot drift: the host decides whether to fold, the webview decides
+  // whether to let plotly move the axes, and they must agree.
+  const relSrc = js.slice(js.indexOf("function isRelativeCamera"));
+  let depth = 0, endAt = 0;
+  for (let i = relSrc.indexOf("{"); i < relSrc.length; i++) {
+    if (relSrc[i] === "{") depth++;
+    else if (relSrc[i] === "}") { depth--; if (depth === 0) { endAt = i; break; } }
+  }
+  const isRel = new Function("lay", relSrc.slice(relSrc.indexOf("{") + 1, endAt));
+  const camOf = (b) => ({ blade_camera: { bindings: b } });
+  for (const [b, want] of [["cx,cy,r", false], ["a,b,c,d,e", true], ["r0,r1,r2,r3,i0,i1,i2,i3,rad", true]]) {
+    const host = _p.cameraFromSpec({ layout: camOf(b).blade_camera ? { blade_camera: { bindings: b } } : {} });
+    check(`zoom webview: relative predicate agrees with the host for ${b.split(",").length} bindings`,
+          isRel(camOf(b)) === want && !!host && host.relative === want, [isRel(camOf(b)), host && host.relative]);
+  }
 }
 
 /** A gesture's ANSWER takes focus: while a zoom recompute is in flight, a
