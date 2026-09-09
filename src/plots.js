@@ -1042,10 +1042,18 @@ function cameraFromSpec(spec) {
   const cam = spec && spec.layout && spec.layout.blade_camera;
   if (!cam || typeof cam.bindings !== "string") return null;
   const names = cam.bindings.split(",").map((s) => s.trim());
-  if ((names.length !== 3 && names.length !== 5) || names.some((n) => !/^[A-Za-z_]\w*$/.test(n))) return null;
   // A three-binding camera is absolute; any odd count 2N + 1 >= 5 is N limbs of
   // Re, N of Im, and r -- a relative camera the hook folds the gesture into.
-  return { bindings: names, relative: names.length >= 5 && names.length % 2 === 1 };
+  //
+  // The count is checked HERE as well as used below, and the two got out of
+  // step: this guard still admitted only 3 or 5 after the flag beside it had
+  // generalized, so a nine-binding quad-double lens was rejected outright.
+  // handleZoom returns on a null camera, which is also how an ordinary figure
+  // is passed over -- so scrolling the far lens did nothing at all, with no
+  // note and no gesture, indistinguishable from a dead panel.
+  const limbed = names.length >= 5 && names.length % 2 === 1;
+  if ((names.length !== 3 && !limbed) || names.some((n) => !/^[A-Za-z_]\w*$/.test(n))) return null;
+  return { bindings: names, relative: limbed };
 }
 
 /** A zoom gesture's ranges → the camera values that reproduce it: center of

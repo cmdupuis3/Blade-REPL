@@ -991,6 +991,19 @@ function testZoomContract() {
   const dd = _p.cameraFromSpec(cameraSpec("cx_hi,cx_lo,cy_hi,cy_lo,r"));
   check("zoom contract: five names are a relative (double-double) camera", !!dd && dd.relative === true && dd.bindings.length === 5, dd);
   check("zoom contract: four names -> null", _p.cameraFromSpec(cameraSpec("a,b,c,d")) === null);
+  // FIELD REPORT: scrolling the quad-double lens did nothing at all. The length
+  // guard here still admitted only 3 or 5 after the `relative` flag beside it
+  // had generalized to any odd 2N + 1, so a nine-binding camera came back null
+  // -- and handleZoom returns on a null camera exactly as it does for an
+  // ordinary figure, so the gesture was dropped with no note to say why.
+  const qd = _p.cameraFromSpec(cameraSpec("r0,r1,r2,r3,i0,i1,i2,i3,rad"));
+  check("zoom contract: nine names are a relative (quad-double) camera",
+        !!qd && qd.relative === true && qd.bindings.length === 9, qd);
+  const six = _p.cameraFromSpec(cameraSpec("r0,r1,r2,i0,i1,i2,rad"));
+  check("zoom contract: seven names too -- the rungs are not enumerated",
+        !!six && six.relative === true && six.bindings.length === 7, six);
+  check("zoom contract: eight names -> null (a limbed camera is 2N + 1)",
+        _p.cameraFromSpec(cameraSpec("a,b,c,d,e,f,g,h")) === null);
   const unitFrame = { data: { data: [{ x: [-1, -0.5, 0, 0.5, 1] }] } };
   check("zoom latch: a relative camera's answer is the unit window", _p.frameShowsWindow(unitFrame, { cx: 0.3, cy: 0.1, r: 0.25, relative: true }));
   check("zoom latch: an absolute camera still wants its own window", !_p.frameShowsWindow(unitFrame, { cx: 0.3, cy: 0.1, r: 0.25 }));
