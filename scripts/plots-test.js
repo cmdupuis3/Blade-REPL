@@ -1080,7 +1080,11 @@ async function testZoomHostFlow() {
   // The generated webview script carries the gesture filter and the gate.
   const js = _p.webviewScript();
   check("zoom webview: relayout listener attached once", js.indexOf("plotly_relayout") !== -1 && js.indexOf("zoomHooked") !== -1);
-  check("zoom webview: wheel zoom enabled", js.indexOf("scrollZoom: true") !== -1);
+  // The wheel drives a gesture on every camera-carrying figure -- but by two
+  // routes: plotly's own scrollZoom for an absolute camera, and the captured
+  // wheel for a relative one, whose axes must not move (see below).
+  check("zoom webview: the wheel drives a gesture either way",
+        js.indexOf("scrollZoom: !rel") !== -1 && js.indexOf("addEventListener('wheel'") !== -1);
   check("zoom webview: settle debounce present", js.indexOf("ZOOM_SETTLE_MS") !== -1 && js.indexOf("clearTimeout(zoomTimer)") !== -1);
   check("zoom webview: only the LATEST gesture survives the debounce", js.indexOf("zoomLatest") !== -1);
   check("zoom webview: requires all four explicit range keys", js.indexOf("xaxis.range[0]") !== -1 && js.indexOf("yaxis.range[1]") !== -1);
