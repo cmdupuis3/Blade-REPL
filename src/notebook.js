@@ -639,6 +639,17 @@ function bladeFloat(v) {
  *  everything else on the line (indentation, a trailing // comment). Returns
  *  the new text and the set of bindings actually rewritten. */
 function rewriteCameraSource(text, names, values) {
+  // This writes into the USER'S SOURCE, so it refuses anything that is not a
+  // finite number rather than formatting it. `bladeFloat(undefined)` is the
+  // reason: String(undefined) is "undefined", which contains an `e`, so the
+  // add-a-decimal-point branch turns it into `und.0efined` and commits that to
+  // the notebook -- silent corruption that only surfaces a gesture later, when
+  // the next read of the camera cell fails somewhere else entirely.
+  if (values.length !== names.length)
+    throw new Error(`camera has ${names.length} bindings but the gesture produced ${values.length} values`);
+  const bad = names.filter((n, i) => typeof values[i] !== "number" || !isFinite(values[i]));
+  if (bad.length > 0)
+    throw new Error(`refusing to write a non-numeric camera value for: ${bad.join(", ")}`);
   const wanted = new Map(names.map((n, i) => [n, values[i]]));
   const replaced = new Set();
   const out = text.split("\n").map((line) => {

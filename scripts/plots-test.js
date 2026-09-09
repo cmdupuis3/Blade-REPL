@@ -1222,6 +1222,24 @@ async function testZoomSupersede() {
   check("supersede: exactly one follow-up ran", calls.length === 2, calls);
   check("supersede: and it carried the LATEST camera (r=0.25)", Math.abs(calls[1] - 0.25) < 1e-12, calls);
   check("supersede: inflight fully released", _p.zoomInflight.size === 0, [..._p.zoomInflight]);
+
+  // FIELD REPORT: a superseded gesture came back as an ABSOLUTE camera. The
+  // immediate path fires `{...cam, relative}` but the queue stored the bare
+  // gesture, so the follow-up took the three-value branch against a
+  // nine-binding lens and wrote `undefined` into six of its limbs.
+  {
+    const fired = [];
+    _p.setDeps({ output: { appendLine: () => {} }, onPlotZoom: (req) => { fired.push(req); return Promise.resolve(); } });
+    const relSpec = cameraSpec("r0,r1,r2,r3,i0,i1,i2,i3,rad");
+    display.ingestReplText(display.encodeReplLine({ mime: display.PLOTLY_MIME, data: relSpec, meta: { id: "sup-rel" } }), "repl");
+    _p.history.cursor = _p.history.entries.findIndex((e) => e.id === "sup-rel");
+    _p.zoomInflight.add("sup-rel");
+    _p.handleZoom({ type: "zoom", xr: [-0.5, 0.5], yr: [-0.5, 0.5] });
+    const queued = _p.zoomPending.get("sup-rel");
+    check("supersede: the queued gesture keeps `relative`", !!queued && queued.relative === true, queued);
+    _p.zoomInflight.delete("sup-rel");
+    _p.zoomPending.delete("sup-rel");
+  }
 }
 
 // --- 8. Notebook renderer contribution ---------------------------------------

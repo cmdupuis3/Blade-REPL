@@ -1130,7 +1130,11 @@ function handleZoom(msg) {
   const cam = zoomCamera(msg.xr, msg.yr);
   if (!cam) return;
   if (zoomInflight.has(entry.id)) {
-    zoomPending.set(entry.id, cam);
+    // The SAME shape the immediate path fires, `relative` included. Queuing the
+    // bare gesture dropped it, so a superseded scroll came back as an absolute
+    // three-value camera: against a nine-binding lens that wrote cx, cy, r into
+    // the first three limbs and `undefined` into the rest.
+    zoomPending.set(entry.id, { ...cam, relative: !!camera.relative });
     note("zoom-to-recompute: still recomputing — latest gesture will follow");
     return;
   }
@@ -1504,6 +1508,7 @@ module.exports._test = {
   frameShowsWindow,
   handleZoom,
   zoomInflight,
+  zoomPending,
   zoomFocus,
   // Streams.
   STREAM_MIME,

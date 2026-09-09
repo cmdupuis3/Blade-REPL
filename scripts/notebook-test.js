@@ -931,6 +931,24 @@ function testBladeFloat() {
   let qthrew = null;
   try { _test.limbCameraValues(qdNames.slice(0, 8), qdCur, { cx: 0, cy: 0, r: 1 }); } catch (err) { qthrew = err.message; }
   check("qd camera: an even binding count is refused", !!qthrew && /odd binding count/.test(qthrew), qthrew);
+
+  // ...and the guard that makes a mismatch loud instead of destructive. A
+  // three-value (absolute) result against a nine-binding camera used to write
+  // `bladeFloat(undefined)` -- String(undefined) contains an `e`, so the
+  // add-a-point branch produced `und.0efined` and committed it to the user's
+  // notebook, failing only on the NEXT gesture's read.
+  const camLine = qdNames.map((n) => `let ${n} = 1.0`).join(String.fromCharCode(10));
+  let wthrew = null;
+  try { _test.rewriteCameraSource(camLine, qdNames, [1, 2, 3]); } catch (e) { wthrew = e.message; }
+  check("camera write: a value-count mismatch is refused", !!wthrew && /9 bindings but the gesture produced 3/.test(wthrew), wthrew);
+  let nthrew = null;
+  try { _test.rewriteCameraSource(camLine, qdNames, [1, 2, 3, undefined, 5, 6, 7, 8, 9]); } catch (e) { nthrew = e.message; }
+  check("camera write: a non-numeric value is refused, naming the binding", !!nthrew && /non-numeric.*q_re3/.test(nthrew), nthrew);
+  let ithrew = null;
+  try { _test.rewriteCameraSource(camLine, qdNames, [1, 2, 3, NaN, 5, 6, 7, 8, 9]); } catch (e) { ithrew = e.message; }
+  check("camera write: NaN is refused too", !!ithrew && /non-numeric/.test(ithrew), ithrew);
+  const okWrite = _test.rewriteCameraSource(camLine, qdNames, [1, 2, 3, 4, 5, 6, 7, 8, 9]);
+  check("camera write: nine finite values still rewrite", okWrite.replaced.size === 9, okWrite.replaced.size);
 }
 
 function testRewriteCameraSource() {
