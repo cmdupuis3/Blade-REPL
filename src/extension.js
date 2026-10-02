@@ -169,8 +169,8 @@ function findGr() {
 let extensionRootPath;
 
 /** Spawn-env provider for serve clients: the composed GR environment (GRDIR,
- *  bin on PATH, GKS_WSTYPE=100, no GR_DISPLAY) when a GR install resolves,
- *  else undefined so the child inherits untouched. Re-evaluated by the
+ *  GKS_WSTYPE=100, no GR_DISPLAY -- PATH untouched, see gr.grEnv) when a GR
+ *  install resolves, else undefined so the child inherits untouched. Re-evaluated by the
  *  protocol client on every spawn — same lifecycle as findCompiler — so a
  *  fetch-vendor run or a blade.grPath change takes effect on the next
  *  (re)spawn without a client rebuild. Ignored by protocol packages

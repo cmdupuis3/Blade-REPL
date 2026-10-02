@@ -4,8 +4,10 @@
 // GR environment fails *silently and catastrophically*: no GRDIR is an access
 // violation with zero output, DLLs missing from PATH is a silent spawn failure.
 // So nothing in this extension may invoke GR-adjacent processes on faith —
-// resolution validates the tree up front and the serve spawn gets a fully
-// composed environment, never "whatever the shell had".
+// resolution validates the tree up front and the serve spawn is told where GR
+// is (GRDIR) explicitly, never left with "whatever the shell had". The
+// compiler composes its GR worker's environment from that; this module must
+// not do it for the serve process itself (see grEnv for why).
 //
 // This module is pure data-in/data-out (no vscode import): the extension host
 // passes the configured setting and the roots to probe; tests pass fakes.
@@ -98,23 +100,30 @@ function resolveGr(opts) {
 }
 
 /**
- * Compose the child-process environment for anything that will load GR,
- * layered over `baseEnv` (normally process.env, never mutated):
+ * Compose the environment of the `ide serve` child so the compiler can find
+ * GR, layered over `baseEnv` (normally process.env, never mutated):
  *
- *   GRDIR       — the install root; GKS plugins and fonts resolve through it,
- *   PATH        — `<grdir>/bin` prepended (load-time DLL resolution on
- *                 Windows; harmless elsewhere), preserving the existing PATH
- *                 key's case ("Path" on Windows) so the child sees one PATH,
+ *   GRDIR       — the install root. This is the ONE thing the compiler needs
+ *                 from us: its `renderPlot` reads it, validates `<GRDIR>/bin`,
+ *                 and composes its GR worker's environment itself (GRDIR, the
+ *                 bin dir on the WORKER's PATH, the null workstation),
  *   GKS_WSTYPE  — "100" (the null workstation): without it GR's Windows
  *                 default is gksqt and a stray Qt process can spawn,
  *   GR_DISPLAY  — removed, same reason.
+ *
+ * PATH IS DELIBERATELY LEFT ALONE. `<grdir>/bin` must NOT be put on the serve
+ * process's PATH: a GR distribution bundles its own libstdc++-6.dll,
+ * libgcc_s_seh-1.dll and libwinpthread-1.dll, and ahead of the toolchain's
+ * they are what g++'s own executables load. g++ then exits 1 with no output —
+ * so every cell that needed the compiled fallback lane (a provider write, an
+ * interpreter-unsupported form) failed with "Compilation failed (exit 1) with
+ * no output", on exactly the machines where plots worked. The worker gets
+ * GR's bin dir from the compiler; the serve process, which never loads GR,
+ * keeps the PATH it was given.
  */
 function grEnv(grdir, baseEnv) {
   const base = baseEnv || process.env;
   const env = Object.assign({}, base);
-  const pathKey = Object.keys(env).find((k) => k.toUpperCase() === "PATH") || "PATH";
-  const bin = path.join(grdir, "bin");
-  env[pathKey] = env[pathKey] ? bin + path.delimiter + env[pathKey] : bin;
   env.GRDIR = grdir;
   env.GKS_WSTYPE = "100";
   delete env.GR_DISPLAY;

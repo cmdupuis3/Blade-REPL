@@ -154,7 +154,12 @@ const extGr = path.join(EXT, "vendor", "gr");
   const env = gr.grEnv(CUSTOM, base);
   const bin = path.join(CUSTOM, "bin");
   check("grEnv: GRDIR set", env.GRDIR === CUSTOM, env.GRDIR);
-  check("grEnv: bin prepended on the existing Path key", env.Path === bin + path.delimiter + "C:\\Windows\\System32", env.Path);
+  // GR's bin ships its own libstdc++ / libgcc / libwinpthread; ahead of the
+  // toolchain's on PATH they are what g++ loads, and g++ then exits 1 with no
+  // output. The serve process never loads GR (the compiler puts the bin dir on
+  // its GR worker's PATH itself), so its PATH must come through untouched.
+  check("grEnv: PATH is left exactly as given", env.Path === "C:\\Windows\\System32", env.Path);
+  check("grEnv: GR's bin dir is nowhere on the PATH", !String(env.Path).includes(bin), env.Path);
   check("grEnv: no duplicate PATH key introduced", !("PATH" in env), Object.keys(env));
   check("grEnv: null workstation pinned", env.GKS_WSTYPE === "100", env.GKS_WSTYPE);
   check("grEnv: GR_DISPLAY removed", !("GR_DISPLAY" in env), env.GR_DISPLAY);
@@ -164,7 +169,7 @@ const extGr = path.join(EXT, "vendor", "gr");
 
 {
   const env = gr.grEnv(CUSTOM, { NOPATH: "1" });
-  check("grEnv: PATH created when base has none", env.PATH === path.join(CUSTOM, "bin"), env.PATH);
+  check("grEnv: no PATH is invented when the base has none", !("PATH" in env) && !("Path" in env), Object.keys(env));
 }
 
 // -----------------------------------------------------------------------------
